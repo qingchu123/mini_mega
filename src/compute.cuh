@@ -506,7 +506,8 @@ __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* w2, uint16_t* l2_out, int l2_k_out, float* l2_chk,
         int rep, int n_reps, TaskTail tail = TaskTail{},
         const int* prefix_ptr = nullptr, unsigned long long* pt = nullptr,
-        uint8_t* a_smem = nullptr, unsigned long long* ctr = nullptr) {
+        uint8_t* a_smem = nullptr, unsigned long long* ctr = nullptr,
+        int merge_grid = 0) {
     extern __shared__ __align__(16) uint8_t smem_raw[];
     int* s_count = reinterpret_cast<int*>(smem_raw);   // EPR：每专家总行数
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）
@@ -547,9 +548,13 @@ __device__ __forceinline__ void dispatch_pull_body(
     //      （slice_flags/l1_prog 仍逐逻辑 slice 写满，wait-all 仍遍历 kNSlice）。
     //   任务数 ≤ grid 时 merge=1，行为与改动前逐字一致（NSLICE=4 不受影响）。
     const int raw_tasks = s_cum[kEPR] * kNSlice;
+    // [LONGTAIL] merge 上限：缺省 gridDim.x（把物理任务粗化到 ≤ 单波）；
+    // 不均衡长尾场景 host 传一个很大的 merge_grid，令 merge 保持 1（不粗化），
+    // 使大专家切成更多、更小的任务摊到更多 block。
     int merge = 1;
+    const int merge_cap = (merge_grid > 0) ? merge_grid : (int)gridDim.x;
     while (merge < kNSlice &&
-           ((raw_tasks + merge - 1) / merge) > (int)gridDim.x)
+           ((raw_tasks + merge - 1) / merge) > merge_cap)
         merge <<= 1;
     if (kNSlice % merge != 0) merge = 1;   // 兜底（kNSlice 非 2 的幂）
     const int nslice_eff = kNSlice / merge;

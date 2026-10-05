@@ -424,6 +424,7 @@ static fp8mega::MegaLaunchArgs make_mega_args(
     // REDUCE 输出 + 发射几何
     a.y = r.y;
     a.grid = kGrid;
+    a.merge_grid = kGrid;   // 缺省：任务粗化到 ≤ 单波（原行为）
     const int block_n = prod_block_n(o.scene.block_n);
     a.threads = block_n == 512 ? 1024 : 512;
     a.smem = prod_smem(o.scene.ranks, o.scene.window, block_n);
@@ -1988,8 +1989,9 @@ static int run_aligned(RunOpts o) {
     if (o.scene.win_cap > 0) {
         win_cap = o.scene.win_cap;
     } else if (imbalanced) {
-        int tgt = (cap_need + kRing - 1) / kRing;        // ~kRing 个窗口
-        tgt = ((tgt + kM - 1) / kM) * kM;                // 对齐 M tile 行数
+        // [LONGTAIL] merge=1（不粗化）+ 小窗口：把大专家切成更多小任务摊到更多
+        // block。实测（853000/max512）最优窗口 ~45 行（45<46<48<44）。
+        int tgt = std::min((int)45, cap_need);
         win_cap = std::min(max_tokens, std::max((int)kM, tgt));
     } else {
         win_cap = std::max(128, max_tokens);
@@ -2219,6 +2221,7 @@ static int run_aligned(RunOpts o) {
                     CHECK(mcStreamCreate(&st));
                     fp8mega::MegaLaunchArgs a = make_mega_args(
                         o, L, r, win_cap, combine_f32_off);
+                    if (imbalanced) a.merge_grid = 0x3fffffff;  // [LONGTAIL] 不粗化
                     while (go.load(std::memory_order_acquire) == 0) {}
                     bool cap = false;
                     cal[rank] = chain_measure(

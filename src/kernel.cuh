@@ -45,6 +45,9 @@ struct MegaArgs {
     int max_spins;
     unsigned publish_epoch;   // publish 校验槽 epoch（阶段 1 = kPublishEpoch）
     int recv_stride;          // recv 行宽（word）= 12
+    // [LONGTAIL] 任务粗化 merge 的网格上限：0=用 gridDim.x（缺省，单波）；
+    // >0 且很大时 merge 恒为 1（不粗化）——不均衡长尾场景把大专家切成更多小任务。
+    int merge_grid;
     int* prefix_ptr;          // 可选独立前缀表缓冲（nullptr = self+prefix_off）    // ---- 计算链 ----
     const uint8_t* w1;        // [EPR][2I][H] lane 序 packed tile（gate/up 配对布局）
     int l1_n_total, l1_block_n, l1_k_out;
@@ -134,7 +137,7 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
         a.l1_prog_idx, a.lf->out_processed, a.lf->dbg, a.max_spins, a.w1,
         a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.lf->l1_chk, a.w2,
         a.l2_out, a.l2_k_out, a.lf->l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
-        a.prefix_ptr, a.lf->pre_ticks, a_smem, ctr);
+        a.prefix_ptr, a.lf->pre_ticks, a_smem, ctr, a.merge_grid);
 }
 
 // 主 kernel（单轮）。

@@ -72,6 +72,7 @@ struct MegaLaunchArgs {
     int max_spins = 0;
     unsigned publish_epoch = 0;
     int recv_stride = 0;
+    int merge_grid = 0;   // 0=gridDim.x（单波粗化）；很大=不粗化（长尾专项）
     int* prefix_ptr = nullptr;
     // ---- 计算链 ----
     const uint8_t* w1 = nullptr;
