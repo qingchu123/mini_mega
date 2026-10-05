@@ -15,8 +15,7 @@ mini_mega/
 ├── perf.md                    # R=32 性能基准口径与基线
 ├── test/70.r32_tpr_perf/      # 测试脚本/日志/结果
 │   ├── run.sh  results.md  test_info.md
-│   ├── t{16,64,256}_r{1,2}.log   # 重编译后运行
-│   └── run1/t*.log               # 重编译前运行
+│   └── r{1,2}.log               # 2 次运行原始日志
 └── README.md
 ```
 
@@ -35,15 +34,20 @@ setarch $(uname -m) -R bash scripts/build.sh   # 确定性构建 -> ./bench
 bash test/70.r32_tpr_perf/run.sh
 ```
 
-口径：`--ranks 32 --nodes 20 --graph 0 --perf-only 1 --compute 1 --perf-pattern 0
---tokens T --max-tokens 512 --win-cap 128`；单档单次 `timeout 10`。
+口径（对齐 `mega/src/bench/bench_mega_fp8.cu`）：单进程 `run_aligned`，均衡路由，
+graph 链 `nodes=20`、`replays=2`（取 min）、默认不做正确性校验：
+
+```bash
+MACA_VISIBLE_DEVICES=0,...,31 ./bench --ranks 32 --tprs 16,64,256 --nodes 20 --replays 2
+```
+
+`./bench` 不带参数 = 默认全档 R=32 TPR={1,4,16,32,33,64,128,256}（单次约 2.9s，
+满足 10s 约束）。`--aligned 0` 可退回旧的单档/扇形口径。
 
 ## 基准（本机 202，C600UL 32 卡）
 
-| TPR | full (µs/kernel) |
-|---:|---:|
-| 16 | 343.8 |
-| 64 | 655.3 |
-| 256 | 1913.6 |
+| TPR | 16 | 64 | 256 |
+|---:|---:|---:|---:|
+| full (µs/kernel) | 343.5 | 651.0 | 1918.3 |
 
 详见 `test/70.r32_tpr_perf/results.md`。

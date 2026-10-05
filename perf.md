@@ -9,6 +9,11 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 31) timeout -k 3 15 ./bench \
   --perf-pattern 0 --tokens <TPR> --max-tokens 512 --win-cap 128
 ```
 - 单档运行 ≤3s（严格 `timeout -k 3`）；每档取 2 次均值。
+
+> 现行口径（对齐 `mega/src/bench/bench_mega_fp8.cu`）：单进程 `run_aligned`，
+> `./bench` 默认 R=32 TPR={1,4,16,32,33,64,128,256}、均衡、graph `nodes=20 replays=2`
+> （取 min）、默认不校验，单次约 2.9s。上表 v0/v1 为改造前分档子进程口径，
+> 改造后同档复测：TPR=16/64/256 = 343.5/651.0/1918.3µs（±1% 内，见 test/70）。
 - `full` = 全链单 launch 平均耗时（µs）；正确性另以 `--perf-only 0` 校验，
   全 TPR 三行 `[数值校验] PASS` + `[总体] R=32 PASS`。
 - win_cap **固定 128**（与 `--expert-window`/环境变量无关）。

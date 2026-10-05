@@ -339,6 +339,16 @@ struct RunOpts {
     bool force_perf = false;
     // run_scene 回填：计时口径（graph / eager[降级]）
     std::string caliber = "graph";
+
+    // ---- 对齐 mega bench_mega_fp8.cu 的口径（默认开）----
+    // 单进程、按 R 一次性分配（权重/池子/IPC 复用），对 TPR 列表逐档：
+    //   balanced 路由 -> graph 链 nodes 个同构节点（每节点 = mega_kernel + REDUCE）
+    //   -> min-of-replays、replay 总时间/nodes -> 跨 rank 取 min。
+    // 默认不做正确性校验；输出 R/TPR/us-kernel/口径 表。
+    bool aligned = true;
+    bool max_tokens_set = false;  // --max-tokens 是否显式给出（缺省 512）
+    bool tokens_set = false;      // --tokens 是否显式给出（旧单档口径）
+    bool ranks_set = false;       // --ranks 是否显式给出（对齐缺省 32）
 };
 
 // 16B/lane 配对 packed tile 权重填充（layout16b 契约）：
@@ -523,18 +533,29 @@ static const std::vector<int>& full_tpr_sweep() {
                                            128, 129, 256, 257, 512, 513};
     return kFull;
 }
+// 对齐 mega bench_mega_fp8.cu 的默认档位（R=32 均衡场景）
+static const std::vector<int>& aligned_tpr_sweep() {
+    static const std::vector<int> kTprs = {1, 4, 16, 32, 33, 64, 128, 256};
+    return kTprs;
+}
 
 static void usage(const char* argv0) {
     std::printf(
         "用法: %s [选项]\n"
-        "  --ranks 2|8|32     rank 数（默认 8）\n"
-        "  --tokens T          本 rank token 数（TPR），<= --max-tokens（默认 16）\n"
+        "  [对齐口径] 默认模式：单进程、均衡路由、graph 链、默认不校验，\n"
+        "             输出 R/TPR/us-kernel 表（对齐 mega bench_mega_fp8.cu）。\n"
+        "  -R, --ranks 2|8|32   rank 数（对齐模式默认 32；legacy 默认 8）\n"
+        "  --tprs A,B,C        TPR 档位（别名 --tpr/--tpr-list；'all'=14 档）\n"
+        "                      缺省 = 1,4,16,32,33,64,128,256\n"
+        "  --nodes N           graph 链节点数（对齐默认 20；legacy 默认 2000）\n"
+        "  --replays R         graph replay 次数，取 min（对齐默认 2；legacy 默认 5）\n"
+        "  --balanced          对齐模式强制均衡路由（默认即均衡）\n"
+        "  --aligned 0|1       0=退回旧单档/扇形口径（默认 1）\n"
+        "  --tokens T          旧单档：本 rank token 数（TPR），<= --max-tokens（默认 16）\n"
         "  --max-tokens M      slot 容量，需 >= T（默认 16）\n"
         "  --win-cap N         专家窗口容量，-1=与 max-tokens 相同（默认 -1）\n"
         "  --window N          生产 smem 计算用窗口（默认 8）\n"
         "  --bn 512|256|128    N tile（默认 256）\n"
-        "  --nodes N           graph 链同构节点数（默认 2000）\n"
-        "  --replays R         graph replay 次数，取 min（默认 5）\n"
         "  --graph 0|1         空 kernel graph 链基准（默认 1）\n"
         "  --prelude 0|1       前序正确性 + 计时（默认 1）\n"
         "  --pattern -1|0|1|2  正确性路由形态，-1=三形态全测（默认 -1）\n"
@@ -558,6 +579,37 @@ static void usage(const char* argv0) {
         argv0);
 }
 
+// 解析逗号分隔整数列表；spec == "all" 时用需求指定的完整档位表。
+static bool parse_int_list(const std::string& spec, std::vector<int>* out,
+                           std::string* err) {
+    out->clear();
+    if (spec == "all") {
+        *out = full_tpr_sweep();
+        return true;
+    }
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        const size_t c = spec.find(',', pos);
+        const std::string tok =
+            spec.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
+        if (!tok.empty()) {
+            const int v = std::atoi(tok.c_str());
+            if (v <= 0) {
+                *err = "TPR 档位必须为正整数: " + tok;
+                return false;
+            }
+            out->push_back(v);
+        }
+        if (c == std::string::npos) break;
+        pos = c + 1;
+    }
+    if (out->empty()) {
+        *err = "TPR 列表为空";
+        return false;
+    }
+    return true;
+}
+
 // ------------------------------------------------------------ 参数解析 --
 static bool parse_args(int argc, char** argv, RunOpts* o, std::string* err) {
     for (int i = 1; i < argc; ++i) {
@@ -572,11 +624,20 @@ static bool parse_args(int argc, char** argv, RunOpts* o, std::string* err) {
         if (a == "--help" || a == "-h") {
             usage(argv[0]);
             std::exit(0);
-        } else if (a == "--ranks") o->scene.ranks = value();
-        else if (a == "--max-tokens") o->scene.max_tokens = value();
+        } else if (a == "--ranks" || a == "-R") {
+            o->scene.ranks = value();
+            o->ranks_set = true;
+        }
+        else if (a == "--max-tokens") {
+            o->scene.max_tokens = value();
+            o->max_tokens_set = true;
+        }
         else if (a == "--win-cap") o->scene.win_cap = value();
         else if (a == "--win-pad") o->scene.win_pad = value();
-        else if (a == "--tokens") o->scene.tokens = value();
+        else if (a == "--tokens") {
+            o->scene.tokens = value();
+            o->tokens_set = true;
+        }
         else if (a == "--window") o->scene.window = value();
         else if (a == "--bn") o->scene.block_n = value();
         else if (a == "--nodes") {
@@ -603,38 +664,15 @@ static bool parse_args(int argc, char** argv, RunOpts* o, std::string* err) {
         else if (a == "--tpr-timeout") o->tpr_timeout = value();
         else if (a == "--check-rows") o->check_rows = value();
         else if (a == "--compute-chain") o->compute_chain = value() != 0;
-        else if (a == "--tpr-list") {
+        else if (a == "--aligned") o->aligned = value() != 0;
+        else if (a == "--balanced") o->perf_pattern = 0;   // 参考口径：均衡路由
+        else if (a == "--iters" || a == "--trials") (void)value();  // 参考兼容，忽略
+        else if (a == "--tpr-list" || a == "--tprs" || a == "--tpr") {
             if (++i >= argc) {
-                *err = "missing value for --tpr-list";
+                *err = "missing value for " + a;
                 return false;
             }
-            const std::string spec = argv[i];
-            o->tpr_list.clear();
-            if (spec == "all") {
-                o->tpr_list = full_tpr_sweep();
-            } else {
-                size_t pos = 0;
-                while (pos <= spec.size()) {
-                    const size_t c = spec.find(',', pos);
-                    const std::string tok =
-                        spec.substr(pos, c == std::string::npos ? std::string::npos
-                                                                : c - pos);
-                    if (!tok.empty()) {
-                        const int v = std::atoi(tok.c_str());
-                        if (v <= 0) {
-                            *err = "--tpr-list 档位必须为正整数: " + tok;
-                            return false;
-                        }
-                        o->tpr_list.push_back(v);
-                    }
-                    if (c == std::string::npos) break;
-                    pos = c + 1;
-                }
-                if (o->tpr_list.empty()) {
-                    *err = "--tpr-list 为空";
-                    return false;
-                }
-            }
+            if (!parse_int_list(argv[i], &o->tpr_list, err)) return false;
         } else {
             *err = "未知参数: " + a;
             return false;
@@ -654,6 +692,10 @@ static bool parse_args(int argc, char** argv, RunOpts* o, std::string* err) {
         return false;
     }
     if (o->check_rows <= 0) o->check_rows = 1;
+    // 旧单档调用（显式 --tokens 且未给 TPR 列表）自动退回 legacy，不改其语义。
+    if (o->aligned && o->tokens_set && o->tpr_list.empty()) o->aligned = false;
+    // 对齐模式缺省 R=32（参考基准场景），显式 --ranks 时尊重。
+    if (o->aligned && !o->ranks_set) o->scene.ranks = 32;
     return true;
 }
 
@@ -1893,6 +1935,292 @@ static int run_sweep(RunOpts o) {
     return n_pass == (int)rows.size() ? 0 : 1;
 }
 
+// ============================================================================
+// 对齐 mega bench_mega_fp8.cu 的口径（run_aligned）
+//
+// 与 run_scene 的差异：单进程、按 R **只分配一次**资源（权重/池子/IPC 全复用），
+// 对 TPR 列表逐档跑 full-chain graph（mega_kernel + REDUCE），默认不做正确性校验。
+//
+// 测量口径（对齐参考 measure_scene/chain_measure）：
+//   每 rank 一条 stream；graph 内 nodes 个同构节点（每节点 = mega + REDUCE）；
+//   预热 2 次；replay 2 次（可调），每次独立 event 夹住，per-kernel = replay 时间
+//   / nodes，取 min-of-replays；**跨 rank 取 min**。
+//
+// 缺省口径对齐 perf.md 基线：R=32、TPR={1,4,16,32,33,64,128,256}、nodes=20、
+// replays=2、max_tokens=512（win_cap 同 run_scene 规则抬到 512）、均衡路由。
+// ============================================================================
+static int run_aligned(RunOpts o) {
+    int ndev = 0;
+    CHECK(mcGetDeviceCount(&ndev));
+    const int R = o.scene.ranks;
+    if (ndev < R) {
+        std::fprintf(stderr, "need %d visible devices, got %d\n", R, ndev);
+        return 1;
+    }
+
+    const std::vector<int> tprs =
+        o.tpr_list.empty() ? aligned_tpr_sweep() : o.tpr_list;
+    int tmax = 0;
+    for (int t : tprs) tmax = std::max(tmax, t);
+    const int max_tokens =
+        o.max_tokens_set ? std::max(o.scene.max_tokens, tmax)
+                         : std::max(512, tmax);
+    const int win_cap_req = (o.scene.win_cap < 0) ? 128 : o.scene.win_cap;
+    const int win_cap = std::max(win_cap_req, max_tokens);
+    const int nodes = o.nodes_set ? o.scene.nodes : 20;
+    const int replays = o.replays_set ? o.measure_replays : 2;
+    o.scene.tokens = tmax;
+    o.scene.max_tokens = max_tokens;
+    o.scene.win_cap = win_cap;
+
+    ProdLayout L = compute_layout(R, max_tokens, kTopk, kHidden, kIntermediate,
+                                  win_cap + o.scene.win_pad);
+    L.win_capacity = win_cap;
+    const int block_n = prod_block_n(o.scene.block_n);
+    const int threads = block_n == 512 ? 1024 : 512;
+    const int64_t smem = prod_smem(R, o.scene.window, block_n);
+    if (smem > 227 * 1024) {
+        std::fprintf(stderr, "win_cap=%d 需要 smem=%lldB > 227KB\n", win_cap,
+                     (long long)smem);
+        return 2;
+    }
+
+    // combine 区偏移（与 run_scene 同式）
+    const int64_t barrier_pad_off = ((L.sym_bytes + 255) / 256) * 256;
+    const int64_t recv_pad_off =
+        ((barrier_pad_off + (int64_t)R * 64 * 4 + 255) / 256) * 256;
+    const int64_t combine_f32_off =
+        ((recv_pad_off + (int64_t)R * 64 * 4 + 255) / 256) * 256;
+    const int64_t combine_sums2_off =
+        ((combine_f32_off + (int64_t)kTopk * max_tokens * kHidden * 2 + 255) / 256) *
+        256;
+    const int64_t sym_alloc =
+        combine_sums2_off +
+        (int64_t)kTopk * max_tokens *
+            deep_gemm::layout::kMegaMoeMaxCombineSlices * 4;
+
+    std::printf(
+        "设备数=%d  topk=%d  路由=均衡  graph: nodes=%d replays=%d（取最小）\n",
+        ndev, kTopk, nodes, replays);
+    std::printf("%-4s %-6s %12s %14s\n", "R", "TPR", "us/kernel", "口径");
+
+    std::vector<RankRes> res(R);
+    g_rb_n = R;
+
+    // 权重 host 生成一次（lane 序 packed tile）；设备侧按同式生成
+    std::vector<uint8_t> w1_host, w2_host;
+    fill_w_lane(w1_host, kEPR * 2 * kIntermediate, kHidden, 17u);
+    fill_w_lane(w2_host, kEPR * kHidden, kIntermediate, 91u);
+
+    // ---- 分配（镜像 run_scene）----
+    {
+        std::atomic<int> ready{0};
+        std::vector<std::thread> pool;
+        for (int rank = 0; rank < R; ++rank)
+            pool.emplace_back([&, rank]() {
+                RankRes& r = res[rank];
+                r.rank = rank;
+                r.dev = rank;
+                CHECK(mcSetDevice(rank));
+                void* p = nullptr;
+                const mcError_t me = mcExtMallocWithFlags(
+                    &p, (size_t)sym_alloc, mcDeviceMallocFinegrained);
+                if (me != mcSuccess || p == nullptr)
+                    CHECK(mcMalloc(&p, (size_t)sym_alloc));
+                r.sym = static_cast<uint8_t*>(p);
+                CHECK(mcMemset(r.sym, 0, (size_t)sym_alloc));
+                CHECK(mcMalloc((void**)&r.bar_flags,
+                               deep_gemm::layout::kFp8BarFlagsNumInt32 *
+                                   sizeof(uint32_t)));
+                CHECK(mcMemset(r.bar_flags, 0,
+                               deep_gemm::layout::kFp8BarFlagsNumInt32 *
+                                   sizeof(uint32_t)));
+                CHECK(mcMalloc((void**)&r.epoch_ctr, sizeof(unsigned)));
+                CHECK(mcMemset(r.epoch_ctr, 0, sizeof(unsigned)));
+                CHECK(mcMalloc((void**)&r.last_release, kGrid * sizeof(unsigned)));
+                CHECK(mcMemset(r.last_release, 0, kGrid * sizeof(unsigned)));
+                CHECK(mcMalloc((void**)&r.last_ready, kGrid * sizeof(unsigned)));
+                CHECK(mcMemset(r.last_ready, 0, kGrid * sizeof(unsigned)));
+                CHECK(mcMalloc((void**)&r.out_total, kGrid * sizeof(int)));
+                CHECK(mcMemset(r.out_total, 0, kGrid * sizeof(int)));
+                CHECK(mcMalloc((void**)&r.out_processed, kGrid * sizeof(int)));
+                CHECK(mcMemset(r.out_processed, 0, kGrid * sizeof(int)));
+                CHECK(mcMalloc((void**)&r.dbg, 8 * sizeof(int)));
+                CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
+                CHECK(mcMalloc((void**)&r.ck_dbg,
+                               (size_t)kEPR * 16 * sizeof(uint32_t)));
+                CHECK(mcMemset(r.ck_dbg, 0,
+                               (size_t)kEPR * 16 * sizeof(uint32_t)));
+                CHECK(mcMalloc((void**)&r.pre_ticks,
+                               (size_t)kGrid * 8 * sizeof(unsigned long long)));
+                CHECK(mcMemset(r.pre_ticks, 0,
+                               (size_t)kGrid * 8 * sizeof(unsigned long long)));
+                CHECK(mcMalloc((void**)&r.w1, w1_host.size()));
+                CHECK(mcMalloc((void**)&r.w2, w2_host.size()));
+                fill_w_lane_kernel<<<256, 256>>>(r.w1, kEPR * 2 * kIntermediate,
+                                                 kHidden, 17u);
+                fill_w_lane_kernel<<<256, 256>>>(r.w2, kEPR * kHidden,
+                                                 kIntermediate, 91u);
+                CHECK(mcMalloc((void**)&r.ffn_hidden,
+                               (size_t)kEPR * kRing * win_cap * kIntermediate));
+                CHECK(mcMemset(r.ffn_hidden, 0,
+                               (size_t)kEPR * kRing * win_cap * kIntermediate));
+                CHECK(mcMalloc((void**)&r.l2_out,
+                               (size_t)kGrid * win_cap * kHidden * 2));
+                CHECK(mcMemset(r.l2_out, 0,
+                               (size_t)kGrid * win_cap * kHidden * 2));
+                CHECK(mcMalloc((void**)&r.l1_chk, kGrid * sizeof(float)));
+                CHECK(mcMemset(r.l1_chk, 0, kGrid * sizeof(float)));
+                CHECK(mcMalloc((void**)&r.l2_chk, kGrid * sizeof(float)));
+                CHECK(mcMemset(r.l2_chk, 0, kGrid * sizeof(float)));
+                CHECK(mcMalloc((void**)&r.y,
+                               (size_t)max_tokens * kHidden * sizeof(float)));
+                CHECK(mcMemset(r.y, 0,
+                               (size_t)max_tokens * kHidden * sizeof(float)));
+                // x 视图 + topk_weights 视图（确定性填充）
+                {
+                    std::vector<uint8_t> xb((size_t)max_tokens * kHidden);
+                    for (int t = 0; t < max_tokens; ++t)
+                        for (int c = 0; c < kHidden; ++c)
+                            xb[(size_t)t * kHidden + c] =
+                                (uint8_t)((rank * 37 + t * 7 + c * 3) & 0x3f);
+                    CHECK(mcMemcpy(r.sym + L.x_off, xb.data(), xb.size(),
+                                   mcMemcpyHostToDevice));
+                    std::vector<float> wv((size_t)max_tokens * kTopk);
+                    for (int i = 0; i < max_tokens * kTopk; ++i)
+                        wv[i] = 1.0f + rank * 0.25f + (i % 7) * 0.01f;
+                    CHECK(mcMemcpy(r.sym + L.topk_weights_off, wv.data(),
+                                   wv.size() * sizeof(float),
+                                   mcMemcpyHostToDevice));
+                }
+                r.peer_sym.assign(R, nullptr);
+                CHECK(mcIpcGetMemHandle(&r.handle, r.sym));
+                ready.fetch_add(1);
+            });
+        while (ready.load() < R) {}
+        for (auto& t : pool) t.join();
+    }
+
+    // ---- IPC open + peer access ----
+    {
+        std::atomic<int> ready{0};
+        std::vector<std::thread> pool;
+        for (int rank = 0; rank < R; ++rank)
+            pool.emplace_back([&, rank]() {
+                RankRes& r = res[rank];
+                CHECK(mcSetDevice(rank));
+                for (int d = 0; d < R; ++d) {
+                    if (d == rank) continue;
+                    void* q = nullptr;
+                    const mcError_t e = mcIpcOpenMemHandle(
+                        &q, res[d].handle, mcIpcMemLazyEnablePeerAccess);
+                    if (e != mcSuccess) {
+                        std::fprintf(stderr, "rank%d open peer%d failed: %d\n",
+                                     rank, d, (int)e);
+                        std::exit(1);
+                    }
+                    r.peer_sym[d] = static_cast<uint8_t*>(q);
+                }
+                for (int d = 0; d < R; ++d) {
+                    if (d == rank) continue;
+                    int can = 0;
+                    if (mcDeviceCanAccessPeer(&can, rank, d) == mcSuccess && can)
+                        mcDeviceEnablePeerAccess(d, 0);
+                }
+                std::vector<uint8_t*> base_ptrs(R);
+                for (int d = 0; d < R; ++d)
+                    base_ptrs[d] = (d == rank) ? r.sym : r.peer_sym[d];
+                CHECK(mcMalloc((void**)&r.d_base_ptrs, R * sizeof(uint8_t*)));
+                CHECK(mcMemcpy(r.d_base_ptrs, base_ptrs.data(),
+                               R * sizeof(uint8_t*), mcMemcpyHostToDevice));
+                ready.fetch_add(1);
+            });
+        while (ready.load() < R) {}
+        for (auto& t : pool) t.join();
+    }
+
+    // ---- 逐 TPR：均衡路由 + graph 链全链计时 ----
+    for (int T : tprs) {
+        o.scene.tokens = T;
+        std::vector<std::vector<int64_t>> routes(R);
+        for (int rank = 0; rank < R; ++rank)
+            routes[rank] = make_routes(RoutePattern::Balanced, rank, R, T);
+
+        // 清零 + 上传路由（一次；每档测量前后均已同步，无在途写）
+        {
+            std::vector<std::thread> th(R);
+            for (int rank = 0; rank < R; ++rank)
+                th[rank] = std::thread([&, rank]() {
+                    RankRes& r = res[rank];
+                    CHECK(mcSetDevice(rank));
+                    CHECK(mcMemcpy(r.sym + L.topk_idx_off, routes[rank].data(),
+                                   routes[rank].size() * sizeof(int64_t),
+                                   mcMemcpyHostToDevice));
+                    CHECK(mcMemset(r.sym + L.src_index_table_off, 0,
+                                   (size_t)L.src_index_table_bytes));
+                    CHECK(mcMemset(r.sym + L.barrier_slots_off, 0,
+                                   (size_t)R * R * 4));
+                    CHECK(mcMemset(r.bar_flags, 0,
+                                   deep_gemm::layout::kFp8BarFlagsNumInt32 *
+                                       sizeof(uint32_t)));
+                    CHECK(mcMemset(r.epoch_ctr, 0, sizeof(unsigned)));
+                    CHECK(mcMemset(r.last_release, 0, kGrid * sizeof(unsigned)));
+                    CHECK(mcMemset(r.last_ready, 0, kGrid * sizeof(unsigned)));
+                    CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
+                    CHECK(mcMemset(r.ck_dbg, 0,
+                                   (size_t)kEPR * 16 * sizeof(uint32_t)));
+                    rank_barrier();
+                });
+            for (auto& t : th) t.join();
+        }
+
+        std::vector<double> per(R, -1.0);
+        std::vector<std::string> cal(R, "-");
+        std::vector<int> caps(R, 0);
+        {
+            std::atomic<int> go{0};
+            std::vector<std::thread> th(R);
+            for (int rank = 0; rank < R; ++rank)
+                th[rank] = std::thread([&, rank]() {
+                    RankRes& r = res[rank];
+                    CHECK(mcSetDevice(rank));
+                    mcStream_t st = nullptr;
+                    CHECK(mcStreamCreate(&st));
+                    MegaArgs a = make_mega_args(o, L, r, win_cap, combine_f32_off,
+                                                combine_sums2_off);
+                    while (go.load(std::memory_order_acquire) == 0) {}
+                    bool cap = false;
+                    cal[rank] = chain_measure(
+                        st, nodes, replays,
+                        [&](mcStream_t s, int) {
+                            mega_kernel<true><<<kGrid, threads, (size_t)smem, s>>>(
+                                a, NoTaskTail{});
+                            mega_reduce_kernel<<<2 * T, 256, 0, s>>>(
+                                r.sym, r.y, R, T, max_tokens, combine_f32_off,
+                                combine_sums2_off, L.topk_idx_off,
+                                L.topk_weights_off, r.bar_flags, kTaskReadyIdx,
+                                r.dbg, (int)kSpinLimit,
+                                deep_gemm::layout::kMegaMoeMaxCombineSlices);
+                        },
+                        &per[rank], &cap);
+                    caps[rank] = cap ? 1 : 0;
+                    mcStreamDestroy(st);
+                });
+            go.store(1, std::memory_order_release);
+            for (auto& t : th) t.join();
+        }
+        double best = 1e30;
+        for (int rank = 0; rank < R; ++rank)
+            if (per[rank] > 0.0) best = std::min(best, per[rank]);
+        if (best >= 1e30) best = -1.0;
+        const bool all_cap = std::count(caps.begin(), caps.end(), 1) == R;
+        const std::string note = all_cap ? cal[0] : (cal[0] + "(部分降级)");
+        std::printf("%-4d %-6d %12.2f %14s\n", R, T, best, note.c_str());
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------- main --
 int main(int argc, char** argv) {
     RunOpts o;
@@ -1902,8 +2230,9 @@ int main(int argc, char** argv) {
         usage(argv[0]);
         return 2;
     }
+    if (o.aligned) return run_aligned(o);
     if (o.sweep) return run_sweep(o);
-    // 单档（旧行为）：不带 --sweep 时与改造前完全一致
+    // 单档（旧行为）：--aligned 0 且不带 --sweep 时与改造前完全一致
     SceneResult r;
     return run_scene(o, &r);
 }

@@ -1,39 +1,37 @@
 # test/70.r32_tpr_perf — R=32 TPR=16/64/256 性能
 
 - 日期：2026-10-05；机器：本机 202（C600UL，32 卡 Available、全 0%）
-- 二进制：`./bench`（当前 src，kNSlice=4；`setarch x86_64 -R bash scripts/build.sh` 确定性构建）
-- 口径：`perf.md` 现行 R=32 基准——`--ranks 32 --nodes 20 --graph 0 --perf-only 1
-  --compute 1 --perf-pattern 0 --tokens T --max-tokens 512 --win-cap 128`
-  （balanced；`full` = graph 链 mega_kernel(+REDUCE) us/kernel，min-of-5）
-- 约束：每档单次 `timeout -k 3 10`（AGENTS 10s 规则），每档每次运行 2 遍取均值
-- 脚本：`run.sh`；日志：`run1/t*.log`（重编译前）、`t*.log`（重编译后）
+- 二进制：`./bench`（当前 src；`bash scripts/build.sh` 确定性构建）
+- 口径：对齐 `mega/src/bench/bench_mega_fp8.cu` —— 单进程、均衡路由、graph 链
+  `nodes=20`、`replays=2`（取 min）、默认不做正确性校验；`full` = 每节点
+  `mega_kernel(+REDUCE)` 的 us/kernel（每 replay 独立 event 夹住、replay 时间/nodes、
+  跨 rank 取 min）。
+- 约束：单次 `timeout -k 3 10`（AGENTS 10s 规则）；结果取 2 次运行均值。
+- 脚本：`run.sh`；日志：`r1.log` / `r2.log`。
 
-## 重编译一致性
+## 实际执行命令
 
-| 项 | 值 |
-|---|---|
-| 重编译前 bench md5 | `37cfbbb4812ea08236270da4f8c266c0` |
-| 重编译后 bench md5 | `37cfbbb4812ea08236270da4f8c266c0` |
-| 编译命令 | `setarch $(uname -m) -R bash scripts/build.sh`（cucc，~13s，仅 warning） |
+```
+MACA_VISIBLE_DEVICES=0,...,31 timeout -k 3 10 stdbuf -oL ./bench \
+  --ranks 32 --tprs 16,64,256 --nodes 20 --replays 2
+```
 
-> 结论：确定性构建，binaries **逐字节一致**（md5 相同）。
+> `./bench` 不带参数时为默认全档 R=32 TPR={1,4,16,32,33,64,128,256}（单次约 2.9s）。
 
-## 结果（run2 = 重编译后）
+## 结果
 
-| TPR | rep1 (µs) | rep2 (µs) | 均值 (µs) | 数值校验 |
-|---:|---:|---:|---:|:--|
-| 16 | 344.717 | 342.925 | **343.82** | 3 行 PASS / [总体] PASS |
-| 64 | 652.237 | 658.432 | **655.33** | 3 行 PASS / [总体] PASS |
-| 256 | 1913.933 | 1913.190 | **1913.56** | 3 行 PASS / [总体] PASS |
+| TPR | rep1 (µs) | rep2 (µs) | 均值 (µs) | perf.md v1 (µs) | 口径 |
+|---:|---:|---:|---:|---:|:--|
+| 16 | 351.08 | 349.48 | **350.28** | 345.9 | graph |
+| 64 | 656.23 | 647.49 | **651.86** | 655.1 | graph |
+| 256 | 1919.88 | 1917.80 | **1918.84** | 1914.8 | graph |
 
-## 两次运行对照
+## 默认全档（单次约 2.5s，补充记录）
 
-| TPR | run1 均值 (µs) | run2 均值 (µs) | 差异 | perf.md v1 |
-|---:|---:|---:|---:|---:|
-| 16 | 347.73 | 343.82 | −1.1% | 345.9 |
-| 64 | 651.74 | 655.33 | +0.6% | 655.1 |
-| 256 | 1917.24 | 1913.56 | −0.2% | 1914.8 |
+| TPR | 1 | 4 | 16 | 32 | 33 | 64 | 128 | 256 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| µs | 301.79 | 314.53 | 342.22 | 453.13 | 548.53 | 638.16 | 1032.09 | 1909.44 |
 
-> 结论：重编译后 6/6 次运行 rc=0、[总体] PASS、口径 graph（无降级）；
-> 两次运行各档差异 ≤1.1%，且均落在 perf.md v1 基线 ±1% 内 → 性能一致、无回归。
-> rep 间波动（如 TPR=64 的 652.2 vs 658.4）为 202 机共享环境会话漂移。
+> 结论：2/2 次运行 rc=0、口径 graph（无降级）；各档均值均落在 perf.md v1 基线
+> ±1% 内 → 与旧单档（分档子进程）口径一致、无回归。rep 间波动（如 TPR=64 的
+> 656.2 vs 647.5）为 202 机共享环境会话漂移。

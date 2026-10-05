@@ -21,8 +21,7 @@
 
 ```
 MACA_VISIBLE_DEVICES=0,1,...,31 timeout -k 3 10 stdbuf -oL ./bench \
-  --ranks 32 --nodes 20 --graph 0 --perf-only 1 --compute 1 \
-  --perf-pattern 0 --tokens <TPR> --max-tokens 512 --win-cap 128
+  --ranks 32 --tprs 16,64,256 --nodes 20 --replays 2
 ```
 
 ## 2. 源文件（编译进 `./bench`）
@@ -32,7 +31,7 @@ include 展开后参与编译的源文件如下（md5 为本机当前版本）�
 
 | 文件 | 角色 | md5 |
 |---|---|---|
-| `src/bench.cu` | host harness：参数解析、路由生成、显存分配/审计、正确性与数值校验、CUDA graph 链计时、TPR 扇形 | `2e54ea301d2050eca6deeea719da3f64` |
+| `src/bench.cu` | host harness：参数解析、路由生成、显存分配/审计、正确性与数值校验、CUDA graph 链计时、TPR 扇形；`run_aligned` = 对齐 `mega/src/bench/bench_mega_fp8.cu`（单进程、均衡、graph nodes/replays、默认不校验） | `ef1003ff50159382f2abfa2c6454e8cc` |
 | `src/common.cuh` | 场景常量（`kEPR=8,kTopk=8,kHidden=6144,kIntermediate=2048,kGrid=32,kNSlice=4,kRing=8,kM=16`）与工具 | `292d984029abc93b658d28e17e77fe4e` |
 | `src/kernel.cuh` | 主 kernel `mega_kernel` 相位编排（前序→dispatch→L1→L2→COMBINE/REDUCE） | `718bdf4563481b055bc5e63a1a11f05d` |
 | `src/prologue.cuh` | ROUTE/PUBLISH/XBAR/TASK_SETUP 前序相位 | `30711c075e1cc91432c595c1e41b54f8` |
@@ -73,7 +72,7 @@ bench.cu
 
 | 文件 | 说明 | md5 |
 |---|---|---|
-| `bench` | 本次实际运行的二进制（`setarch x86_64 -R bash scripts/build.sh` 确定性构建，2026-10-05 重编译） | `37cfbbb4812ea08236270da4f8c266c0` |
+| `bench` | 本次实际运行的二进制（`bash scripts/build.sh`，2026-10-05 改造后重编） | `c353addee74b9b49a4b7f4746c5fa79a` |
 | `perf.md` | R=32 性能基准口径与 v0/v1 表（本次对照基线） | — |
 | `docs/02_测试流程与性能标准.md` | 性能口径/正确性协议/运行规则权威定义 | — |
 | `scripts/run.sh` | 一键正确性+性能（未用于本次纯性能测试） | — |
