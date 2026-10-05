@@ -1,5 +1,5 @@
 设备数=32  topk=8  路由=均衡  graph: nodes=20 replays=2（取最小）
 R    TPR       us/kernel         口径
-32   16           349.48          graph
-32   64           647.49          graph
-32   256         1917.80          graph
+32   16           354.27          graph
+32   64           654.48          graph
+32   256         1914.32          graph

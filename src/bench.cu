@@ -31,9 +31,9 @@
 #include <unistd.h>
 
 #include "common.cuh"
-#include "kernel.cuh"
 #include "host_layout.cuh"
 #include "bench_check.cuh"
+#include "megakernel.h"   // host C++ 接口（链接 megakernel.so）；不直接发射 kernel
 
 // bar flag 索引（生产布局常量）
 static constexpr int64_t kXreleaseIdx = deep_gemm::layout::kBarXreleaseIdx;
@@ -54,32 +54,9 @@ static bool red_timing() {
     const char* s = std::getenv("BENCH_RED_TIMING");
     return s && std::atoi(s) != 0;
 }
-// [R33] 正确性诊断：单 launch 路径用 CombineTail（融合推送）实例，使 [数值校验]
-//   覆盖 L2 融合推送路径（默认 NoTaskTail 只验证任务尾整段推送）。
-//   R33_FUSED_CHECK 默认 0：默认构建不实例化 CombineTail（实测多一份大任务体
-//   实例会造成热路径 code-layout 崩坏，R=32 T=256 +400µs）；验证时用 shadow
-//   构建 -DR33_FUSED_CHECK=1 -DBENCH_FUSED=1。
-#ifndef R33_FUSED_CHECK
-#define R33_FUSED_CHECK 0
-#endif
-// [集33] 单实例开关（CUDA graph 固定 kernel 实例）：
-//   1（默认）=所有 max_tokens 都发射同一个完整实例 mega_kernel<true>；大/小
-//   count 在 device 侧按 count>kM 分派（r24 M 档位 / 小路径）。配套改动：
-//   kernel.cuh tail 实例统一（消除 NoTaskTail 死实例）+ compute_big.cuh 小路径
-//   L2 单批 kBatch=6；71 机端到端 R=8/R=32 TPR=16 = 317.6/326.5（目标 ≤325/≤340）、
-//   TPR=256 1624/1880（回退 ≤0.1%）。
-//   0=回退分派：max_tokens<=16 发射 small-only 实例（不含大任务体）。
-//   两档正确性/数值逐位一致（见 test/33.single_kernel/results.md）。
-#ifndef SINGLE_KERNEL
-#define SINGLE_KERNEL 1
-#endif
-#if R33_FUSED_CHECK
-static bool fused_check() {
-    const char* s = std::getenv("BENCH_FUSED");
-    return s && std::atoi(s) != 0;
-}
-#endif
-
+// 说明：kernel 发射已全部下沉到 src/megakernel.cu（megakernel.so），bench 只调用
+// `fp8mega::launch_*` / `fp8mega::fill_weights_lane`。原 [R33] fused-check 诊断
+// （shadow CombineTail 实例）随接口化移除；需要时在接口层增加对应 launch 变体。
 
 // ---------------------------------------------------------------- 运行态 --
 struct RankRes {
@@ -351,53 +328,12 @@ struct RunOpts {
     bool ranks_set = false;       // --ranks 是否显式给出（对齐缺省 32）
 };
 
-// 16B/lane 配对 packed tile 权重填充（layout16b 契约）：
-//   supertile 基址 = W + ((out_col/32)*kIters + (k/32))*1024（kIters = k_cols/32）；
-//   supertile 内 64 lane × 16B：lane L 的低 8B 覆盖逻辑行 (out_col/32)*32 + L%16、
-//   K 段 [(L/16)*8, +8)；高 8B 覆盖逻辑行 +16（同一 K 段）。
-//   即一次 16B 装载 = 同 lane 的两个 native fragment（t=0/t=1 两个 N16 tile），
-//   免 shuffle 直接喂 MMA。值模式与旧布局同式（逻辑 (row,k) 决定字节）。
-// [诊断开关·非周期探针] -DWPROBE=1 把值函数切到"非周期 + 小值"（验证子agent C
-//   analysis/11 同式）：原 (seed+row*131+k*7)&0x3f 对行周期 64（131%64=3 与 64
-//   互素），而 L1 反序位移是 256/768 行的倍数（≡0 mod 64）→ 周期数据掩盖读序
-//   缺陷；探针加入 (row>>6)/(row>>11)/(row>>4) 项使周期扩到全表，字节 1..7
-//   （E4M3 小值，K=6144 累加后 L1 输出 ~3e2 不饱和）使数值校验可判别。
-//   默认 0：生成字节与基线逐字节一致，不扰动性能基线。
-#ifndef WPROBE
-#define WPROBE 0
-#endif
-#if WPROBE
-#define WPROBE_VAL(seed, row, k)                                            \
-    ((uint8_t)(1 + ((uint32_t)((seed) + (row) * 131 + (k) * 7 +             \
-                                ((row) >> 6) * 37 + ((row) >> 11) * 13 +    \
-                                ((row) >> 4) * 5) %                          \
-                      7u)))
-#else
-#define WPROBE_VAL(seed, row, k) \
-    ((uint8_t)(((seed) + (row) * 131 + (k) * 7) & 0x3f))
-#endif
-// 设备侧权重生成（16B/lane supertile 布局；替代 host 生成+9.6GB 上传，R=32 测试提速）
-__global__ void fill_w_lane_kernel(uint8_t* __restrict__ w, int n_rows,
-                                   int k_cols, uint32_t seed) {
-    const int k_iters = k_cols / 32;
-    const size_t total = (size_t)(n_rows / 32) * k_iters;
-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
-         idx += (size_t)gridDim.x * blockDim.x) {
-        const int np = (int)(idx / k_iters);
-        const int kt = (int)(idx % k_iters);
-        uint8_t* tile = w + idx * 1024;
-        for (int L = 0; L < 64; ++L) {
-            const int row0 = np * 32 + (L % 16);
-            const int row1 = row0 + 16;
-            const int k0 = kt * 32 + (L / 16) * 8;
-            for (int b = 0; b < 8; ++b) {
-                tile[L * 16 + b] = WPROBE_VAL(seed, row0, k0 + b);
-                tile[L * 16 + 8 + b] = WPROBE_VAL(seed, row1, k0 + b);
-            }
-        }
-    }
-}
-
+// 16B/lane 配对 packed tile 权重填充（layout16b 契约，与 megakernel.cu 设备侧同式）：
+//   supertile 基址 = W + ((out_col/32)*kIters + (k/32))*1024；lane L 低 8B = 逻辑行
+//   (out_col/32)*32 + L%16 的 K 段 [(L/16)*8, +8)，高 8B = 逻辑行 +16 的同段。
+//   值函数 WPROBE_VAL 见 megakernel.h（host 参考与设备生成必须逐字节一致；
+//   -DWPROBE=1 切非周期小值探针）。
+// 本函数仅生成 host CPU 参考缓冲；设备侧生成走 fp8mega::fill_weights_lane。
 static void fill_w_lane(std::vector<uint8_t>& buf, int n_rows, int k_cols,
                         uint32_t seed) {
     buf.assign((size_t)n_rows * k_cols, 0);
@@ -429,13 +365,13 @@ static void fill_w_lane(std::vector<uint8_t>& buf, int n_rows, int k_cols,
     for (auto& t : th) t.join();
 }
 
-// 构造主 kernel 参数（M1：只前序；M3：combine 区偏移由调用方传入）
-static MegaArgs make_mega_args(const RunOpts& o, const ProdLayout& L,
-                               const RankRes& r, int win_cap,
-                               int64_t combine_rows_off,
-                               int64_t combine_sums_off) {
-    MegaArgs a{};
+// 构造接口入参（M1：只前序；M3：combine 区偏移由调用方传入）
+static fp8mega::MegaLaunchArgs make_mega_args(
+    const RunOpts& o, const ProdLayout& L, const RankRes& r, int win_cap,
+    int64_t combine_rows_off, int64_t combine_sums_off) {
+    fp8mega::MegaLaunchArgs a{};
     a.topk_idx = reinterpret_cast<const int64_t*>(r.sym + L.topk_idx_off);
+    a.topk_idx_off = L.topk_idx_off;
     a.self = r.sym;
     a.peer_bases = r.d_base_ptrs;
     a.R = o.scene.ranks;
@@ -492,6 +428,12 @@ static MegaArgs make_mega_args(const RunOpts& o, const ProdLayout& L,
     a.combine_sums_off = combine_sums_off;
     a.combine_cap = o.scene.max_tokens;
     a.sums_stride = deep_gemm::layout::kMegaMoeMaxCombineSlices;
+    // REDUCE 输出 + 发射几何
+    a.y = r.y;
+    a.grid = kGrid;
+    const int block_n = prod_block_n(o.scene.block_n);
+    a.threads = block_n == 512 ? 1024 : 512;
+    a.smem = prod_smem(o.scene.ranks, o.scene.window, block_n);
     return a;
 }
 
@@ -834,11 +776,10 @@ static int run_scene(RunOpts o, SceneResult* out) {
                     CHECK(mcMalloc((void**)&r.w1, w1_host.size()));
                     CHECK(mcMalloc((void**)&r.w2, w2_host.size()));
                     // 设备侧生成（替代 host→device 9.6GB 上传；host 缓冲仅作数值参考）
-                    fill_w_lane_kernel<<<256, 256>>>(r.w1,
-                                                     kEPR * 2 * kIntermediate,
-                                                     kHidden, 17u);
-                    fill_w_lane_kernel<<<256, 256>>>(r.w2, kEPR * kHidden,
-                                                     kIntermediate, 91u);
+                    fp8mega::fill_weights_lane(r.w1, kEPR * 2 * kIntermediate,
+                                               kHidden, 17u, 0);
+                    fp8mega::fill_weights_lane(r.w2, kEPR * kHidden,
+                                               kIntermediate, 91u, 0);
                     CHECK(mcMalloc((void**)&r.ffn_hidden,
                                    (size_t)kEPR * kRing * win_cap * kIntermediate));
                     CHECK(mcMemset(r.ffn_hidden, 0,
@@ -984,8 +925,7 @@ static int run_scene(RunOpts o, SceneResult* out) {
                     const bool ok = graph_chain_measure(
                         st, o.scene.nodes, o.measure_replays,
                         [&](mcStream_t s, int) {
-                            mega_empty_kernel<<<c.grid, c.threads,
-                                                (size_t)c.smem, s>>>();
+                            fp8mega::launch_empty(c.grid, c.threads, c.smem, s);
                         },
                         []() {}, &us[rank]);
                     fail[rank] = ok ? 0 : 1;
@@ -1087,11 +1027,10 @@ static int run_scene(RunOpts o, SceneResult* out) {
                     for (int rank = 0; rank < o.scene.ranks; ++rank) {
                         th[rank] = std::thread([&, rank]() {
                             CHECK(mcSetDevice(rank));
-                            MegaArgs args = make_mega_args(
+                            fp8mega::MegaLaunchArgs args = make_mega_args(
                                 o, L, res[rank], win_cap, combine_f32_off,
                                 combine_sums2_off);
-                            mega_kernel<false><<<kGrid, threads, (size_t)smem>>>(
-                                args, NoTaskTail{});
+                            fp8mega::launch_prelude(args, 0);
                             CHECK(mcDeviceSynchronize());
                         });
                     }
@@ -1211,7 +1150,7 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                        (size_t)kTopk * o.scene.max_tokens *
                                            deep_gemm::layout::kMegaMoeMaxCombineSlices *
                                            4));
-                        MegaArgs args = make_mega_args(
+                        fp8mega::MegaLaunchArgs args = make_mega_args(
                             o, L, r, win_cap, combine_f32_off,
                             combine_sums2_off);
                         // 所有 rank 清零完成后统一 launch（FG 下跨 rank 写可靠）
@@ -1225,71 +1164,16 @@ static int run_scene(RunOpts o, SceneResult* out) {
                             CHECK(mcEventRecord(e0, 0));
                         }
                         if (o.compute) {
-                            // [R33] R33_FUSED_CHECK=1 的 shadow 构建才实例化
-                            //   CombineTail（默认 0：不引入额外 kernel 实例，
-                            //   避免 code-layout 对热实例的干扰）
-#if R33_FUSED_CHECK
-                            if (fused_check()) {
-#if SINGLE_KERNEL
-                                mega_kernel<true, CombineTail>
-                                    <<<kGrid, threads, (size_t)smem>>>(
-                                        args, CombineTail{});
-#else
-                                if (o.scene.max_tokens <= 16)
-                                    mega_kernel<true, CombineTail, true>
-                                        <<<kGrid, threads, (size_t)smem>>>(
-                                            args, CombineTail{});
-                                else
-                                    mega_kernel<true, CombineTail>
-                                        <<<kGrid, threads, (size_t)smem>>>(
-                                            args, CombineTail{});
-#endif
-                            } else
-#endif
-#if SINGLE_KERNEL
-                            mega_kernel<true>
-                                <<<kGrid, threads, (size_t)smem>>>(
-                                    args, NoTaskTail{});
-#else
-                            if (o.scene.max_tokens <= 16)
-                                mega_kernel<true, NoTaskTail, true>
-                                    <<<kGrid, threads, (size_t)smem>>>(
-                                        args, NoTaskTail{});
-                            else
-                                mega_kernel<true>
-                                    <<<kGrid, threads, (size_t)smem>>>(
-                                        args, NoTaskTail{});
-#endif
-                            // [R33] 诊断 rt==2：再跑一次热 mega（覆盖 pre_ticks 得暖态相位）
-                            if (red_timing() == 2) {
-#if SINGLE_KERNEL
-                                mega_kernel<true>
-                                    <<<kGrid, threads, (size_t)smem>>>(
-                                        args, NoTaskTail{});
-#else
-                                if (o.scene.max_tokens <= 16)
-                                    mega_kernel<true, NoTaskTail, true>
-                                        <<<kGrid, threads, (size_t)smem>>>(
-                                            args, NoTaskTail{});
-                                else
-                                    mega_kernel<true>
-                                        <<<kGrid, threads, (size_t)smem>>>(
-                                            args, NoTaskTail{});
-#endif
-                            }
+                            fp8mega::launch_compute(args, 0);
+                            // [R32D] 诊断 rt==2：再跑一次热 mega（覆盖 pre_ticks 得暖态相位）
+                            if (red_timing() == 2)
+                                fp8mega::launch_compute(args, 0);
                             if (rt) CHECK(mcEventRecord(e1, 0));
                             // M3 REDUCE：任务循环结束后独立 kernel 收尾（同流有序）。
                             // grid = 2×tokens（每 token 2 block 列分半）；TPR=16 时恰为 32。
-                            mega_reduce_kernel<<<2 * o.scene.tokens, 256>>>(
-                                res[rank].sym, res[rank].y, o.scene.ranks, o.scene.tokens,
-                                o.scene.max_tokens, combine_f32_off,
-                                combine_sums2_off, L.topk_idx_off,
-                                L.topk_weights_off, res[rank].bar_flags, kTaskReadyIdx,
-                                res[rank].dbg, (int)kSpinLimit,
-                                deep_gemm::layout::kMegaMoeMaxCombineSlices);
+                            fp8mega::launch_reduce(args, 0);
                         } else {
-                            mega_kernel<false><<<kGrid, threads, (size_t)smem>>>(
-                                args, NoTaskTail{});
+                            fp8mega::launch_prelude(args, 0);
                         }
                         if (rt) CHECK(mcEventRecord(e2, 0));
                         CHECK(mcDeviceSynchronize());
@@ -1297,16 +1181,7 @@ static int run_scene(RunOpts o, SceneResult* out) {
                             // 第二次 REDUCE：标记已全部就绪（纯工作量，无等待）
                             mcEvent_t e3 = nullptr;
                             CHECK(mcEventCreate(&e3));
-                            if (o.compute) {
-                                mega_reduce_kernel<<<2 * o.scene.tokens, 256>>>(
-                                    res[rank].sym, res[rank].y, o.scene.ranks,
-                                    o.scene.tokens, o.scene.max_tokens,
-                                    combine_f32_off, combine_sums2_off,
-                                    L.topk_idx_off, L.topk_weights_off,
-                                    res[rank].bar_flags, kTaskReadyIdx,
-                                    res[rank].dbg, (int)kSpinLimit,
-                                    deep_gemm::layout::kMegaMoeMaxCombineSlices);
-                            }
+                            if (o.compute) fp8mega::launch_reduce(args, 0);
                             CHECK(mcEventRecord(e3, 0));
                             CHECK(mcDeviceSynchronize());
                             float m1 = 0, m2 = 0, m3 = 0;
@@ -1543,34 +1418,15 @@ static int run_scene(RunOpts o, SceneResult* out) {
             auto make_launch = [&](int rank, bool with_reduce) {
                 return [&, rank, with_reduce](mcStream_t s) {
                     RankRes& r = res[rank];
-                    const MegaArgs a2 = make_mega_args(
+                    const fp8mega::MegaLaunchArgs a2 = make_mega_args(
                         o, L, r, win_cap, combine_f32_off, combine_sums2_off);
                     if (!o.compute) {
-                        mega_kernel<false><<<kGrid, threads, (size_t)smem, s>>>(
-                            a2, NoTaskTail{});
+                        fp8mega::launch_prelude(a2, s);
                         return;
                     }
-                    // 小场景（max_tokens≤16）走 small-only 实例：避免大 count GEMM
-                    // 的 256 MTregs collateral（TPR=16 回归修复，BB/集31）
-#if SINGLE_KERNEL
-                    mega_kernel<true><<<kGrid, threads, (size_t)smem, s>>>(
-                        a2, NoTaskTail{});
-#else
-                    if (o.scene.max_tokens <= 16)
-                        mega_kernel<true, NoTaskTail, true>
-                            <<<kGrid, threads, (size_t)smem, s>>>(a2, NoTaskTail{});
-                    else
-                        mega_kernel<true><<<kGrid, threads, (size_t)smem, s>>>(
-                            a2, NoTaskTail{});
-#endif
-                    if (!with_reduce) return;
                     // 端到端口径：graph 链内追加 REDUCE（同流有序，依赖 combine_sums 标记）
-                    mega_reduce_kernel<<<2 * o.scene.tokens, 256, 0, s>>>(
-                        r.sym, r.y, o.scene.ranks, o.scene.tokens, o.scene.max_tokens,
-                        combine_f32_off, combine_sums2_off, L.topk_idx_off,
-                        L.topk_weights_off, r.bar_flags, kTaskReadyIdx, r.dbg,
-                        (int)kSpinLimit,
-                        deep_gemm::layout::kMegaMoeMaxCombineSlices);
+                    if (with_reduce) fp8mega::launch_full(a2, s);
+                    else fp8mega::launch_compute(a2, s);
                 };
             };
             // 口径 1：全链（含 REDUCE 收尾）；口径 2：计算链（仅 mega 任务循环）
@@ -2057,10 +1913,10 @@ static int run_aligned(RunOpts o) {
                                (size_t)kGrid * 8 * sizeof(unsigned long long)));
                 CHECK(mcMalloc((void**)&r.w1, w1_host.size()));
                 CHECK(mcMalloc((void**)&r.w2, w2_host.size()));
-                fill_w_lane_kernel<<<256, 256>>>(r.w1, kEPR * 2 * kIntermediate,
-                                                 kHidden, 17u);
-                fill_w_lane_kernel<<<256, 256>>>(r.w2, kEPR * kHidden,
-                                                 kIntermediate, 91u);
+                fp8mega::fill_weights_lane(r.w1, kEPR * 2 * kIntermediate,
+                                           kHidden, 17u, 0);
+                fp8mega::fill_weights_lane(r.w2, kEPR * kHidden,
+                                           kIntermediate, 91u, 0);
                 CHECK(mcMalloc((void**)&r.ffn_hidden,
                                (size_t)kEPR * kRing * win_cap * kIntermediate));
                 CHECK(mcMemset(r.ffn_hidden, 0,
@@ -2186,21 +2042,14 @@ static int run_aligned(RunOpts o) {
                     CHECK(mcSetDevice(rank));
                     mcStream_t st = nullptr;
                     CHECK(mcStreamCreate(&st));
-                    MegaArgs a = make_mega_args(o, L, r, win_cap, combine_f32_off,
-                                                combine_sums2_off);
+                    fp8mega::MegaLaunchArgs a = make_mega_args(
+                        o, L, r, win_cap, combine_f32_off, combine_sums2_off);
                     while (go.load(std::memory_order_acquire) == 0) {}
                     bool cap = false;
                     cal[rank] = chain_measure(
                         st, nodes, replays,
                         [&](mcStream_t s, int) {
-                            mega_kernel<true><<<kGrid, threads, (size_t)smem, s>>>(
-                                a, NoTaskTail{});
-                            mega_reduce_kernel<<<2 * T, 256, 0, s>>>(
-                                r.sym, r.y, R, T, max_tokens, combine_f32_off,
-                                combine_sums2_off, L.topk_idx_off,
-                                L.topk_weights_off, r.bar_flags, kTaskReadyIdx,
-                                r.dbg, (int)kSpinLimit,
-                                deep_gemm::layout::kMegaMoeMaxCombineSlices);
+                            fp8mega::launch_full(a, s);
                         },
                         &per[rank], &cap);
                     caps[rank] = cap ? 1 : 0;

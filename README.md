@@ -8,25 +8,40 @@ R=32 TPR=16/64/256 性能测试（test/70）所涉及的全部文件。
 
 ```
 mini_mega/
-├── src/                       # 10 个源文件（bench.cu + 9 个 .cuh）
-├── include/deep_gemm/         # 最小外部头（mega_moe.cuh + common/{math,exception}.cuh）
-├── scripts/build.sh           # cucc 编译；优先用本工程 include/，缺失回退 MXMOEMega
+├── src/
+│   ├── megakernel.h            # host C++ 接口（公共头，bench 唯一依赖）
+│   ├── megakernel.cu           # 接口实现 + kernel 发射 -> megakernel.so
+│   ├── bench.cu                # benchmark：只调接口，不直接发射 kernel
+│   └── *.cuh                   # kernel 实现（kernel/prologue/compute/combine/flags/...）
+├── include/deep_gemm/          # 最小外部头（mega_moe.cuh + common/{math,exception}.cuh）
+├── scripts/build.sh            # 先编 megakernel.so，再链接 bench
 ├── docs/02_测试流程与性能标准.md
-├── perf.md                    # R=32 性能基准口径与基线
-├── test/70.r32_tpr_perf/      # 测试脚本/日志/结果
+├── perf.md                     # R=32 性能基准口径与基线
+├── test/70.r32_tpr_perf/       # 测试脚本/日志/结果
 │   ├── run.sh  results.md  test_info.md
-│   └── r{1,2}.log               # 2 次运行原始日志
+│   └── r{1,2}.log                # 2 次运行原始日志
 └── README.md
 ```
+
+## 分层
+
+- **接口层**：`src/megakernel.h`（声明 `fp8mega::MegaLaunchArgs` 与
+  `launch_prelude/compute/reduce/full`、`launch_empty`、`fill_weights_lane`）。
+- **实现层**：`src/megakernel.cu` 是**唯一**发射 `mega_kernel` /
+  `mega_reduce_kernel` / `mega_empty_kernel` / `fill_w_lane_kernel` 的地方，
+  编译为 `megakernel.so`。
+- **调用层**：`src/bench.cu` 只 `#include "megakernel.h"` 并链接 `megakernel.so`，
+  不包含 `kernel.cuh`、不出现任何 `<<<>>>`。
 
 ## 构建
 
 ```bash
-setarch $(uname -m) -R bash scripts/build.sh   # 确定性构建 -> ./bench
+setarch $(uname -m) -R bash scripts/build.sh   # -> ./megakernel.so + ./bench
 ```
 
 依赖：MACA（`MACA_PATH=/opt/maca`）、`cucc`、`mcr` 运行时、系统头 `cute`
-（位于 `/opt/maca/include`）。无需 torch / 容器。
+（位于 `/opt/maca/include`）。无需 torch / 容器。运行 `./bench` 时经 rpath
+`$ORIGIN` 自动加载同目录的 `./megakernel.so`。
 
 ## 测试（R=32 TPR=16/64/256）
 

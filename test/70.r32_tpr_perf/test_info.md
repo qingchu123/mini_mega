@@ -9,13 +9,10 @@
 
 | 文件 | 作用 |
 |---|---|
-| `run.sh` | 测试驱动：3 档 ×2 次，逐次 `timeout -k 3 10` |
-| `results.md` | 结果表与结论（含重编译一致性） |
+| `run.sh` | 测试驱动：单次跑全档，共 2 次，每次 `timeout -k 3 10` |
+| `results.md` | 结果表与结论 |
 | `test_info.md` | 本文件 |
-| `t16_r1.log` / `t16_r2.log` | 重编译后 TPR=16 两次运行原始日志 |
-| `t64_r1.log` / `t64_r2.log` | 重编译后 TPR=64 两次运行原始日志 |
-| `t256_r1.log` / `t256_r2.log` | 重编译后 TPR=256 两次运行原始日志 |
-| `run1/t*.log` | 重编译前首次运行的 6 个原始日志（对照用） |
+| `r1.log` / `r2.log` | 两次运行原始日志（含 R/TPR/us-kernel 表） |
 
 ### run.sh 实际执行命令
 
@@ -24,14 +21,17 @@ MACA_VISIBLE_DEVICES=0,1,...,31 timeout -k 3 10 stdbuf -oL ./bench \
   --ranks 32 --tprs 16,64,256 --nodes 20 --replays 2
 ```
 
-## 2. 源文件（编译进 `./bench`）
+## 2. 源文件（分层）
 
-`scripts/build.sh` 用 `cucc -O3 -std=c++17 -Isrc ... -o bench src/bench.cu` 单次编译，
-include 展开后参与编译的源文件如下（md5 为本机当前版本）：
+`scripts/build.sh` 分两步：(1) `src/megakernel.cu -fPIC -shared -o megakernel.so`；
+(2) `src/bench.cu` 链接 `./megakernel.so`（rpath `$ORIGIN`）。md5 为本机当前版本：
+
+### 2.1 接口层 / kernel 实现（编入 `megakernel.so`）
 
 | 文件 | 角色 | md5 |
 |---|---|---|
-| `src/bench.cu` | host harness：参数解析、路由生成、显存分配/审计、正确性与数值校验、CUDA graph 链计时、TPR 扇形；`run_aligned` = 对齐 `mega/src/bench/bench_mega_fp8.cu`（单进程、均衡、graph nodes/replays、默认不校验） | `ef1003ff50159382f2abfa2c6454e8cc` |
+| `src/megakernel.h` | host 公共接口：`fp8mega::MegaLaunchArgs` 与 `launch_{prelude,compute,reduce,full}` / `launch_empty` / `fill_weights_lane`（bench 唯一依赖） | `9c8de46588901dca9acae4abb90e1af0` |
+| `src/megakernel.cu` | 接口实现，**唯一**发射 `mega_kernel`/`mega_reduce_kernel`/`mega_empty_kernel`/`fill_w_lane_kernel` | `d3c9fa15f189845b6ae2f0531a90e886` |
 | `src/common.cuh` | 场景常量（`kEPR=8,kTopk=8,kHidden=6144,kIntermediate=2048,kGrid=32,kNSlice=4,kRing=8,kM=16`）与工具 | `292d984029abc93b658d28e17e77fe4e` |
 | `src/kernel.cuh` | 主 kernel `mega_kernel` 相位编排（前序→dispatch→L1→L2→COMBINE/REDUCE） | `718bdf4563481b055bc5e63a1a11f05d` |
 | `src/prologue.cuh` | ROUTE/PUBLISH/XBAR/TASK_SETUP 前序相位 | `30711c075e1cc91432c595c1e41b54f8` |
@@ -40,6 +40,12 @@ include 展开后参与编译的源文件如下（md5 为本机当前版本）�
 | `src/combine.cuh` | COMBINE / 融合推送 | `4d5c9d776d012f29e232a174ff52b946` |
 | `src/flags.cuh` | 旗区协议（epoch/checksum/任务就绪） | `be4912cfba1a2518425eb2491127d6af` |
 | `src/host_layout.cuh` | host/device 同源 scratch 布局偏移 | `3487d7ade401d4a90cd1fe94b514d4f6` |
+
+### 2.2 调用层（编入 `bench`）
+
+| 文件 | 角色 | md5 |
+|---|---|---|
+| `src/bench.cu` | host harness：参数解析、路由生成、显存分配/审计、正确性与数值校验、CUDA graph 链计时、TPR 扇形；`run_aligned` = 对齐 `mega/src/bench/bench_mega_fp8.cu`；**只 include `megakernel.h`，无任何 `<<<>>>`** | `87d2cb22af808afd9bee458335d8d0d2` |
 | `src/bench_check.cuh` | 行级校验与 `w_lane_get` 权威权重公式 | `8fba1343308a05922dcde03fe68be17c` |
 
 ### include 依赖图
@@ -47,22 +53,27 @@ include 展开后参与编译的源文件如下（md5 为本机当前版本）�
 ```
 bench.cu
 ├── common.cuh
-├── kernel.cuh
-│   ├── common.cuh
-│   ├── flags.cuh ── common.cuh
-│   ├── prologue.cuh ── common.cuh, flags.cuh
-│   ├── compute.cuh ── common.cuh, flags.cuh ── compute_big.cuh
-│   │                                   ── common.cuh, flags.cuh, combine.cuh
-│   └── combine.cuh ── common.cuh
 ├── host_layout.cuh ── common.cuh, <deep_gemm/layout/mega_moe.cuh>（外部）
-└── bench_check.cuh ── common.cuh, host_layout.cuh
+├── bench_check.cuh ── common.cuh, host_layout.cuh
+└── megakernel.h（接口；链接 megakernel.so）
+
+megakernel.cu（-> megakernel.so）
+├── megakernel.h
+├── common.cuh
+└── kernel.cuh
+    ├── common.cuh
+    ├── flags.cuh ── common.cuh
+    ├── prologue.cuh ── common.cuh, flags.cuh
+    ├── compute.cuh ── common.cuh, flags.cuh ── compute_big.cuh
+    │                                   ── common.cuh, flags.cuh, combine.cuh
+    └── combine.cuh ── common.cuh
 ```
 
 ## 3. 构建与外部依赖
 
 | 项 | 路径 / 值 |
 |---|---|
-| 构建脚本 | `scripts/build.sh`（`cucc -O3 -std=c++17`，产物 `./bench`） |
+| 构建脚本 | `scripts/build.sh`（`cucc -O3 -std=c++17`；产物 `./megakernel.so` + `./bench`，bench 链接 .so） |
 | 外部头 include 根 | `-I$REPO/mxmegakernel/include`，`REPO=/home/lchen1/data/projs/MXMOEMega` |
 | 外部头 | `$REPO/mxmegakernel/include/deep_gemm/layout/mega_moe.cuh`（md5 `c0562ad7e9d80c35920166ecc8049371`） |
 | 平台头 | `/opt/maca/include`、`$MACA_PATH/tools/cu-bridge/include` |
@@ -72,7 +83,8 @@ bench.cu
 
 | 文件 | 说明 | md5 |
 |---|---|---|
-| `bench` | 本次实际运行的二进制（`bash scripts/build.sh`，2026-10-05 改造后重编） | `c353addee74b9b49a4b7f4746c5fa79a` |
+| `megakernel.so` | host 接口层 + kernel 发射（bench 经 rpath `$ORIGIN` 加载） | `bfc00c0d6a499bdeccb30e04974cd805` |
+| `bench` | 本次实际运行的二进制（`bash scripts/build.sh`，2026-10-05 接口化后重编） | `9ab44acbaea95f32ca655e1e6ca7473e` |
 | `perf.md` | R=32 性能基准口径与 v0/v1 表（本次对照基线） | — |
 | `docs/02_测试流程与性能标准.md` | 性能口径/正确性协议/运行规则权威定义 | — |
 | `scripts/run.sh` | 一键正确性+性能（未用于本次纯性能测试） | — |

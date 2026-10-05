@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # 宿主机编译（cucc + mcr runtime，无需容器、不用 torch）
+#
+# 产物：
+#   megakernel.so   fp8 mega kernel 的 host C++ 接口层（src/megakernel.cu）
+#   bench           benchmark：只调用接口，链接 megakernel.so
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,11 +17,19 @@ export MACA_PATH=${MACA_PATH:-/opt/maca}
 export CUDA_HOME=${CUDA_HOME:-$MACA_PATH/tools/cu-bridge}
 mkdir -p "$HOME/_nvcc"
 
-"$MACA_PATH/tools/cu-bridge/bin/cucc" -O3 -std=c++17 \
-  -I"$MACA_PATH/tools/cu-bridge/include" \
-  -I/opt/maca/include \
-  -I"$INCLUDE_ROOT" \
-  -Isrc \
-  -o bench src/bench.cu
+CUCC="$MACA_PATH/tools/cu-bridge/bin/cucc"
+INC=(-I"$MACA_PATH/tools/cu-bridge/include" -I/opt/maca/include
+     -I"$INCLUDE_ROOT" -Isrc)
 
+# 1) 接口层 + kernel -> megakernel.so（-fPIC -shared）
+"$CUCC" -O3 -std=c++17 -fPIC -shared "${INC[@]}" \
+  -o megakernel.so src/megakernel.cu
+
+# 2) bench：只 include megakernel.h，链接 megakernel.so（rpath=$ORIGIN 便于原地运行）
+#    文件名非 lib*.so，故直接以路径链接（不用 -l）。
+"$CUCC" -O3 -std=c++17 "${INC[@]}" \
+  -o bench src/bench.cu \
+  ./megakernel.so -Wl,-rpath,'$ORIGIN'
+
+echo "built: $PWD/megakernel.so"
 echo "built: $PWD/bench"
