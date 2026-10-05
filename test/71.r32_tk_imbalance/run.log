@@ -1,0 +1,19 @@
+### 均衡基线 TPR=16（每专家恰好 16 对）
+设备数=32  topk=8  路由=均衡  graph: nodes=20 replays=2（取最小）
+R    TPR       us/kernel         口径
+32   16           354.57          graph
+### 不均衡 launch=804400
+设备数=32  topk=8  路由=不均衡(TK_INFO)  graph: nodes=20 replays=2（取最小）
+[TK_INFO] launch=804400 tokens=16 单专家最大收行=176 非零专家=199/256
+R    TPR       us/kernel         口径
+32   16          1809.95 graph max_expert=176
+### 不均衡 launch=804300
+设备数=32  topk=8  路由=不均衡(TK_INFO)  graph: nodes=20 replays=2（取最小）
+[TK_INFO] launch=804300 tokens=16 单专家最大收行=362 非零专家=199/256
+R    TPR       us/kernel         口径
+32   16          3458.19 graph max_expert=362
+### 不均衡 launch=853000
+设备数=32  topk=8  路由=不均衡(TK_INFO)  graph: nodes=20 replays=2（取最小）
+[TK_INFO] launch=853000 tokens=16 单专家最大收行=512 非零专家=178/256
+R    TPR       us/kernel         口径
+32   16          4716.84 graph max_expert=512

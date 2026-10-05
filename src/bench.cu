@@ -22,6 +22,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -326,6 +329,9 @@ struct RunOpts {
     bool max_tokens_set = false;  // --max-tokens 是否显式给出（缺省 512）
     bool tokens_set = false;      // --tokens 是否显式给出（旧单档口径）
     bool ranks_set = false;       // --ranks 是否显式给出（对齐缺省 32）
+    // 不均衡测例：从 TK_INFO 日志复现某次 launch 的每专家收行分布
+    std::string tk_info;          // --tk-info <path>
+    int tk_launch = 0;            // --tk-launch <N>（0=自动选最不均衡的全 rank launch）
 };
 
 // 16B/lane 配对 packed tile 权重填充（layout16b 契约，与 megakernel.cu 设备侧同式）：
@@ -489,6 +495,9 @@ static void usage(const char* argv0) {
         "  -R, --ranks 2|8|32   rank 数（对齐模式默认 32；legacy 默认 8）\n"
         "  --tprs A,B,C        TPR 档位（别名 --tpr/--tpr-list；'all'=14 档）\n"
         "                      缺省 = 1,4,16,32,33,64,128,256\n"
+        "  --tk-info FILE      不均衡测例：从 TK_INFO 日志复现某 launch 的每专家\n"
+        "                      收行分布（覆盖 --tprs，tpk/tokens 由日志推导）\n"
+        "  --tk-launch N       指定 TK_INFO 中的 launch 号（缺省=自动选最不均衡者）\n"
         "  --nodes N           graph 链节点数（对齐默认 20；legacy 默认 2000）\n"
         "  --replays R         graph replay 次数，取 min（对齐默认 2；legacy 默认 5）\n"
         "  --balanced          对齐模式强制均衡路由（默认即均衡）\n"
@@ -615,7 +624,14 @@ static bool parse_args(int argc, char** argv, RunOpts* o, std::string* err) {
                 return false;
             }
             if (!parse_int_list(argv[i], &o->tpr_list, err)) return false;
-        } else {
+        } else if (a == "--tk-info") {
+            if (++i >= argc) {
+                *err = "missing value for --tk-info";
+                return false;
+            }
+            o->tk_info = argv[i];
+        } else if (a == "--tk-launch") o->tk_launch = value();
+        else {
             *err = "未知参数: " + a;
             return false;
         }
@@ -1792,6 +1808,138 @@ static int run_sweep(RunOpts o) {
 }
 
 // ============================================================================
+// 不均衡测例：从 TK_INFO 日志复现一次真实 launch 的每专家收行分布
+//
+// 日志格式（MXMOEMega fp8xfp8 内核 DG_TK_INFO_EVERY）：
+//   [TK_INFO] rank=<r> launch=<n> n=<EPR> : c0 c1 ... c_{EPR-1}
+// 其中 ci = 该 rank 物理专家 i **收到**的 route pair 数（全网源 rank 汇总）。
+//
+// 复现方式：把「全局专家 e=r*EPR+le 需要 count[r][le] 个 pair」展开成一个
+// pool（按专家分组），再按 `j % R` round-robin 分给 R 个源 rank —— 每个源 rank
+// 恰好 tokens*topk 个 pair，且各专家收行数精确等于日志值。round-robin 让每个
+// 专家的一份行摊到各源 rank（每 (专家,源) ≤ ceil(count/R)），不超 slot 容量。
+// ============================================================================
+struct TkCase {
+    int tokens = 0;            // 每 rank token 数（= total/(R*topk)）
+    int launch = 0;            // 选中的 launch 号
+    int max_expert = 0;        // 单专家最大收行数（最不均衡处）
+    int nz_expert = 0;         // 非零收行的专家数
+    std::vector<std::vector<int64_t>> routes;  // [R][tokens*topk] 全局专家号
+};
+
+static bool load_tk_case(const std::string& path, int want_launch, int R,
+                         int topk, int epr, TkCase* out, std::string* err) {
+    std::ifstream f(path);
+    if (!f) {
+        *err = "无法打开 TK_INFO 文件: " + path;
+        return false;
+    }
+    std::map<int, std::map<int, std::vector<int>>> data;  // launch -> rank -> vals
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t p = line.find("[TK_INFO]");
+        if (p == std::string::npos) continue;
+        int rank = -1, launch = -1, n = -1;
+        if (std::sscanf(line.c_str() + p, "[TK_INFO] rank=%d launch=%d n=%d :",
+                        &rank, &launch, &n) != 3)
+            continue;
+        const size_t colon = line.find(':', p);
+        if (colon == std::string::npos) continue;
+        std::istringstream is(line.substr(colon + 1));
+        std::vector<int> vals;
+        int v = 0;
+        while (is >> v) vals.push_back(v);
+        if ((int)vals.size() != n || n != epr) continue;
+        data[launch][rank] = vals;
+    }
+    if (data.empty()) {
+        *err = "TK_INFO 中未解析到任何合法行: " + path;
+        return false;
+    }
+    // 选 launch：指定优先；否则在「含 R 个 rank」的 launch 里取单专家最大值最大者
+    int sel = -1, sel_max = -1;
+    if (want_launch > 0) {
+        if (!data.count(want_launch)) {
+            *err = "TK_INFO 中无 launch=" + std::to_string(want_launch);
+            return false;
+        }
+        sel = want_launch;
+    } else {
+        for (const auto& kv : data) {
+            if ((int)kv.second.size() != R) continue;
+            int mx = 0;
+            for (const auto& rk : kv.second)
+                for (int c : rk.second) mx = std::max(mx, c);
+            if (mx > sel_max) {
+                sel_max = mx;
+                sel = kv.first;
+            }
+        }
+        if (sel < 0) {
+            *err = "TK_INFO 中没有含 " + std::to_string(R) + " 个 rank 的 launch";
+            return false;
+        }
+    }
+
+    std::vector<std::vector<int>> cnt(R, std::vector<int>(epr, 0));
+    for (const auto& rk : data[sel]) {
+        if (rk.first < 0 || rk.first >= R) continue;
+        cnt[rk.first] = rk.second;
+    }
+    long long total = 0;
+    int max_expert = 0, nz = 0;
+    for (int r = 0; r < R; ++r)
+        for (int e = 0; e < epr; ++e) {
+            total += cnt[r][e];
+            if (cnt[r][e] > max_expert) max_expert = cnt[r][e];
+            if (cnt[r][e] > 0) ++nz;
+        }
+    const int per = R * topk;
+    if (total <= 0 || total % per != 0) {
+        *err = "TK_INFO launch=" + std::to_string(sel) + " 总 pair=" +
+               std::to_string(total) + " 不能被 R*topk=" + std::to_string(per) +
+               " 整除";
+        return false;
+    }
+    const int tokens = (int)(total / per);
+    if (tokens <= 0) {
+        *err = "TK_INFO 推导出 tokens<=0";
+        return false;
+    }
+    // pool：全局专家 e=r*epr+le 重复 cnt[r][le] 次；round-robin 分给各源 rank
+    out->routes.assign(R, std::vector<int64_t>((size_t)tokens * topk, 0));
+    long long j = 0;
+    for (int r = 0; r < R; ++r)
+        for (int e = 0; e < epr; ++e) {
+            const int64_t ge = (int64_t)r * epr + e;
+            for (int c = 0; c < cnt[r][e]; ++c, ++j) {
+                const int src = (int)(j % R);
+                const int idx = (int)(j / R);
+                out->routes[src][(size_t)(idx / topk) * topk + (idx % topk)] = ge;
+            }
+        }
+    // 自检：按构造出的路由回跑统计，必须逐专家等于日志值
+    std::vector<std::vector<int>> got(R, std::vector<int>(epr, 0));
+    for (int s = 0; s < R; ++s)
+        for (int64_t e : out->routes[s])
+            if (e >= 0 && e < (int64_t)R * epr) ++got[(int)(e / epr)][(int)(e % epr)];
+    for (int r = 0; r < R; ++r)
+        for (int e = 0; e < epr; ++e)
+            if (got[r][e] != cnt[r][e]) {
+                *err = "TK_INFO 路由自检失败 rank=" + std::to_string(r) +
+                       " expert=" + std::to_string(e) + " got=" +
+                       std::to_string(got[r][e]) + " want=" +
+                       std::to_string(cnt[r][e]);
+                return false;
+            }
+    out->tokens = tokens;
+    out->launch = sel;
+    out->max_expert = max_expert;
+    out->nz_expert = nz;
+    return true;
+}
+
+// ============================================================================
 // 对齐 mega bench_mega_fp8.cu 的口径（run_aligned）
 //
 // 与 run_scene 的差异：单进程、按 R **只分配一次**资源（权重/池子/IPC 全复用），
@@ -1814,13 +1962,40 @@ static int run_aligned(RunOpts o) {
         return 1;
     }
 
-    const std::vector<int> tprs =
-        o.tpr_list.empty() ? aligned_tpr_sweep() : o.tpr_list;
-    int tmax = 0;
-    for (int t : tprs) tmax = std::max(tmax, t);
+    // ---- 构造测例（tokens + 每 rank 路由）----
+    // 缺省：均衡路由 × TPR 列表；--tk-info：从日志复现一次真实（不均衡）launch。
+    const bool tk_mode = !o.tk_info.empty();
+    std::vector<TkCase> cases;
+    if (tk_mode) {
+        TkCase c;
+        std::string e;
+        if (!load_tk_case(o.tk_info, o.tk_launch, R, kTopk, kEPR, &c, &e)) {
+            std::fprintf(stderr, "[bench] %s\n", e.c_str());
+            return 2;
+        }
+        cases.push_back(c);
+    } else {
+        const std::vector<int> tprs =
+            o.tpr_list.empty() ? aligned_tpr_sweep() : o.tpr_list;
+        for (int t : tprs) {
+            TkCase c;
+            c.tokens = t;
+            c.max_expert = t * kTopk / kEPR;  // 均衡：每专家恰好 t*topk/EPR 对
+            c.routes.resize(R);
+            for (int rank = 0; rank < R; ++rank)
+                c.routes[rank] = make_routes(RoutePattern::Balanced, rank, R, t);
+            cases.push_back(c);
+        }
+    }
+    int tmax = 0, cap_need = 0;
+    for (const TkCase& c : cases) {
+        tmax = std::max(tmax, c.tokens);
+        cap_need = std::max(cap_need, c.max_expert);
+    }
     const int max_tokens =
-        o.max_tokens_set ? std::max(o.scene.max_tokens, tmax)
-                         : std::max(512, tmax);
+        o.max_tokens_set
+            ? std::max(std::max(o.scene.max_tokens, tmax), cap_need)
+            : std::max(std::max(512, tmax), cap_need);
     const int win_cap_req = (o.scene.win_cap < 0) ? 128 : o.scene.win_cap;
     const int win_cap = std::max(win_cap_req, max_tokens);
     const int nodes = o.nodes_set ? o.scene.nodes : 20;
@@ -1856,8 +2031,14 @@ static int run_aligned(RunOpts o) {
             deep_gemm::layout::kMegaMoeMaxCombineSlices * 4;
 
     std::printf(
-        "设备数=%d  topk=%d  路由=均衡  graph: nodes=%d replays=%d（取最小）\n",
-        ndev, kTopk, nodes, replays);
+        "设备数=%d  topk=%d  路由=%s  graph: nodes=%d replays=%d（取最小）\n",
+        ndev, kTopk, tk_mode ? "不均衡(TK_INFO)" : "均衡", nodes, replays);
+    if (tk_mode) {
+        const TkCase& c = cases[0];
+        std::printf(
+            "[TK_INFO] launch=%d tokens=%d 单专家最大收行=%d 非零专家=%d/%d\n",
+            c.launch, c.tokens, c.max_expert, c.nz_expert, R * kEPR);
+    }
     std::printf("%-4s %-6s %12s %14s\n", "R", "TPR", "us/kernel", "口径");
 
     std::vector<RankRes> res(R);
@@ -1995,12 +2176,11 @@ static int run_aligned(RunOpts o) {
         for (auto& t : pool) t.join();
     }
 
-    // ---- 逐 TPR：均衡路由 + graph 链全链计时 ----
-    for (int T : tprs) {
+    // ---- 逐测例：graph 链全链计时 ----
+    for (const TkCase& c : cases) {
+        const int T = c.tokens;
         o.scene.tokens = T;
-        std::vector<std::vector<int64_t>> routes(R);
-        for (int rank = 0; rank < R; ++rank)
-            routes[rank] = make_routes(RoutePattern::Balanced, rank, R, T);
+        const std::vector<std::vector<int64_t>>& routes = c.routes;
 
         // 清零 + 上传路由（一次；每档测量前后均已同步，无在途写）
         {
@@ -2063,7 +2243,8 @@ static int run_aligned(RunOpts o) {
             if (per[rank] > 0.0) best = std::min(best, per[rank]);
         if (best >= 1e30) best = -1.0;
         const bool all_cap = std::count(caps.begin(), caps.end(), 1) == R;
-        const std::string note = all_cap ? cal[0] : (cal[0] + "(部分降级)");
+        std::string note = all_cap ? cal[0] : (cal[0] + "(部分降级)");
+        if (tk_mode) note += " max_expert=" + std::to_string(c.max_expert);
         std::printf("%-4d %-6d %12.2f %14s\n", R, T, best, note.c_str());
         std::fflush(stdout);
     }

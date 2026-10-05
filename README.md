@@ -17,9 +17,11 @@ mini_mega/
 ├── scripts/build.sh            # 先编 megakernel.so，再链接 bench
 ├── docs/02_测试流程与性能标准.md
 ├── perf.md                     # R=32 性能基准口径与基线
-├── test/70.r32_tpr_perf/       # 测试脚本/日志/结果
+├── test/70.r32_tpr_perf/       # 均衡 TPR 基准
 │   ├── run.sh  results.md  test_info.md
 │   └── r{1,2}.log                # 2 次运行原始日志
+├── test/71.r32_tk_imbalance/   # 真实 TK_INFO 不均衡路由基准
+│   ├── run.sh  results.md  run.log
 └── README.md
 ```
 
@@ -58,6 +60,20 @@ MACA_VISIBLE_DEVICES=0,...,31 ./bench --ranks 32 --tprs 16,64,256 --nodes 20 --r
 
 `./bench` 不带参数 = 默认全档 R=32 TPR={1,4,16,32,33,64,128,256}（单次约 2.9s，
 满足 10s 约束）。`--aligned 0` 可退回旧的单档/扇形口径。
+
+## 不均衡测例（真实 TK_INFO）
+
+读取内核抽样日志 `0928_tk_info.log`，复现某次 launch 的每专家收行分布并建图测量：
+
+```bash
+bash test/71.r32_tk_imbalance/run.sh
+./bench --tk-info test/70.r32_tpr_perf/0928_tk_info.log --tk-launch 853000
+```
+
+日志行 `[TK_INFO] rank=r launch=n : c0..c7`；`ci` = rank r 物理专家 i 收到的 pair
+数。`--tk-launch N` 指定 launch（缺省自动选「单专家最大收行」最大的全 rank
+launch）。实测单次全链：均衡 354.6µs → 不均衡 1.81/3.46/4.72ms（max 176/362/512），
+详见 `test/71.r32_tk_imbalance/results.md`。
 
 ## 基准（本机 202，C600UL 32 卡）
 
