@@ -39,8 +39,8 @@
 //          见 [P4c]）→ fence → tid0 建 count/cum 窗口表、重置
 //          task_counter=gridDim.x → fence → task_ready=epoch（同设备旗：普通写+
 //          fence）→ fence；
-//        非 leader：等 task_ready 变化（last_ready[blockIdx] 水位）后从 prefix_tbl
-//          重建窗口表；
+//        非 leader：等 task_ready（由 lf->current_time[blockIdx] 派生 launch 身份）
+//          后从 prefix_tbl 重建窗口表；
 //        返回本 block 总窗口数 Σ_e ceil(count_e/slot_capacity)；checksum 超时 -1。
 //
 // 与骨架的差异登记：
@@ -255,7 +255,11 @@ __device__ __forceinline__ int task_setup_body(
         bool reset_ring = true, int tid_base = 0, volatile int* sb_cnt = nullptr,
         int smem_off = 0, int* prefix_ptr = nullptr,
         uint32_t* ck_dbg = nullptr, unsigned long long* ctr = nullptr) {
-    uint32_t* bar_flags = lf->bar;
+    // [M_CYCLE] 本轮 copy c：task_setup 相位用 current_time[b][1]（入口尚未自增，
+    //   全 block 同为 L ⇒ c 一致）。bar 取第 c 片，与 xbar 用同一 c（两计数器
+    //   每 launch 各同步 +1，模 M_CYCLE 恒相等）。自增仍写回 current_time。
+    const int cyc = (int)(lf->current_time[blockIdx.x][1] % M_CYCLE);
+    uint32_t* bar_flags = lf->bar[cyc];
     extern __shared__ __align__(16) uint8_t smem_raw[];
     uint32_t* s_recv = reinterpret_cast<uint32_t*>(smem_raw + smem_off);
     const int tid = threadIdx.x - tid_base;

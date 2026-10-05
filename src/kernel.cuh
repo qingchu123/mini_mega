@@ -40,10 +40,8 @@ struct MegaArgs {
     int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
     int64_t slice_flags_idx, l1_prog_idx;
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
-    int* out_total;           // [kGrid] 每 block 总窗口数
-    int* out_processed;       // [kGrid] 每 block 处理任务数
-    int* dbg;                 // [8] 诊断码
-    uint32_t* ck_dbg;         // [kEPR][16] checksum 超时行诊断（可选）
+    // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）
+    // 已迁入 local_flags（lf->...），此处不再持有独立指针。
     int max_spins;
     unsigned publish_epoch;   // publish 校验槽 epoch（阶段 1 = kPublishEpoch）
     int recv_stride;          // recv 行宽（word）= 12
@@ -51,17 +49,13 @@ struct MegaArgs {
     const uint8_t* w1;        // [EPR][2I][H] lane 序 packed tile（gate/up 配对布局）
     int l1_n_total, l1_block_n, l1_k_out;
     uint8_t* ffn_hidden;      // [EPR][ring][win_cap][I] FP8
-    float* l1_chk;            // [kGrid]
     const uint8_t* w2;        // [EPR][H][I] lane 序 packed tile
     uint16_t* l2_out;         // [kGrid][win_cap][H] BF16
     int l2_k_out;
-    float* l2_chk;            // [kGrid]
     // ---- 收尾 ----
-    int64_t combine_rows_off, combine_sums_off;  // 目标 rank 的区偏移（BF16/uint32）
-    int combine_cap;   // combine_rows/sums 行容量（= max_tokens）
+    int64_t combine_rows_off;  // 目标 rank 的 combine_rows 区偏移（BF16，留在 sym）
+    int combine_cap;   // combine_rows 行容量（= max_tokens）
     int sums_stride;   // combine_sums 每行槽数（= 32）
-    // 诊断：前序相位时间戳（block0 tid0 写；[kGrid][8]，可选）
-    unsigned long long* pre_ticks;
     // ---- [集71] 内部执行次数统计（编译期默认关：MX_DBG_COUNT=0）----
     // 整块条件编译：关闭态 MegaArgs 的布局/大小与改造前**逐字节一致**
     // （已用 .mc_fatbin md5 对比验证，见 test/71.kernel_exec_count/results.md）。
@@ -129,18 +123,18 @@ struct R29TailFuseSet<CombineTail> {
 // 计算链任务循环（tail 类型由调用点按运行期开关选择）
 template <typename TaskTail, bool kSmallOnly = false>
 __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
-                                                   TaskTail tail,
+                                                   TaskTail tail, int cycle,
                                                    uint8_t* a_smem = nullptr,
                                                    unsigned long long* ctr = nullptr) {
     dispatch_pull_body<TaskTail, kSmallOnly>(
         a.self, a.peer_bases, a.R, a.rank, a.win_cap, a.pool_stride,
         a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off, a.src_off, a.x_off,
-        a.weights_off, a.pool_off, a.w_off, a.meta_off, a.lf->bar,
+        a.weights_off, a.pool_off, a.w_off, a.meta_off, a.lf->bar[cycle],
         a.task_counter_idx, a.l2_done_idx, a.task_ready_idx, a.slice_flags_idx,
-        a.l1_prog_idx, a.out_processed, a.dbg, a.max_spins, a.w1,
-        a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.l1_chk, a.w2,
-        a.l2_out, a.l2_k_out, a.l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
-        a.prefix_ptr, a.pre_ticks, a_smem, ctr);
+        a.l1_prog_idx, a.lf->out_processed, a.lf->dbg, a.max_spins, a.w1,
+        a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.lf->l1_chk, a.w2,
+        a.l2_out, a.l2_k_out, a.lf->l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
+        a.prefix_ptr, a.lf->pre_ticks, a_smem, ctr);
 }
 
 // 主 kernel（单轮）。
@@ -150,8 +144,7 @@ template <bool kWithCompute, typename TaskTail = NoTaskTail,
           bool kSmallOnly = false>
 __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     // 相位时间戳（block0 tid0；[6]=入口 [0]=route后 [1]=publish后 [2]=xbar后 [3]=setup后）
-    const bool kTick = (a.pre_ticks != nullptr) && (blockIdx.x == 0) &&
-                       (threadIdx.x == 0);
+    const bool kTick = (blockIdx.x == 0) && (threadIdx.x == 0);
     // [集71] 计数缓冲归一（运行期开关折叠成单指针判空；编译期关闭时恒 nullptr，
     //   该局部量无人读取即被优化器消除，不进入任何 kernel 参数/寄存器）
 #if MX_DBG_COUNT
@@ -166,31 +159,39 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     }
     // [R24] A-smem 双缓冲（kernel 作用域，两类任务体共享同一块）
     __shared__ __align__(16) uint8_t s_a_smem[2][R24_MT * R24_KS * 512];
-    if (kTick) a.pre_ticks[6] = clock64();
+    if (kTick) a.lf->pre_ticks[6] = clock64();
+    // 0) [M_CYCLE] 预清 ct2=(c+2)%M_CYCLE 槽（本轮 copy c 尚未定，用 current_time
+    //   [b][0] 派生；入口全 block 同为 L ⇒ c 一致）。ct1 留给下一轮，本轮不碰。
+    mx_preclear_ct2(a.lf, a.rf);
+    __syncthreads();
     // 1) PROLOGUE：ROUTE_BUILD + PUBLISH_COUNTS（仅 block0）
     if (blockIdx.x == 0) {
         route_build_body(a.topk_idx, a.peer_bases, a.R, a.rank, a.tokens,
                          a.tbl_cap, a.src_off, a.rsc_off, 0, 0, ctr);
-        if (kTick) a.pre_ticks[0] = clock64();
+        if (kTick) a.lf->pre_ticks[0] = clock64();
         publish_counts_body(a.self, a.peer_bases, a.R, a.rank, a.rsc_off,
                             a.recv_off, a.publish_epoch, a.recv_stride, 0, ctr);
-        if (kTick) a.pre_ticks[1] = clock64();
+        if (kTick) a.lf->pre_ticks[1] = clock64();
     }
     // 2) XBAR_ROUTE_READY（全 grid，mode3：转置 + warp 并行发布）
     xbar_route_ready_body(a.rf, a.rf_peers, a.lf, a.R, a.rank,
-                          a.xrelease_idx, a.dbg, a.max_spins, 0, ctr);
-    if (kTick) a.pre_ticks[2] = clock64();
+                          a.xrelease_idx, a.lf->dbg, a.max_spins, 0, ctr);
+    if (kTick) a.lf->pre_ticks[2] = clock64();
     // 3) TASK_SETUP（block0 leader：checksum -> prefix -> 窗口表 -> task_ready）
     task_setup_body(a.self, a.R, a.rank, a.slot_capacity, a.recv_off,
                     a.prefix_off, a.lf, a.task_ready_idx,
                     a.task_counter_idx, a.l2_done_idx,
-                    a.out_total, a.dbg, a.max_spins,
+                    a.lf->out_total, a.lf->dbg, a.max_spins,
                     a.recv_stride, /*reset_ring=*/true, /*tid_base=*/0,
                     /*sb_cnt=*/nullptr, /*smem_off=*/0, a.prefix_ptr,
-                    a.ck_dbg, ctr);
-    if (kTick) a.pre_ticks[3] = clock64();
+                    a.lf->ck_dbg, ctr);
+    if (kTick) a.lf->pre_ticks[3] = clock64();
     // 4) 任务循环（DISPATCH -> L1 -> L2 -> tail(COMBINE)）
     if (kWithCompute) {
+        // [M_CYCLE] 任务循环 / COMBINE / REDUCE 用的 copy c：task_setup 结束时
+        //   current_time[b][1] 已自增到 L+1，故 (ct-1)%M_CYCLE = L%M_CYCLE，与
+        //   xbar/task_setup 所用 c 一致。COMBINE 完成标记与 REDUCE 等待须同片。
+        const int cyc = (int)((a.lf->current_time[blockIdx.x][1] - 1) % M_CYCLE);
         // [集33] tail 实例统一：任务循环恒用 CombineTail，combine 关闭时
         //   （combine_rows_off<0）融合能力置 false 且 tail 为空操作。这样
         //   mega_kernel<..., NoTaskTail> 不再实例化第二份重型任务体
@@ -204,11 +205,12 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.weights =
                     reinterpret_cast<const float*>(a.self + a.w_off);
                 tail.ctx.peer_bases = a.peer_bases;
+                tail.ctx.rf_peers = a.rf_peers;
                 tail.ctx.rows_off = a.combine_rows_off;
-                tail.ctx.sums_off = a.combine_sums_off;
                 tail.ctx.staging_cap = a.win_cap;
                 tail.ctx.combine_cap = a.combine_cap;
                 tail.ctx.block_idx = (int)blockIdx.x;
+                tail.ctx.cycle = cyc;   // [M_CYCLE] combine_sums 片
                 tail.out_base = reinterpret_cast<const uint8_t*>(a.l2_out);
                 tail.nwarps = 8;
                 tail.sums_stride = a.sums_stride;
@@ -229,6 +231,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.staging_cap = a.win_cap;
                 tail.ctx.combine_cap = a.combine_cap;
                 tail.ctx.block_idx = (int)blockIdx.x;
+                tail.ctx.cycle = cyc;   // [M_CYCLE]（combine 关闭，仅占位）
                 tail.out_base = nullptr;
                 tail.nwarps = 8;
                 tail.sums_stride = a.sums_stride;
@@ -238,8 +241,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
 #if MX_DBG_COUNT
             tail.ctr = ctr;
 #endif
-            mega_dispatch_loop<CombineTail, kSmallOnly>(a, tail,
-                                                        &s_a_smem[0][0], ctr);
+            mega_dispatch_loop<CombineTail, kSmallOnly>(
+                a, tail, cyc, &s_a_smem[0][0], ctr);
         }
     }
 }
@@ -250,10 +253,10 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
 //        编译期 MX_DBG_COUNT=0 时统计代码整体消除。
 __global__ void mega_reduce_kernel(const uint8_t* self, float* y, int R,
                                    int tokens, int combine_cap,
-                                   int64_t rows_off, int64_t sums_off,
+                                   int64_t rows_off,
                                    int64_t topk_idx_off, int64_t weights_off,
-                                   const local_flags* lf,
-                                   int64_t task_ready_idx, int* dbg,
+                                   local_flags* lf, ranks_flags* rf,
+                                   int64_t task_ready_idx,
                                    int max_spins, int sums_stride
 #if MX_DBG_COUNT
                                    ,
@@ -261,8 +264,8 @@ __global__ void mega_reduce_kernel(const uint8_t* self, float* y, int R,
                                    int dbg_count = 0
 #endif
 ) {
-    reduce_body(self, y, R, tokens, combine_cap, rows_off, sums_off,
-                topk_idx_off, weights_off, lf, task_ready_idx, dbg,
+    reduce_body(self, y, R, tokens, combine_cap, rows_off,
+                topk_idx_off, weights_off, lf, rf, task_ready_idx,
                 max_spins, sums_stride
 #if MX_DBG_COUNT
                 , mx_ctr_open(dbg_count, exec_ctr)

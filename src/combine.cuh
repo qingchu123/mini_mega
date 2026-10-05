@@ -37,12 +37,13 @@
 //     （数据推送 → __threadfence → __syncthreads → lane0 标记）。
 //   3) __device__ void reduce_body(const uint8_t* self, float* y, int R,
 //          int tokens, int combine_cap, long long combine_rows_off,
-//          long long combine_sums_off, long long topk_idx_off,
-//          long long weights_off, const uint32_t* bar_flags,
-//          long long task_ready_idx, int* dbg, int max_spins, int sums_stride)
+//          long long topk_idx_off, long long weights_off,
+//          local_flags* lf, ranks_flags* rf, long long task_ready_idx,
+//          int max_spins, int sums_stride)
 //        REDUCE：block 映射 token = blockIdx.x/2、half = blockIdx.x%2（列分半）；
-//        行完成轮询 → fence → 全块并行读 → topk 加权求和 → y（[tokens][kHidden]
-//        FP32）。epoch 取 bar_flags[task_ready_idx]（volatile）。
+//        行完成轮询（读 rf->combine_sums[k][token][s]）→ fence → 全块并行读 →
+//        topk 加权求和 → y（[tokens][kHidden] FP32）。epoch 取
+//        lf->bar[task_ready_idx]（volatile）。
 //
 // 与骨架差异（适配点，其余照抄）：
 //   1) 行数据为 BF16（生产布局）：COMBINE 直接 16B 拷贝，不再 FP32→BF16 打包
@@ -50,8 +51,8 @@
 //      行步长按 bf16 元素计。
 //   2) combine_push_pair 的列范围由 slice/NSLICE 推导（只写本 slice），与骨架
 //      独立 COMBINE（bench:1884-1910）一致，不再走 col_begin/col_count/last_pair。
-//   3) combine_sums 行槽数 sums_stride 显式传参（骨架/生产 =
-//      kMegaMoeMaxCombineSlices = 32）：本文件不 include 布局头、不引入新常量。
+//   3) combine_sums 完成标记已迁入 ranks_flags::combine_sums[k][token][slice]；
+//      combine_rows（BF16 数据）仍留在 sym。sums_stride 恒 = kCombineSlicesMax。
 //   4) 容量显式两分（docs/03 §6 防"容量混用"）：staging 行容量 staging_cap
 //      （= 窗口容量 win_capacity）与 combine_rows 行容量 combine_cap
 //      （= max_tokens，生产布局 [topk][max_tokens][H]）分别传参；骨架因默认
@@ -126,16 +127,20 @@ struct CombineCtx {
     const float* weights = nullptr;     // staging 权重视图（无效行 = 0）
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址（含 self）
     long long rows_off = -1;            // 目标 rank combine_rows 区偏移（BF16）
-    long long sums_off = -1;            // 目标 rank combine_sums 区偏移（uint32）
+    // 各 rank 的 ranks_flags（含 self）：combine_sums 完成标记区（FG 显存）
+    ranks_flags* const* rf_peers = nullptr;
     uint32_t epoch = 0;                 // 本窗 epoch（= bar_flags[task_ready]）
     int slice = 0;                      // 本 block 任务切片号 [0, kNSlice)
     int block_idx = 0;                  // staging 块号（= blockIdx.x）
     int staging_cap = 0;                // staging 行容量（= win_capacity）
     int combine_cap = 0;                // combine_rows 行容量（= max_tokens）
     // [R35] 波量化粗化：本物理任务覆盖 merge 个逻辑 slice，几何用 nslice_eff；
-    //   标记槽按逻辑 slice（slice*merge + i）写满 kNSlice。
+//        标记槽按逻辑 slice（slice*merge + i）写满 kNSlice。完成标记写目标
+//        rank 的 ranks_flags::combine_sums[k][token][slice]（FG 显存）。
     int nslice_eff = kNSlice;
     int merge = 1;
+    // [M_CYCLE] 本轮 copy c：combine_sums 取第 c 片（与 REDUCE 读取片一致）。
+    int cycle = 0;
 };
 
 // BF16 → FP32（无符号左移 16 位即得 FP32 位模式；生产同构）
@@ -379,6 +384,7 @@ __device__ __forceinline__ void combine_push_chunk(
 __device__ __forceinline__ void combine_mark_rows(
         const CombineCtx& c, int count, int lane, int warp, int nwarps,
         int sums_stride) {
+    (void)sums_stride;   // 槽 stride 固定 = kCombineSlicesMax（结构体维度）
     __threadfence();
     __syncthreads();
     for (int s2 = warp; s2 < count; s2 += nwarps) {
@@ -389,10 +395,8 @@ __device__ __forceinline__ void combine_mark_rows(
         const int stok = m[1];
         const int kk = m[2];
         if (lane == 0)
-            __stwt(reinterpret_cast<uint32_t*>(
-                       const_cast<uint8_t*>(c.peer_bases[src]) + c.sums_off) +
-                       ((size_t)kk * c.combine_cap + stok) * sums_stride +
-                       c.slice,
+            // 完成标记迁入目标 rank 的 ranks_flags::combine_sums[c][k][token][slice]
+            __stwt(&c.rf_peers[src]->combine_sums[c.cycle][kk][stok][c.slice],
                    c.epoch);
     }
 }
@@ -410,6 +414,7 @@ __device__ __forceinline__ void combine_mark_rows(
 __device__ __forceinline__ void combine_push_pair(
         const CombineCtx& c, const uint8_t* out_base, int count, int lane,
         int warp, int nwarps, int sums_stride) {
+    (void)sums_stride;   // 槽 stride 固定 = kCombineSlicesMax（结构体维度）
     // 本物理 slice 的列范围（BF16 元素；c0s 起、cols_per_slice 列）
     // [R35] 粗化后每个物理任务覆盖合并后的列段（kHidden/nslice_eff）
     const int cols_per_slice = kHidden / c.nslice_eff;
@@ -440,10 +445,7 @@ __device__ __forceinline__ void combine_push_pair(
         // slice 完成标记：槽 = 物理 slice，值 = epoch（REDUCE 以 >= epoch 放行）
         // [R37] 粒度=物理 slice（每任务 1 个标记），REDUCE 按 nslice_eff 等待
         if (lane == 0)
-            __stwt(reinterpret_cast<uint32_t*>(
-                       const_cast<uint8_t*>(c.peer_bases[src]) + c.sums_off) +
-                       ((size_t)kk * c.combine_cap + stok) * sums_stride +
-                       c.slice,
+            __stwt(&c.rf_peers[src]->combine_sums[c.cycle][kk][stok][c.slice],
                    c.epoch);
     }
 }
@@ -460,11 +462,17 @@ __device__ __forceinline__ void combine_push_pair(
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void reduce_body(
         const uint8_t* self, float* y, int R, int tokens, int combine_cap,
-        long long combine_rows_off, long long combine_sums_off,
+        long long combine_rows_off,
         long long topk_idx_off, long long weights_off,
-        const local_flags* lf, long long task_ready_idx, int* dbg,
+        local_flags* lf, ranks_flags* rf, long long task_ready_idx,
         int max_spins, int sums_stride, unsigned long long* ctr = nullptr) {
-    const uint32_t* bar_flags = lf->bar;
+    (void)sums_stride;   // 槽 stride 固定 = kCombineSlicesMax（结构体维度）
+    // [M_CYCLE] REDUCE 是独立 kernel：mega 末尾已把 current_time[0][1] 自增到 L+1
+    // （block0 为 leader，每 launch 恰自增一次），故 (ct-1)%M_CYCLE = L%M_CYCLE，
+    // 与本轮 mega 的 bar / combine_sums 片一致。用 device 计数派生，graph 安全。
+    const int cyc = (int)((lf->current_time[0][1] - 1) % M_CYCLE);
+    const uint32_t* bar_flags = lf->bar[cyc];
+    int* dbg = lf->dbg;
     // [集71] REDUCE 启动次数（block0 tid0）+ 参与 block 数（tid0）
     if (threadIdx.x == 0) {
         if (blockIdx.x == 0) MX_CTR_ADD(ctr, kCtrReduceLaunch, 1);
@@ -475,8 +483,6 @@ __device__ __forceinline__ void reduce_body(
     const int64_t* topk_idx =
         reinterpret_cast<const int64_t*>(self + topk_idx_off);
     const float* weights = reinterpret_cast<const float*>(self + weights_off);
-    const uint32_t* sums =
-        reinterpret_cast<const uint32_t*>(self + combine_sums_off);
     const uint16_t* rows_h =
         reinterpret_cast<const uint16_t*>(self + combine_rows_off);
     const int tid = (int)threadIdx.x;
@@ -510,7 +516,7 @@ __device__ __forceinline__ void reduce_body(
             const int s2 = tid % ns_eff;
             if (ok8[k]) {
                 const volatile uint32_t* part =
-                    sums + ((size_t)k * combine_cap + token) * sums_stride;
+                    &rf->combine_sums[cyc][k][token][0];
                 long long spin = 0;
                 // [集71] REDUCE 等待轮次（每 (k,slice) 标记一次）
                 MX_CTR_ADD(ctr, kCtrReduceWait, 1);

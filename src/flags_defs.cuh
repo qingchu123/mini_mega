@@ -31,10 +31,26 @@
 // 每 block 占用 MX_FLAGS_NO_CACHE 个 int64 = 512B，独立于邻块。
 constexpr int MX_FLAGS_NO_CACHE = 64;
 
+// ---- M_CYCLE 轮转（对齐参考实现 /projs/mega/src/kernel/mega_fp8.cuh）----
+//   int64_t ct = lf->current_time[b][k]; int c = (int)(ct % M_CYCLE); // 本轮用 copy c
+//   各 per-launch 旗数组带 [M_CYCLE] 旋转维：同一槽位每 M_CYCLE 轮才复用一次，
+//   其间无人触碰 ⇒ 开工时干净。完成旗可用常量、无需每轮重置；kernel 入口对
+//   ct2=(c+2)%M_CYCLE 槽做一次预清（ct1=(c+1)%M_CYCLE 是下一轮要用的槽，本轮
+//   绝不能碰；ct2 是 M_CYCLE-2 轮前用过、早已结束的那一份，清它天然安全）。
+//   唯一正确性前提（host 契约）：所有 rank 的 launch 次数必须相同，使各 block /
+//   各 rank 的 c 同步前进。M_CYCLE>=3 是「预清 ct2 + 不碰 ct1」成立的前提。
+constexpr int M_CYCLE = 4;
+
 // 旧扁平 bar_flags 布局容量（与生产布局头同源）：
 //   kBarFlagsNumInt32=1024（普通旗区）、kFp8BarFlagsNumInt32=1032（+epoch/done 保留槽）
 constexpr int kBarFlagsNumInt32 = 1024;
 constexpr int kFp8BarFlagsNumInt32 = 1032;
+
+// COMBINE 完成标记容量（kernel 侧不 include 布局头，故本地重述）：
+//   kCombineSlicesMax 与 include/deep_gemm/layout/mega_moe.cuh 的
+//   kMegaMoeMaxCombineSlices=32 一致；kMaxCombineRows = max_tokens 上限 512。
+constexpr int kCombineSlicesMax = 32;
+constexpr int kMaxCombineRows = 512;
 
 // ---- 本 rank 私有（普通显存）----
 struct alignas(256) local_flags {
@@ -44,15 +60,31 @@ struct alignas(256) local_flags {
 
     // 原 bar_flags 旗区（索引逐一对应原 kBar*Idx，行为不变）：
     //   xrelease/task_ready/task_counter/l2_done/slice_flags/l1_prog/nslice_eff ...
-    alignas(256) uint32_t bar[kFp8BarFlagsNumInt32];
+    // [M_CYCLE] 旋转维：本轮只用 bar[c]，同一槽位每 M_CYCLE 轮才复用一次。
+    alignas(256) uint32_t bar[M_CYCLE][kFp8BarFlagsNumInt32];
 
-    // task_ready 等待水位（原 last_ready）：非 leader 每 block 一份（保留语义备用）
-    alignas(256) unsigned last_ready[kGrid];
+    // ---- 控制/诊断状态（原 MegaArgs 独立指针迁入）----
+    alignas(256) int out_total[kGrid];       // 每 block 总窗口数（TASK_SETUP 写）
+    alignas(256) int out_processed[kGrid];   // 每 block 处理任务数（任务循环写）
+    alignas(256) int dbg[8];                 // 诊断码（超时归因）
+    alignas(256) uint32_t ck_dbg[kEPR * 16]; // checksum 超时行诊断（可选）
+    // 前序/计算链相位时间戳：task_trace 打开时每 block 16 槽，普通 8；统一按 16 分配
+    alignas(256) unsigned long long pre_ticks[kGrid * 16];
+    alignas(256) float l1_chk[kGrid];        // L1 数值校验累加
+    alignas(256) float l2_chk[kGrid];        // L2 数值校验累加
 };
 
 // ---- 跨 rank（FG 显存，peer 可写）----
 struct alignas(256) ranks_flags {
-    // 跨 rank ROUTE_READY barrier，转置布局 xbar_barrier[src][dst]
+    // 跨 rank ROUTE_READY barrier，转置布局 xbar_barrier[c][src][dst]
     // （与原 sym 内 barrier_slots 的 src*R+dst 语义一致，行 stride 用 kGrid）。
-    alignas(256) uint32_t xbar_barrier[kGrid][kGrid];
+    // [M_CYCLE] 旋转维：本轮只用 copy c。
+    alignas(256) uint32_t xbar_barrier[M_CYCLE][kGrid][kGrid];
+
+    // 跨 rank COMBINE 完成标记：combine_sums[c][k][token][slice] = epoch。
+    // 取代原 sym::combine_sums（uint32 区）；行 stride = kMaxCombineRows。
+    // combine_rows（BF16 数据）仍留在 sym，不在此。
+    // [M_CYCLE] 旋转维：本轮只用 copy c（±2MB/rank，可接受）。
+    alignas(256) uint32_t
+        combine_sums[M_CYCLE][kTopk][kMaxCombineRows][kCombineSlicesMax];
 };

@@ -72,10 +72,6 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.pool_off = a.pool_off;
     m.w_off = a.w_off;
     m.meta_off = a.meta_off;
-    m.out_total = a.out_total;
-    m.out_processed = a.out_processed;
-    m.dbg = a.dbg;
-    m.ck_dbg = a.ck_dbg;
     m.max_spins = a.max_spins;
     m.publish_epoch = a.publish_epoch;
     m.recv_stride = a.recv_stride;
@@ -85,16 +81,12 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.l1_block_n = a.l1_block_n;
     m.l1_k_out = a.l1_k_out;
     m.ffn_hidden = a.ffn_hidden;
-    m.l1_chk = a.l1_chk;
     m.w2 = a.w2;
     m.l2_out = a.l2_out;
     m.l2_k_out = a.l2_k_out;
-    m.l2_chk = a.l2_chk;
     m.combine_rows_off = a.combine_rows_off;
-    m.combine_sums_off = a.combine_sums_off;
     m.combine_cap = a.combine_cap;
     m.sums_stride = a.sums_stride;
-    m.pre_ticks = a.pre_ticks;
     return m;
 }
 
@@ -113,8 +105,8 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
     mega_reduce_kernel<<<2 * a.tokens, 256, 0, stream>>>(
         a.self, a.y, a.R, a.tokens, a.combine_cap, a.combine_rows_off,
-        a.combine_sums_off, a.topk_idx_off, a.weights_off, a.lf,
-        a.task_ready_idx, a.dbg, a.max_spins, a.sums_stride);
+        a.topk_idx_off, a.weights_off, a.lf, a.rf,
+        a.task_ready_idx, a.max_spins, a.sums_stride);
 }
 
 void launch_full(const MegaLaunchArgs& a, mcStream_t stream) {

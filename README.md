@@ -89,15 +89,38 @@ launch）。实测单次全链：均衡 354.6µs → 不均衡 1.81/3.46/4.72ms�
 
 - 新增 `src/flags_defs.cuh`：
   - `struct alignas(256) local_flags { int64_t current_time[kGrid][64];
-    uint32_t bar[1032]; unsigned last_ready[kGrid]; }`（普通显存，本 rank 私有）；
-  - `struct alignas(256) ranks_flags { uint32_t xbar_barrier[kGrid][kGrid]; }`
-    （FG 显存，跨 rank peer 可写）。
+    uint32_t bar[1032]; int out_total[kGrid]; int out_processed[kGrid]; int dbg[8];
+    uint32_t ck_dbg[kEPR*16]; unsigned long long pre_ticks[kGrid*16];
+    float l1_chk[kGrid]; float l2_chk[kGrid]; }`（普通显存，本 rank 私有）；
+  - `struct alignas(256) ranks_flags { uint32_t xbar_barrier[kGrid][kGrid];
+    uint32_t combine_sums[kTopk][kMaxCombineRows][kCombineSlicesMax]; }`
+    （FG 显存，跨 rank peer 可写；kMaxCombineRows=512、kCombineSlicesMax=32）。
 - `MegaArgs` / `MegaLaunchArgs` 的 `bar_flags` 改 `local_flags* lf`，
-  `epoch_ctr/last_release` 由每 block 单调 launch 计数 `lf->current_time[b][*]` 取代，
-  `last_ready` 并入 `lf->last_ready`；xbar 跨 rank 旗从 sym 迁到 `rf->xbar_barrier`。
+  `epoch_ctr/last_release` 由每 block 单调 launch 计数 `lf->current_time[b][*]` 取代；
+  xbar 跨 rank 旗从 sym 迁到 `rf->xbar_barrier`。
+- 第二轮（本提交）：把控制/诊断缓冲 `out_total/out_processed/dbg/ck_dbg/
+  pre_ticks/l1_chk/l2_chk` 从 `MegaArgs`/`MegaLaunchArgs` 独立指针/独立 mcMalloc
+  收进 `local_flags`，kernel/host 读写一律走 `lf->...`；删除已无引用的
+  `local_flags.last_ready`。跨 rank COMBINE 完成标记 `combine_sums` 从 sym 的
+  `combine_sums_off` 区迁入 `ranks_flags::combine_sums[k][token][slice]`，
+  COMBINE 推送/标记与 REDUCE 等待读取改经 `rf_peers[dst]->combine_sums`；
+  `combine_rows`（BF16 数据）仍留在 sym，sym 分配随之去掉 sums 区。
 - 行为不变：`bar[]` 索引逐一对齐原 `kBar*Idx`；可见性顺序（payload→fence→ready）
-  与自旋/超时语义保持。
+  与自旋/超时语义保持；`MX_DBG_COUNT=0` 默认零开销路径不变。
 
-正确性（旧口径 R=2/8/32，`--perf-only 0 --compute 1`）全部 `[总体] PASS`；
-性能（test/70，graph，4 次采样均值）：TPR=16/64/256 = 350.3/644.9/1906.6 µs/kernel，
-相对改前基线 353/651/1915 均略快（全在 ±3% 内，见 `perf.md` v2）。
+正确性（旧口径 R=2/32，`--perf-only 0 --compute 1`）全部 `[总体] PASS`；
+性能（test/70，graph，2 次采样）：TPR=16/64/256 = 335~340/646~648/1909~1911
+µs/kernel，相对基线 345~353/637~654/1901~1915 全在 ±3% 内（见 `perf.md` v3）。
+test/71 不均衡 1788/3483/4749µs vs 基线 1776~1810/3458~3502/4686~4717，全在 3% 内。
+
+## flag K 片轮转（M_CYCLE，对齐 mega_fp8.cuh）
+
+时间标签 `[261005_22_06]`（未提交 git）。引入 `constexpr int M_CYCLE = 4`：
+`local_flags::bar` 加 `[M_CYCLE]` 旋转维；`ranks_flags::xbar_barrier` 与
+`combine_sums` 同理（后者 +1.5MB/rank，FG 显存）。每相位按单调 launch 计数
+`current_time[b][*]` 派生 `c=ct%M_CYCLE`，只用第 c 片；内核入口对
+`ct2=(c+2)%M_CYCLE` 槽 device 侧预清（graph replay 安全）。REDUCE 独立 kernel
+由 `current_time[0][1]-1` 派生同一 c。可见性顺序与自旋/超时语义不变。
+性能：test/70 TPR16/64/256 = 337.6~340.6/637.0~639.5/1904.1~1906.7µs（全在
+基线 ±3% 内，TPR64 略快）；test/71 全档 1787/3448/4721µs（±3% 内）；R=2/32
+全 `[总体] PASS`。

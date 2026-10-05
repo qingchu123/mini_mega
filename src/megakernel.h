@@ -67,10 +67,8 @@ struct MegaLaunchArgs {
     int64_t xrelease_idx = 0, task_ready_idx = 0, task_counter_idx = 0,
             l2_done_idx = 0, slice_flags_idx = 0, l1_prog_idx = 0;
     int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;
-    int* out_total = nullptr;
-    int* out_processed = nullptr;
-    int* dbg = nullptr;
-    uint32_t* ck_dbg = nullptr;
+    // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）
+    // 已迁入 local_flags（lf->...）。
     int max_spins = 0;
     unsigned publish_epoch = 0;
     int recv_stride = 0;
@@ -79,17 +77,14 @@ struct MegaLaunchArgs {
     const uint8_t* w1 = nullptr;
     int l1_n_total = 0, l1_block_n = 0, l1_k_out = 0;
     uint8_t* ffn_hidden = nullptr;
-    float* l1_chk = nullptr;
     const uint8_t* w2 = nullptr;
     uint16_t* l2_out = nullptr;
     int l2_k_out = 0;
-    float* l2_chk = nullptr;
     // ---- 收尾 ----
-    int64_t topk_idx_off = 0;   // REDUCE 用：self + topk_idx_off = topk_idx 基址
-    int64_t combine_rows_off = -1, combine_sums_off = 0;
+    int64_t topk_idx_off = 0;    // REDUCE 用：self + topk_idx_off = topk_idx 基址
+    int64_t combine_rows_off = -1;  // combine_rows（BF16）区偏移（留在 sym）
     int combine_cap = 0;
     int sums_stride = 0;
-    unsigned long long* pre_ticks = nullptr;
     // ---- REDUCE 输出 + 发射几何（host 侧，设备不读）----
     float* y = nullptr;
     int grid = 0;

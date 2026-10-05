@@ -90,6 +90,25 @@
 #include "common.cuh"
 #include "flags_defs.cuh"
 
+// ------------------------------------------------- M_CYCLE 预清 --
+// kernel 入口对 ct2=(c+2)%M_CYCLE 槽做一次清零：本轮 copy c，ct1=(c+1)%M_CYCLE
+// 是下一轮要用的槽（本轮绝不碰，否则与下一轮竞争同一槽），ct2 是 M_CYCLE-2 轮
+// 前用过、早已结束的一份，清它天然安全。使轮转槽复用时干净，完成旗可用常量、
+// 无需每轮重置。CUDA graph replay 下该清零在 device 侧每次真实执行。
+// 仅清 per-launch 的 bar / xbar_barrier；combine_sums 用单调 epoch 判据
+// （part < epoch），旧槽值必小于本轮 epoch，无需预清。
+__device__ __forceinline__ void mx_preclear_ct2(local_flags* lf,
+                                                ranks_flags* rf) {
+    const int c0 = (int)(lf->current_time[blockIdx.x][0] % M_CYCLE);
+    const int ct2 = (c0 + 2) % M_CYCLE;
+    for (int i = (int)threadIdx.x; i < kFp8BarFlagsNumInt32;
+         i += (int)blockDim.x)
+        lf->bar[ct2][i] = 0u;
+    const int n = kGrid * kGrid;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x)
+        rf->xbar_barrier[ct2][i / kGrid][i % kGrid] = 0u;
+}
+
 // ---------------------------------------------------------------- 子集 barrier --
 // 冻结接口（[D2]）：整 warp 子集、每 warp lane0 到达、累计计数推导 phase。
 __device__ __forceinline__ void subset_barrier_n(uint32_t* smem_ctr,
@@ -246,6 +265,11 @@ __device__ __forceinline__ void xbar_route_ready_body(
         int rank, int64_t xrelease_idx, int* dbg, int max_spins,
         int tid_base = 0, unsigned long long* ctr = nullptr) {
     (void)tid_base;   // 骨架恒用 block0 的 threadIdx.x<64
+    // [M_CYCLE] 本轮 copy c：xbar 相位用 current_time[b][0]（入口尚未自增，全
+    //   block 同为 L ⇒ c 一致）；bar / xbar_barrier 均取第 c 片。自增仍写回
+    //   current_time（单调），旗值 epoch 仍单调。
+    const int cyc = (int)(lf->current_time[blockIdx.x][0] % M_CYCLE);
+    uint32_t* bar_flags = lf->bar[cyc];
     // [集71] XBAR_ROUTE_READY 参与 block 数（tid0 计一次）
     if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrPhaseXbar, 1);
     if (blockIdx.x == 0 && threadIdx.x < 64) {
@@ -262,7 +286,8 @@ __device__ __forceinline__ void xbar_route_ready_body(
         epoch = __shfl(epoch, 0, 64);   // 先广播，否则并行 lane 会发 0
         // 每 lane 发一个 peer（lane==rank 无动作）；转置槽 xbar_barrier[rank][lane]
         if (lane < R && lane != rank) {
-            uint32_t* slot = &rf_peers[lane]->xbar_barrier[rank][lane];
+            uint32_t* slot =
+                &rf_peers[lane]->xbar_barrier[cyc][rank][lane];
             __stwt(slot, epoch);
         }
         __threadfence_system();
@@ -274,7 +299,7 @@ __device__ __forceinline__ void xbar_route_ready_body(
                 const int src = lane;
                 if (src != rank) {
                     volatile const uint32_t* mine =
-                        &rf->xbar_barrier[src][rank];
+                        &rf->xbar_barrier[cyc][src][rank];
                     my_done =
                         (static_cast<int32_t>(*mine - epoch) >= 0) ? 1 : 0;
                 }
@@ -298,7 +323,7 @@ __device__ __forceinline__ void xbar_route_ready_body(
             __threadfence_system();
             // 同设备旗用普通写 + fence：__stwt 在普通显存上不更新 L2，
             // volatile 读可能长期命中旧值（实测 release 等待偶发超时）。
-            *reinterpret_cast<volatile uint32_t*>(lf->bar + xrelease_idx) =
+            *reinterpret_cast<volatile uint32_t*>(bar_flags + xrelease_idx) =
                 epoch;
         }
     }
@@ -306,7 +331,7 @@ __device__ __forceinline__ void xbar_route_ready_body(
     if (threadIdx.x == 0 && blockIdx.x != 0) {
         const int64_t c = lf->current_time[blockIdx.x][0];
         const unsigned expected = (unsigned)(c + 1);
-        volatile uint32_t* release = lf->bar + xrelease_idx;
+        volatile uint32_t* release = bar_flags + xrelease_idx;
         int spins = 0;
         while (*release != expected) {
             if (++spins > max_spins) {

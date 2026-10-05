@@ -72,18 +72,11 @@ struct RankRes {
     ranks_flags** d_rf_ptrs = nullptr;
     mcIpcMemHandle_t rf_handle;
     std::vector<ranks_flags*> peer_rf;
-    int* out_total = nullptr;
-    int* out_processed = nullptr;
-    int* dbg = nullptr;
-    uint32_t* ck_dbg = nullptr;
-    unsigned long long* pre_ticks = nullptr;
     // M2 计算链
     uint8_t* w1 = nullptr;          // [EPR][2I][H] lane 序 packed tile
     uint8_t* w2 = nullptr;          // [EPR][H][I] lane 序 packed tile
     uint8_t* ffn_hidden = nullptr;  // [EPR][ring][win_cap][I] FP8
     uint16_t* l2_out = nullptr;     // [kGrid][win_cap][H] BF16
-    float* l1_chk = nullptr;        // [kGrid]
-    float* l2_chk = nullptr;        // [kGrid]
     float* y = nullptr;             // M3：REDUCE 输出 [max_tokens][H] FP32
     uint8_t** d_base_ptrs = nullptr;
     mcIpcMemHandle_t handle;
@@ -377,7 +370,7 @@ static void fill_w_lane(std::vector<uint8_t>& buf, int n_rows, int k_cols,
 // 构造接口入参（M1：只前序；M3：combine 区偏移由调用方传入）
 static fp8mega::MegaLaunchArgs make_mega_args(
     const RunOpts& o, const ProdLayout& L, const RankRes& r, int win_cap,
-    int64_t combine_rows_off, int64_t combine_sums_off) {
+    int64_t combine_rows_off) {
     fp8mega::MegaLaunchArgs a{};
     a.topk_idx = reinterpret_cast<const int64_t*>(r.sym + L.topk_idx_off);
     a.topk_idx_off = L.topk_idx_off;
@@ -412,11 +405,6 @@ static fp8mega::MegaLaunchArgs make_mega_args(
     a.pool_off = L.expert_tokens_off;
     a.w_off = L.token_route_weights_off;
     a.meta_off = L.token_src_meta_off;
-    a.out_total = r.out_total;
-    a.out_processed = r.out_processed;
-    a.dbg = r.dbg;
-    a.ck_dbg = r.ck_dbg;
-    a.pre_ticks = r.pre_ticks;
     a.max_spins = (int)kSpinLimit;
     a.publish_epoch = kPublishEpoch;
     a.recv_stride = (int)L.recv_stride;
@@ -427,13 +415,10 @@ static fp8mega::MegaLaunchArgs make_mega_args(
     a.l1_block_n = 256;
     a.l1_k_out = kIntermediate;
     a.ffn_hidden = r.ffn_hidden;
-    a.l1_chk = r.l1_chk;
     a.w2 = r.w2;
     a.l2_out = r.l2_out;
     a.l2_k_out = kHidden;
-    a.l2_chk = r.l2_chk;
     a.combine_rows_off = combine_rows_off;
-    a.combine_sums_off = combine_sums_off;
     a.combine_cap = o.scene.max_tokens;
     a.sums_stride = deep_gemm::layout::kMegaMoeMaxCombineSlices;
     // REDUCE 输出 + 发射几何
@@ -705,13 +690,11 @@ static int run_scene(RunOpts o, SceneResult* out) {
         ((barrier_pad_off + (int64_t)o.scene.ranks * 64 * 4 + 255) / 256) * 256;
     const int64_t combine_f32_off =
         ((recv_pad_off + (int64_t)o.scene.ranks * 64 * 4 + 255) / 256) * 256;
-    const int64_t combine_sums2_off =
+    // combine_rows（BF16）末端；combine_sums 已迁入 ranks_flags，不再占 sym。
+    const int64_t combine_rows_end =
         ((combine_f32_off + (int64_t)kTopk * o.scene.max_tokens * kHidden * 2 + 255) /
          256) * 256;
-    const int64_t sym_alloc =
-        combine_sums2_off +
-        (int64_t)kTopk * o.scene.max_tokens *
-            deep_gemm::layout::kMegaMoeMaxCombineSlices * 4;
+    const int64_t sym_alloc = combine_rows_end;
 
     std::printf("============================================================\n");
     std::printf("fp8xfp8 MoE Mega Kernel 基准（M1 前序）\n");
@@ -780,20 +763,8 @@ static int run_scene(RunOpts o, SceneResult* out) {
                     r.rf = static_cast<ranks_flags*>(rfp);
                     CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
                 }
-                CHECK(mcMalloc((void**)&r.out_total, kGrid * sizeof(int)));
-                CHECK(mcMemset(r.out_total, 0, kGrid * sizeof(int)));
-                CHECK(mcMalloc((void**)&r.out_processed, kGrid * sizeof(int)));
-                CHECK(mcMemset(r.out_processed, 0, kGrid * sizeof(int)));
-                CHECK(mcMalloc((void**)&r.dbg, 8 * sizeof(int)));
-                CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
-                CHECK(mcMalloc((void**)&r.ck_dbg, (size_t)kEPR * 16 * sizeof(uint32_t)));
-                CHECK(mcMemset(r.ck_dbg, 0, (size_t)kEPR * 16 * sizeof(uint32_t)));
-                const size_t pt_cells =
-                    (size_t)kGrid * (o.task_trace ? 16 : 8);
-                CHECK(mcMalloc((void**)&r.pre_ticks,
-                               pt_cells * sizeof(unsigned long long)));
-                CHECK(mcMemset(r.pre_ticks, 0,
-                               pt_cells * sizeof(unsigned long long)));
+                // out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk
+                // 已迁入 local_flags，由上面的 lf 清零覆盖。
                 // M2 计算链资源（--compute 1）
                 if (!w1_host.empty()) {
                     CHECK(mcMalloc((void**)&r.w1, w1_host.size()));
@@ -811,10 +782,6 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                    (size_t)kGrid * win_cap * kHidden * 2));
                     CHECK(mcMemset(r.l2_out, 0,
                                    (size_t)kGrid * win_cap * kHidden * 2));
-                    CHECK(mcMalloc((void**)&r.l1_chk, kGrid * sizeof(float)));
-                    CHECK(mcMemset(r.l1_chk, 0, kGrid * sizeof(float)));
-                    CHECK(mcMalloc((void**)&r.l2_chk, kGrid * sizeof(float)));
-                    CHECK(mcMemset(r.l2_chk, 0, kGrid * sizeof(float)));
                     // M3 REDUCE 输出 y [max_tokens][H] FP32
                     CHECK(mcMalloc((void**)&r.y,
                                    (size_t)o.scene.max_tokens * kHidden *
@@ -1044,12 +1011,6 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                            (size_t)o.scene.ranks * o.scene.ranks * 4));
                             CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
                             CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
-                            CHECK(mcMemset(r.out_total, 0, kGrid * sizeof(int)));
-                            CHECK(mcMemset(r.out_processed, 0,
-                                           kGrid * sizeof(int)));
-                            CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
-                            CHECK(mcMemset(r.ck_dbg, 0,
-                                           (size_t)kEPR * 16 * sizeof(uint32_t)));
                             // 所有 rank 的第二遍清零完成后才允许各自 launch：
                             // 避免某 rank 提前 launch 的 publish 写被其他 rank 覆盖
                             if (pass == 1) rank_barrier();
@@ -1064,8 +1025,7 @@ static int run_scene(RunOpts o, SceneResult* out) {
                         th[rank] = std::thread([&, rank]() {
                             CHECK(mcSetDevice(rank));
                             fp8mega::MegaLaunchArgs args = make_mega_args(
-                                o, L, res[rank], win_cap, combine_f32_off,
-                                combine_sums2_off);
+                                o, L, res[rank], win_cap, combine_f32_off);
                             fp8mega::launch_prelude(args, 0);
                             CHECK(mcDeviceSynchronize());
                         });
@@ -1090,7 +1050,7 @@ static int run_scene(RunOpts o, SceneResult* out) {
                     std::vector<int> ts_cpu(kGrid, 0);
                     if (ok) {
                         CHECK(mcSetDevice(rank));
-                        CHECK(mcMemcpy(ts_cpu.data(), res[rank].out_total,
+                        CHECK(mcMemcpy(ts_cpu.data(), res[rank].lf->out_total,
                                        kGrid * sizeof(int),
                                        mcMemcpyDeviceToHost));
                         if (!validate_task_setup(L, o.scene.ranks, rank, routes,
@@ -1105,13 +1065,13 @@ static int run_scene(RunOpts o, SceneResult* out) {
                         std::vector<int> pfx((size_t)kEPR * (o.scene.ranks + 1), 0);
                         std::vector<uint32_t> ck((size_t)kEPR * 16, 0);
                         CHECK(mcSetDevice(rank));
-                        CHECK(mcMemcpy(dbg_cpu.data(), res[rank].dbg,
+                        CHECK(mcMemcpy(dbg_cpu.data(), res[rank].lf->dbg,
                                        8 * sizeof(int), mcMemcpyDeviceToHost));
                         CHECK(mcMemcpy(pfx.data(),
                                        res[rank].sym + L.prefix_tbl_off,
                                        pfx.size() * sizeof(int),
                                        mcMemcpyDeviceToHost));
-                        CHECK(mcMemcpy(ck.data(), res[rank].ck_dbg,
+                        CHECK(mcMemcpy(ck.data(), res[rank].lf->ck_dbg,
                                        ck.size() * sizeof(uint32_t),
                                        mcMemcpyDeviceToHost));
                         first_msg = "rank" + std::to_string(rank) + ": " + msg +
@@ -1166,25 +1126,18 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                        (size_t)o.scene.ranks * o.scene.ranks * 4));
                         CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
                         CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
-                        CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
                         if (o.task_trace)
-                            CHECK(mcMemcpy(r.dbg + 7, &kTraceSentinel, sizeof(int),
+                            CHECK(mcMemcpy(r.lf->dbg + 7, &kTraceSentinel, sizeof(int),
                                            mcMemcpyHostToDevice));
-                        CHECK(mcMemset(r.pre_ticks, 0,
-                                       (size_t)kGrid *
-                                           (o.task_trace ? 16 : 8) *
+                        CHECK(mcMemset(r.lf->pre_ticks, 0,
+                                       (size_t)kGrid * 16 *
                                            sizeof(unsigned long long)));
-                        // M3：COMBINE 目标区与完成标记清零（epoch 协议起点）
+                        // M3：COMBINE 目标区清零（combine_sums 标记在 rf，已随 rf 清零）
                         CHECK(mcMemset(r.sym + combine_f32_off, 0,
                                        (size_t)kTopk * o.scene.max_tokens *
                                            kHidden * 2));
-                        CHECK(mcMemset(r.sym + combine_sums2_off, 0,
-                                       (size_t)kTopk * o.scene.max_tokens *
-                                           deep_gemm::layout::kMegaMoeMaxCombineSlices *
-                                           4));
                         fp8mega::MegaLaunchArgs args = make_mega_args(
-                            o, L, r, win_cap, combine_f32_off,
-                            combine_sums2_off);
+                            o, L, r, win_cap, combine_f32_off);
                         // 所有 rank 清零完成后统一 launch（FG 下跨 rank 写可靠）
                         rank_barrier();
                         const bool rt = red_timing();
@@ -1236,12 +1189,12 @@ static int run_scene(RunOpts o, SceneResult* out) {
             }
             std::vector<unsigned long long> pt(8, 0);
             CHECK(mcSetDevice(0));
-            CHECK(mcMemcpy(pt.data(), res[0].pre_ticks,
+            CHECK(mcMemcpy(pt.data(), res[0].lf->pre_ticks,
                            8 * sizeof(unsigned long long), mcMemcpyDeviceToHost));
             if (o.task_trace) {
                 // 第二 bank：pt + kGrid*8；每块 8 槽
                 std::vector<unsigned long long> tr((size_t)kGrid * 8, 0);
-                CHECK(mcMemcpy(tr.data(), res[0].pre_ticks + (size_t)kGrid * 8,
+                CHECK(mcMemcpy(tr.data(), res[0].lf->pre_ticks + (size_t)kGrid * 8,
                                tr.size() * sizeof(unsigned long long),
                                mcMemcpyDeviceToHost));
                 std::printf(
@@ -1268,11 +1221,11 @@ static int run_scene(RunOpts o, SceneResult* out) {
                 std::vector<float> l1c(kGrid, 0), l2c(kGrid, 0);
                 std::vector<int> proc(kGrid, 0);
                 CHECK(mcSetDevice(0));
-                CHECK(mcMemcpy(l1c.data(), res[0].l1_chk, kGrid * sizeof(float),
+                CHECK(mcMemcpy(l1c.data(), res[0].lf->l1_chk, kGrid * sizeof(float),
                                mcMemcpyDeviceToHost));
-                CHECK(mcMemcpy(l2c.data(), res[0].l2_chk, kGrid * sizeof(float),
+                CHECK(mcMemcpy(l2c.data(), res[0].lf->l2_chk, kGrid * sizeof(float),
                                mcMemcpyDeviceToHost));
-                CHECK(mcMemcpy(proc.data(), res[0].out_processed,
+                CHECK(mcMemcpy(proc.data(), res[0].lf->out_processed,
                                kGrid * sizeof(int), mcMemcpyDeviceToHost));
                 int sum_proc = 0, min_proc = 1 << 30, max_proc = 0;
                 for (int b = 0; b < kGrid; ++b) {
@@ -1434,9 +1387,6 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                        (size_t)o.scene.ranks * o.scene.ranks * 4));
                         CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
                         CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
-                        CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
-                        CHECK(mcMemset(r.ck_dbg, 0,
-                                       (size_t)kEPR * 16 * sizeof(uint32_t)));
                         if (pass == 1) rank_barrier();
                     });
                 }
@@ -1447,7 +1397,7 @@ static int run_scene(RunOpts o, SceneResult* out) {
                 return [&, rank, with_reduce](mcStream_t s) {
                     RankRes& r = res[rank];
                     const fp8mega::MegaLaunchArgs a2 = make_mega_args(
-                        o, L, r, win_cap, combine_f32_off, combine_sums2_off);
+                        o, L, r, win_cap, combine_f32_off);
                     if (!o.compute) {
                         fp8mega::launch_prelude(a2, s);
                         return;
@@ -1525,7 +1475,7 @@ static int run_scene(RunOpts o, SceneResult* out) {
                 for (int rank = 0; rank < o.scene.ranks; ++rank) {
                     std::vector<int> d8(8, 0);
                     CHECK(mcSetDevice(rank));
-                    CHECK(mcMemcpy(d8.data(), res[rank].dbg, 8 * sizeof(int),
+                    CHECK(mcMemcpy(d8.data(), res[rank].lf->dbg, 8 * sizeof(int),
                                    mcMemcpyDeviceToHost));
                     std::printf("  [dbg] rank%d=[", rank);
                     for (int d = 0; d < 8; ++d)
@@ -2034,13 +1984,11 @@ static int run_aligned(RunOpts o) {
         ((barrier_pad_off + (int64_t)R * 64 * 4 + 255) / 256) * 256;
     const int64_t combine_f32_off =
         ((recv_pad_off + (int64_t)R * 64 * 4 + 255) / 256) * 256;
-    const int64_t combine_sums2_off =
+    // combine_rows（BF16）末端；combine_sums 已迁入 ranks_flags，不再占 sym。
+    const int64_t combine_rows_end =
         ((combine_f32_off + (int64_t)kTopk * max_tokens * kHidden * 2 + 255) / 256) *
         256;
-    const int64_t sym_alloc =
-        combine_sums2_off +
-        (int64_t)kTopk * max_tokens *
-            deep_gemm::layout::kMegaMoeMaxCombineSlices * 4;
+    const int64_t sym_alloc = combine_rows_end;
 
     std::printf(
         "设备数=%d  topk=%d  路由=%s  graph: nodes=%d replays=%d（取最小）\n",
@@ -2095,20 +2043,8 @@ static int run_aligned(RunOpts o) {
                     r.rf = static_cast<ranks_flags*>(rfp);
                     CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
                 }
-                CHECK(mcMalloc((void**)&r.out_total, kGrid * sizeof(int)));
-                CHECK(mcMemset(r.out_total, 0, kGrid * sizeof(int)));
-                CHECK(mcMalloc((void**)&r.out_processed, kGrid * sizeof(int)));
-                CHECK(mcMemset(r.out_processed, 0, kGrid * sizeof(int)));
-                CHECK(mcMalloc((void**)&r.dbg, 8 * sizeof(int)));
-                CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
-                CHECK(mcMalloc((void**)&r.ck_dbg,
-                               (size_t)kEPR * 16 * sizeof(uint32_t)));
-                CHECK(mcMemset(r.ck_dbg, 0,
-                               (size_t)kEPR * 16 * sizeof(uint32_t)));
-                CHECK(mcMalloc((void**)&r.pre_ticks,
-                               (size_t)kGrid * 8 * sizeof(unsigned long long)));
-                CHECK(mcMemset(r.pre_ticks, 0,
-                               (size_t)kGrid * 8 * sizeof(unsigned long long)));
+                // out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk
+                // 已迁入 local_flags，由上面的 lf 清零覆盖。
                 CHECK(mcMalloc((void**)&r.w1, w1_host.size()));
                 CHECK(mcMalloc((void**)&r.w2, w2_host.size()));
                 fp8mega::fill_weights_lane(r.w1, kEPR * 2 * kIntermediate,
@@ -2123,10 +2059,6 @@ static int run_aligned(RunOpts o) {
                                (size_t)kGrid * win_cap * kHidden * 2));
                 CHECK(mcMemset(r.l2_out, 0,
                                (size_t)kGrid * win_cap * kHidden * 2));
-                CHECK(mcMalloc((void**)&r.l1_chk, kGrid * sizeof(float)));
-                CHECK(mcMemset(r.l1_chk, 0, kGrid * sizeof(float)));
-                CHECK(mcMalloc((void**)&r.l2_chk, kGrid * sizeof(float)));
-                CHECK(mcMemset(r.l2_chk, 0, kGrid * sizeof(float)));
                 CHECK(mcMalloc((void**)&r.y,
                                (size_t)max_tokens * kHidden * sizeof(float)));
                 CHECK(mcMemset(r.y, 0,
@@ -2233,9 +2165,6 @@ static int run_aligned(RunOpts o) {
                                    (size_t)R * R * 4));
                     CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
                     CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
-                    CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
-                    CHECK(mcMemset(r.ck_dbg, 0,
-                                   (size_t)kEPR * 16 * sizeof(uint32_t)));
                     rank_barrier();
                 });
             for (auto& t : th) t.join();
@@ -2254,7 +2183,7 @@ static int run_aligned(RunOpts o) {
                     mcStream_t st = nullptr;
                     CHECK(mcStreamCreate(&st));
                     fp8mega::MegaLaunchArgs a = make_mega_args(
-                        o, L, r, win_cap, combine_f32_off, combine_sums2_off);
+                        o, L, r, win_cap, combine_f32_off);
                     while (go.load(std::memory_order_acquire) == 0) {}
                     bool cap = false;
                     cal[rank] = chain_measure(

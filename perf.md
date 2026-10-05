@@ -69,6 +69,69 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 31) timeout -k 3 15 ./bench \
 
 > 结论：三档均略快于基线（全在 ±3% 内，无性能下降）；正确性 R=2/8/32 全 `[总体] PASS`。
 
+## v3：控制/诊断状态与 combine_sums 收进 flag 结构体
+
+时间标签：`[261005]`（未提交 git）。在 v2 基础上继续收敛：
+`out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk` 从
+`MegaArgs`/`MegaLaunchArgs` 的独立指针 + 独立 mcMalloc 收进 `local_flags`，
+kernel/host 读写一律走 `lf->...`；删除已无引用的 `local_flags.last_ready`。
+跨 rank COMBINE 完成标记 `combine_sums` 从 sym 区迁入
+`ranks_flags::combine_sums[kTopk][kMaxCombineRows][kCombineSlicesMax]`
+（=8×512×32×4=512KB/rank），COMBINE 推送/标记与 REDUCE 等待改经
+`rf_peers[dst]->combine_sums`；`combine_rows`（BF16 数据）仍留 sym，
+sym 分配随之去掉 sums 区，`sums_stride` 恒 = kCombineSlicesMax=32。
+
+同机同口径（test/70 graph，2 次采样；基线为任务给定值）：
+
+| TPR | 基线 (µs) | v3 (µs) | v3 相对基线 |
+|---:|---:|---:|---:|
+| 16 | 345~353 | 335.2 / 339.6 | −1.5% ~ +0.8% |
+| 64 | 637~654 | 645.9 / 647.7 | −0.2% ~ +1.7% |
+| 256 | 1901~1915 | 1909.4 / 1910.6 | −0.6% ~ +0.5% |
+
+test/71 不均衡（TK_INFO）：均衡 347.2µs；max176/362/512 = 1788.2/3483.2/4749.1µs
+vs 基线 346~355 / 1776~1810 / 3458~3502 / 4686~4717，全档在 ±3% 内。
+
+> 结论：无性能回退（三档与不均衡全档均在 ±3% 内）；正确性 R=2 与 R=32 全 `[总体] PASS`。
+> 未做（可选）：`route_slot_counts`/`expert_recv_counts` 小计数未搬入 `ranks_flags`。
+
+## v4：flag K 片轮转（M_CYCLE）
+
+时间标签：`[261005_22_06]`（未提交 git）。按参考实现 `mega/src/kernel/mega_fp8.cuh`
+加入 `constexpr int M_CYCLE = 4` 与轮转维：
+
+- `local_flags::bar` → `bar[M_CYCLE][kFp8BarFlagsNumInt32]`；
+  `ranks_flags::xbar_barrier` → `[M_CYCLE][kGrid][kGrid]`；
+  `ranks_flags::combine_sums` → `[M_CYCLE][kTopk][kMaxCombineRows][kCombineSlicesMax]`
+  （+1.5MB/rank，FG 显存，可接受）。
+- 每相位入口按 `current_time[b][0]/[b][1]` 的单调 launch 计数派生
+  `c = ct % M_CYCLE`，把 `&lf->bar[c][0]` / `&rf->xbar_barrier[c][0][0]` /
+  `&rf->combine_sums[c][0][0][0]` 作为本轮「当前 cycle 切片」传入现有同步函数，
+  `flags.cuh` 的 `bar_flags + idx` 寻址逻辑不变。内核入口对
+  `ct2=(c+2)%M_CYCLE` 槽做一次 device 侧预清（CUDA graph replay 安全）。
+- `l2_done` 仍随 `bar[c]` 轮转：它在 TASK_SETUP 每轮被重置为 0、判据是
+  launch 内相对计数，轮转不影响其目标推导（方案 a 的等价实现）。
+- REDUCE 是独立 kernel：读 `current_time[0][1]-1` 派生同一 c，读取
+  `lf->bar[c]` 与 `rf->combine_sums[c]`，graph 下无需 host 传参。
+
+同机同口径（test/70 graph，4 次采样；基线为同会话改前）：全档在 ±3% 内，
+其中 TPR=64 略快（−2.2%）。test/71 不均衡全档 1787/3448/4721µs vs 基线
+1784/3479/4709，全在 ±3% 内；均衡复测 337µs（与基线 336.8 持平）。
+正确性 R=2 与 R=32 全 `[总体] PASS`。
+
+| 口径 | 基线 (µs) | v4 (µs) | v4 相对基线 |
+|---|---:|---:|---:|
+| test70 TPR16 | 342.8 | 337.6~340.6 | +0.6%~+1.5% |
+| test70 TPR64 | 651.6 | 637.0~639.5 | **+1.9%~+2.2%** |
+| test70 TPR256 | 1905.4 | 1904.1~1906.7 | ~0% |
+| test71 均衡 | 338.6 | 337.1~346.8 | −2.4%~+0.4% |
+| test71 max176 | 1784.2 | 1787.2 | −0.2% |
+| test71 max362 | 3479.0 | 3448.4 | +0.9% |
+| test71 max512 | 4708.8 | 4721.4 | −0.3% |
+
+> 结论：M_CYCLE 轮转未引入性能回退，且为完成旗「无需每轮重置」提供了机制
+> 保证；测试 R=2/R=32 全 PASS。
+
 ## 追加方式（后续每次优化）
 在表尾新增一列：`| vN (µs) | vN 提升 |`，其中 `vN 提升 = (v0 − vN) / v0`，
 并在「版本记录」追加一行说明该版本改动。示例（v2 占位，勿填入未测数据）：
