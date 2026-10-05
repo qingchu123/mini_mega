@@ -24,14 +24,14 @@
 //      行尾校验槽 = ~(Σ行内计数 + epoch)。
 //   3) int task_setup_body(const uint8_t* self, int R, int rank,
 //                          int slot_capacity, int64_t recv_off,
-//                          int64_t prefix_off, uint32_t* bar_flags,
+//                          int64_t prefix_off, local_flags* lf,
 //                          int64_t task_ready_idx, int64_t task_counter_idx,
-//                          int64_t l2_done_idx, unsigned* epoch_ctr,
-//                          unsigned* last_ready, int* out_total, int* dbg,
+//                          int64_t l2_done_idx, int* out_total, int* dbg,
 //                          int max_spins, int recv_stride = 12,
 //                          bool reset_ring = true, int tid_base = 0,
 //                          volatile int* sb_cnt = nullptr, int smem_off = 0,
 //                          int* prefix_ptr = nullptr);
+//        launch 身份（task_ready 旗值）改由 lf->current_time[b][1] 派生。
 //      TASK_SETUP（leader=block0，bench:443-588）：
 //        leader：FG 快轮询 checksum（Σ+epoch==~csum；R≤8 warp-per-row 用 __ldcv
 //          读 entry/cslot，R>8 lane-per-row 用 __ldcv 读 vals/cslot）→ 成功批写
@@ -248,13 +248,14 @@ __device__ __forceinline__ uint32_t warp_sum_u32_64(uint32_t value, int lane) {
 // task_counter/l2_done 重置 → task_ready=epoch；非 leader 等 task_ready 后重建窗口表。
 __device__ __forceinline__ int task_setup_body(
         const uint8_t* self, int R, int rank, int slot_capacity,
-        int64_t recv_off, int64_t prefix_off, uint32_t* bar_flags,
+        int64_t recv_off, int64_t prefix_off, local_flags* lf,
         int64_t task_ready_idx, int64_t task_counter_idx, int64_t l2_done_idx,
-        unsigned* epoch_ctr, unsigned* last_ready, int* out_total, int* dbg,
+        int* out_total, int* dbg,
         int max_spins, int recv_stride = (int)((kEPR + 1 + 3) & ~3),
         bool reset_ring = true, int tid_base = 0, volatile int* sb_cnt = nullptr,
         int smem_off = 0, int* prefix_ptr = nullptr,
         uint32_t* ck_dbg = nullptr, unsigned long long* ctr = nullptr) {
+    uint32_t* bar_flags = lf->bar;
     extern __shared__ __align__(16) uint8_t smem_raw[];
     uint32_t* s_recv = reinterpret_cast<uint32_t*>(smem_raw + smem_off);
     const int tid = threadIdx.x - tid_base;
@@ -289,7 +290,10 @@ __device__ __forceinline__ int task_setup_body(
         // 计数器的可见性由 ② 的 __threadfence + sb 与 task_ready release 覆盖。
         if (tid == 0) {
             *(volatile int*)(bar_flags + task_counter_idx) = (int)gridDim.x;
-            my_epoch = atomicAdd(epoch_ctr, 2u) + 1u;
+            // launch 身份由 block0 自己的 current_time[0][1] 派生（取代 epoch_ctr）
+            const int64_t c = lf->current_time[0][1];
+            my_epoch = (unsigned)(c + 1);
+            lf->current_time[0][1] = c + 1;
         }
         // ① FG 快轮询 checksum，成功即把同一批已读值写入 smem（bench:477-548）
         if (R <= 8) {
@@ -436,13 +440,13 @@ __device__ __forceinline__ int task_setup_body(
                 my_epoch;
         }
     } else {
-        // 非 leader（[P2c] 生产语义）：等 task_ready 变化后再读 prefix_tbl
+        // 非 leader（[P2c] 生产语义）：等 task_ready 到本 launch 的 epoch 后再读 prefix_tbl
         if (tid == 0) {
+            const int64_t c = lf->current_time[blockIdx.x][1];
+            const unsigned expected = (unsigned)(c + 1);
             volatile const uint32_t* ready = bar_flags + task_ready_idx;
-            unsigned* last = last_ready + blockIdx.x;
-            const unsigned prev = *last;
             long long spin = 0;
-            while (*ready == prev) {
+            while (*ready != expected) {
                 if (++spin > max_spins) {
                     if (dbg) atomicAdd(dbg + 3, 1);
                     break;
@@ -452,7 +456,7 @@ __device__ __forceinline__ int task_setup_body(
             MX_CTR_ADD(ctr, kCtrTaskReadyWait, 1);
             MX_CTR_ADD(ctr, kCtrTaskReadySpin, spin);
             if (spin > max_spins) MX_CTR_ADD(ctr, kCtrTaskReadyTimeout, 1);
-            *last = *ready;
+            lf->current_time[blockIdx.x][1] = c + 1;
             __threadfence();
             // 等待与建表合并（原两次 barrier -> 一次）
             int total = 0;

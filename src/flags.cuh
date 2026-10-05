@@ -38,22 +38,21 @@
 //                               int pool_slot, int slice, unsigned epoch,
 //                               int nslice = kNSlice);
 //      L1 完成旗发布：__threadfence() 后 __stwt 写 epoch（每 (pool_slot,slice) 一旗）。
-//   8) void xbar_route_ready_body(const uint8_t* self_sym,
-//                                 uint8_t* const* peer_bases, int R, int rank,
-//                                 int64_t barrier_slots_off, unsigned* epoch_ctr,
-//                                 uint32_t* bar_flags, int64_t xrelease_idx,
-//                                 unsigned* last_release, int* dbg, int max_spins,
+//   8) void xbar_route_ready_body(ranks_flags* rf,
+//                                 ranks_flags* const* rf_peers,
+//                                 local_flags* lf, int R, int rank,
+//                                 int64_t xrelease_idx, int* dbg, int max_spins,
 //                                 int tid_base = 0);
 //      mode3 跨 rank ROUTE_READY barrier：block0 前 64 lane 发布（lane→peer 并行，
-//      barrier_slots[src][dst] 转置，__stwt）+ ballot 收齐（popcll==64）；lane0
-//      fence 后写 release=epoch；其余 block tid0 等 release 变化
-//      （last_release[blockIdx]），末尾全块 __syncthreads()。
+//      rf->xbar_barrier[src][dst] 转置，__stwt）+ ballot 收齐（popcll==64）；lane0
+//      fence 后写 release=epoch；其余 block tid0 等 release 到本 launch epoch
+//      （由各自的 lf->current_time[b][0] 派生），末尾全块 __syncthreads()。
 //
 // 与骨架的差异登记：
-//   [D1] xbar_route_ready_body：冻结签名缺少 release 旗与每 block 等待水位，
-//        mode3 语义必需，故在冻结 6 参之后追加 bar_flags/xrelease_idx/
-//        last_release/dbg/max_spins（与骨架 xbar_body_v<3> 参数一致，bench:298-385）；
-//        骨架诊断开关 skip_wait 移除（恒 false）。tid_base 保留但按骨架恒用
+//   [D1] xbar_route_ready_body：冻结签名缺少 release 旗与每 block 等待身份，
+//        mode3 语义必需，故追加 rf/rf_peers/lf/xrelease_idx/dbg/max_spins；
+//        launch 身份改由 local_flags::current_time 派生（取代 epoch_ctr/last_release）；
+//        骨架诊断开关 skip_wait 移除（恒 false）。tid_base 保留但恒用
 //        block0 的 threadIdx.x<64（WS 子集发布未验证，不启用）。
 //   [D2] subset_barrier_n：骨架为 (cnt, phase, tid_base, nwarps)（bench:428-437），
 //        冻结签名收敛为 (smem_ctr, nthreads)：phase 由累计计数推导
@@ -89,6 +88,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "flags_defs.cuh"
 
 // ---------------------------------------------------------------- 子集 barrier --
 // 冻结接口（[D2]）：整 warp 子集、每 warp lane0 到达、累计计数推导 phase。
@@ -233,36 +233,40 @@ __device__ __forceinline__ void l1_progress_publish(
 }
 
 // ------------------------------------------------- mode3 跨 rank barrier --
-// 与骨架 xbar_body_v<3> 同构（bench:298-385）：转置布局 barrier_slots[src][dst]
+// 与骨架 xbar_body_v<3> 同构：转置布局 ranks_flags::xbar_barrier[src][dst]
 // + lane→peer 并行发布 + ballot 收齐 + lane0 release；非 block0 仅 tid0 等 release。
-// [D1] 追加 bar_flags/xrelease_idx/last_release/dbg/max_spins；tid_base 保留不启用。
+//
+// flag 结构改造（对齐参考实现）：
+//   * 跨 rank 旗区从 sym 的 barrier_slots 移入 ranks_flags（FG 显存，peer 可写）；
+//   * launch 身份由 local_flags::current_time[b][0] 派生，取代 epoch_ctr/水位。
+//     block0 读自己槽 c 并发布 epoch=c+1，写回 c+1；其余 block 读自己槽 c，
+//     期望 release==c+1，通过后写回 c+1。同一 launch 内各 block 计数同步前进。
 __device__ __forceinline__ void xbar_route_ready_body(
-        const uint8_t* self_sym, uint8_t* const* peer_bases, int R, int rank,
-        int64_t barrier_slots_off, unsigned* epoch_ctr, uint32_t* bar_flags,
-        int64_t xrelease_idx, unsigned* last_release, int* dbg, int max_spins,
+        ranks_flags* rf, ranks_flags* const* rf_peers, local_flags* lf, int R,
+        int rank, int64_t xrelease_idx, int* dbg, int max_spins,
         int tid_base = 0, unsigned long long* ctr = nullptr) {
-    (void)tid_base;   // 骨架恒用 block0 的 threadIdx.x<64（见 [D1]）
+    (void)tid_base;   // 骨架恒用 block0 的 threadIdx.x<64
     // [集71] XBAR_ROUTE_READY 参与 block 数（tid0 计一次）
     if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrPhaseXbar, 1);
     if (blockIdx.x == 0 && threadIdx.x < 64) {
         const int lane = threadIdx.x;
         __threadfence_system();
-        // [D7a][V4] warp 内收敛：确保各 lane 的 release fence 先于 lane0 的
-        // announce（route 远端写已收敛到 warp0，见 prologue.cuh [P8]）
+        // 各 lane 的 release fence 先于 lane0 的 announce
         __syncwarp();
         unsigned epoch = 0;
-        if (lane == 0) epoch = atomicAdd(epoch_ctr, 2u) + 1u;
+        if (lane == 0) {
+            const int64_t c = lf->current_time[0][0];
+            epoch = (unsigned)(c + 1);
+            lf->current_time[0][0] = c + 1;
+        }
         epoch = __shfl(epoch, 0, 64);   // 先广播，否则并行 lane 会发 0
-        // 每 lane 发一个 peer（lane==rank 无动作）；mode3 转置 idx = rank*R + lane
+        // 每 lane 发一个 peer（lane==rank 无动作）；转置槽 xbar_barrier[rank][lane]
         if (lane < R && lane != rank) {
-            const size_t idx = (size_t)(rank * R + lane);
-            uint32_t* slot = reinterpret_cast<uint32_t*>(
-                const_cast<uint8_t*>(peer_bases[lane]) + barrier_slots_off +
-                idx * 4);
+            uint32_t* slot = &rf_peers[lane]->xbar_barrier[rank][lane];
             __stwt(slot, epoch);
         }
         __threadfence_system();
-        // 收齐自己该收的槽：转置槽 (src*R+rank)；lane<R 各自轮询 + ballot 聚合
+        // 收齐自己该收的槽：xbar_barrier[src][rank]；lane<R 各自轮询 + ballot 聚合
         int spins = 0;
         while (true) {
             int my_done = 1;
@@ -270,9 +274,7 @@ __device__ __forceinline__ void xbar_route_ready_body(
                 const int src = lane;
                 if (src != rank) {
                     volatile const uint32_t* mine =
-                        reinterpret_cast<volatile const uint32_t*>(
-                            self_sym + barrier_slots_off +
-                            (size_t)(src * R + rank) * 4);
+                        &rf->xbar_barrier[src][rank];
                     my_done =
                         (static_cast<int32_t>(*mine - epoch) >= 0) ? 1 : 0;
                 }
@@ -296,18 +298,17 @@ __device__ __forceinline__ void xbar_route_ready_body(
             __threadfence_system();
             // 同设备旗用普通写 + fence：__stwt 在普通显存上不更新 L2，
             // volatile 读可能长期命中旧值（实测 release 等待偶发超时）。
-            *reinterpret_cast<volatile uint32_t*>(bar_flags + xrelease_idx) =
+            *reinterpret_cast<volatile uint32_t*>(lf->bar + xrelease_idx) =
                 epoch;
-            // [V1x] 尾 fence_system 删除：release 之后本 lane 不再发布依赖数据
         }
     }
-    // 非 block0：tid0 等 release 变化，写回水位 + fence，再全块同步
+    // 非 block0：tid0 等 release 到本 launch 的 epoch，写回计数 + fence，再全块同步
     if (threadIdx.x == 0 && blockIdx.x != 0) {
-        volatile uint32_t* release = bar_flags + xrelease_idx;
-        unsigned* last = last_release + blockIdx.x;
-        const unsigned prev = *last;
+        const int64_t c = lf->current_time[blockIdx.x][0];
+        const unsigned expected = (unsigned)(c + 1);
+        volatile uint32_t* release = lf->bar + xrelease_idx;
         int spins = 0;
-        while (*release == prev) {
+        while (*release != expected) {
             if (++spins > max_spins) {
                 if (dbg) {
                     atomicAdd(dbg + 1, 1);
@@ -321,7 +322,7 @@ __device__ __forceinline__ void xbar_route_ready_body(
         MX_CTR_ADD(ctr, kCtrXbarWait, 1);
         MX_CTR_ADD(ctr, kCtrXbarSpin, spins);
         if (spins > max_spins) MX_CTR_ADD(ctr, kCtrXbarTimeout, 1);
-        *last = *release;
+        lf->current_time[blockIdx.x][0] = c + 1;
         // [D7b][V5] 同设备旗 acquire 用设备域 fence（release 旗与消费数据均在
         // 本地显存；跨 rank 数据不经此路径）
         __threadfence();

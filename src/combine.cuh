@@ -62,6 +62,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "flags_defs.cuh"
 
 // [R30] 推送流水实验开关（默认关：与 R29 交付逐字等价）
 //   R30_PUSH_RUN  ：融合推送行分配改为 warp 连续段（减小跨目标 rank 的行步跳）
@@ -461,8 +462,9 @@ __device__ __forceinline__ void reduce_body(
         const uint8_t* self, float* y, int R, int tokens, int combine_cap,
         long long combine_rows_off, long long combine_sums_off,
         long long topk_idx_off, long long weights_off,
-        const uint32_t* bar_flags, long long task_ready_idx, int* dbg,
+        const local_flags* lf, long long task_ready_idx, int* dbg,
         int max_spins, int sums_stride, unsigned long long* ctr = nullptr) {
+    const uint32_t* bar_flags = lf->bar;
     // [集71] REDUCE 启动次数（block0 tid0）+ 参与 block 数（tid0）
     if (threadIdx.x == 0) {
         if (blockIdx.x == 0) MX_CTR_ADD(ctr, kCtrReduceLaunch, 1);

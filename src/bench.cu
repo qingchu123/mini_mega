@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "common.cuh"
+#include "flags_defs.cuh"
 #include "host_layout.cuh"
 #include "bench_check.cuh"
 #include "megakernel.h"   // host C++ 接口（链接 megakernel.so）；不直接发射 kernel
@@ -66,10 +67,11 @@ struct RankRes {
     int rank = -1;
     int dev = -1;
     uint8_t* sym = nullptr;
-    uint32_t* bar_flags = nullptr;
-    unsigned* epoch_ctr = nullptr;
-    unsigned* last_release = nullptr;
-    unsigned* last_ready = nullptr;
+    local_flags* lf = nullptr;      // 本 rank 私有旗区（普通显存）
+    ranks_flags* rf = nullptr;      // 跨 rank 旗区（FG 显存）
+    ranks_flags** d_rf_ptrs = nullptr;
+    mcIpcMemHandle_t rf_handle;
+    std::vector<ranks_flags*> peer_rf;
     int* out_total = nullptr;
     int* out_processed = nullptr;
     int* dbg = nullptr;
@@ -251,7 +253,8 @@ static bool audit_sym(const ProdLayout& L, const std::vector<RankRes>& res,
         {"x(view)", r.sym + L.x_off, true},
         {"topk_idx(view)", r.sym + L.topk_idx_off, true},
         {"topk_weights(view)", r.sym + L.topk_weights_off, true},
-        {"local_bar_flags", r.bar_flags, false},
+        {"local_flags", r.lf, false},
+        {"ranks_flags", r.rf, true},
     };
     for (const auto& p : probes) {
         mcPointerAttribute_t a;
@@ -395,16 +398,15 @@ static fp8mega::MegaLaunchArgs make_mega_args(
     a.recv_off = L.expert_recv_counts_off;
     a.prefix_off = L.prefix_tbl_off;
     a.barrier_off = L.barrier_slots_off;
-    a.bar_flags = r.bar_flags;
+    a.lf = r.lf;
+    a.rf = r.rf;
+    a.rf_peers = r.d_rf_ptrs;
     a.xrelease_idx = kXreleaseIdx;
     a.task_ready_idx = kTaskReadyIdx;
     a.task_counter_idx = kTaskCounterIdx;
     a.l2_done_idx = kL2DoneIdx;
     a.slice_flags_idx = kSliceFlagsIdx;
     a.l1_prog_idx = kL1ProgIdx;
-    a.epoch_ctr = r.epoch_ctr;
-    a.last_release = r.last_release;
-    a.last_ready = r.last_ready;
     a.x_off = L.x_off;
     a.weights_off = L.topk_weights_off;
     a.pool_off = L.expert_tokens_off;
@@ -761,18 +763,23 @@ static int run_scene(RunOpts o, SceneResult* out) {
                 }
                 r.sym = static_cast<uint8_t*>(p);
                 CHECK(mcMemset(r.sym, 0, (size_t)sym_alloc));
-                CHECK(mcMalloc((void**)&r.bar_flags,
-                               deep_gemm::layout::kFp8BarFlagsNumInt32 *
-                                   sizeof(uint32_t)));
-                CHECK(mcMemset(r.bar_flags, 0,
-                               deep_gemm::layout::kFp8BarFlagsNumInt32 *
-                                   sizeof(uint32_t)));
-                CHECK(mcMalloc((void**)&r.epoch_ctr, sizeof(unsigned)));
-                CHECK(mcMemset(r.epoch_ctr, 0, sizeof(unsigned)));
-                CHECK(mcMalloc((void**)&r.last_release, kGrid * sizeof(unsigned)));
-                CHECK(mcMemset(r.last_release, 0, kGrid * sizeof(unsigned)));
-                CHECK(mcMalloc((void**)&r.last_ready, kGrid * sizeof(unsigned)));
-                CHECK(mcMemset(r.last_ready, 0, kGrid * sizeof(unsigned)));
+                // local_flags：本 rank 私有，普通显存
+                CHECK(mcMalloc((void**)&r.lf, sizeof(local_flags)));
+                CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
+                // ranks_flags：跨 rank，FG 显存（与 sym 同款；普通显存跨 rank 写丢写）
+                {
+                    void* rfp = nullptr;
+                    const mcError_t rme = mcExtMallocWithFlags(
+                        &rfp, sizeof(ranks_flags), mcDeviceMallocFinegrained);
+                    if (rme != mcSuccess || rfp == nullptr) {
+                        std::fprintf(stderr,
+                                     "rank%d ranks_flags FG 分配失败(%d)，回退普通显存\n",
+                                     rank, (int)rme);
+                        CHECK(mcMalloc(&rfp, sizeof(ranks_flags)));
+                    }
+                    r.rf = static_cast<ranks_flags*>(rfp);
+                    CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
+                }
                 CHECK(mcMalloc((void**)&r.out_total, kGrid * sizeof(int)));
                 CHECK(mcMemset(r.out_total, 0, kGrid * sizeof(int)));
                 CHECK(mcMalloc((void**)&r.out_processed, kGrid * sizeof(int)));
@@ -835,6 +842,8 @@ static int run_scene(RunOpts o, SceneResult* out) {
                 }
                 r.peer_sym.assign(o.scene.ranks, nullptr);
                 CHECK(mcIpcGetMemHandle(&r.handle, r.sym));
+                r.peer_rf.assign(o.scene.ranks, nullptr);
+                CHECK(mcIpcGetMemHandle(&r.rf_handle, r.rf));
                 alloc_ready.fetch_add(1);
             });
         }
@@ -862,6 +871,15 @@ static int run_scene(RunOpts o, SceneResult* out) {
                         std::exit(1);
                     }
                     r.peer_sym[d] = static_cast<uint8_t*>(q);
+                    void* qr = nullptr;
+                    const mcError_t er = mcIpcOpenMemHandle(
+                        &qr, res[d].rf_handle, mcIpcMemLazyEnablePeerAccess);
+                    if (er != mcSuccess) {
+                        std::fprintf(stderr, "rank%d open peer%d rf failed: %d\n",
+                                     rank, d, (int)er);
+                        std::exit(1);
+                    }
+                    r.peer_rf[d] = static_cast<ranks_flags*>(qr);
                 }
                 int enabled = 0, unavailable = 0;
                 for (int d = 0; d < o.scene.ranks; ++d) {
@@ -876,12 +894,20 @@ static int run_scene(RunOpts o, SceneResult* out) {
                     }
                 }
                 std::vector<uint8_t*> base_ptrs(o.scene.ranks);
-                for (int d = 0; d < o.scene.ranks; ++d)
+                std::vector<ranks_flags*> rf_ptrs(o.scene.ranks);
+                for (int d = 0; d < o.scene.ranks; ++d) {
                     base_ptrs[d] = (d == rank) ? r.sym : r.peer_sym[d];
+                    rf_ptrs[d] = (d == rank) ? r.rf : r.peer_rf[d];
+                }
                 CHECK(mcMalloc((void**)&r.d_base_ptrs,
                                o.scene.ranks * sizeof(uint8_t*)));
                 CHECK(mcMemcpy(r.d_base_ptrs, base_ptrs.data(),
                                o.scene.ranks * sizeof(uint8_t*),
+                               mcMemcpyHostToDevice));
+                CHECK(mcMalloc((void**)&r.d_rf_ptrs,
+                               o.scene.ranks * sizeof(ranks_flags*)));
+                CHECK(mcMemcpy(r.d_rf_ptrs, rf_ptrs.data(),
+                               o.scene.ranks * sizeof(ranks_flags*),
                                mcMemcpyHostToDevice));
                 peer_enabled[rank] = enabled;
                 peer_unavail[rank] = unavailable;
@@ -1016,14 +1042,8 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                            (size_t)L.prefix_tbl_bytes));
                             CHECK(mcMemset(r.sym + L.barrier_slots_off, 0,
                                            (size_t)o.scene.ranks * o.scene.ranks * 4));
-                            CHECK(mcMemset(r.bar_flags, 0,
-                                           deep_gemm::layout::kFp8BarFlagsNumInt32 *
-                                               sizeof(uint32_t)));
-                            CHECK(mcMemset(r.epoch_ctr, 0, sizeof(unsigned)));
-                            CHECK(mcMemset(r.last_release, 0,
-                                           kGrid * sizeof(unsigned)));
-                            CHECK(mcMemset(r.last_ready, 0,
-                                           kGrid * sizeof(unsigned)));
+                            CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
+                            CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
                             CHECK(mcMemset(r.out_total, 0, kGrid * sizeof(int)));
                             CHECK(mcMemset(r.out_processed, 0,
                                            kGrid * sizeof(int)));
@@ -1075,7 +1095,7 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                        mcMemcpyDeviceToHost));
                         if (!validate_task_setup(L, o.scene.ranks, rank, routes,
                                                  res[rank].sym,
-                                                 res[rank].bar_flags,
+                                                 /*bar_flags=*/nullptr,
                                                  ts_cpu.data(), &msg))
                             ok = false;
                     }
@@ -1144,12 +1164,8 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                        (size_t)o.scene.ranks * L.recv_stride * 4));
                         CHECK(mcMemset(r.sym + L.barrier_slots_off, 0,
                                        (size_t)o.scene.ranks * o.scene.ranks * 4));
-                        CHECK(mcMemset(r.bar_flags, 0,
-                                       deep_gemm::layout::kFp8BarFlagsNumInt32 *
-                                           sizeof(uint32_t)));
-                        CHECK(mcMemset(r.epoch_ctr, 0, sizeof(unsigned)));
-                        CHECK(mcMemset(r.last_release, 0, kGrid * sizeof(unsigned)));
-                        CHECK(mcMemset(r.last_ready, 0, kGrid * sizeof(unsigned)));
+                        CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
+                        CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
                         CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
                         if (o.task_trace)
                             CHECK(mcMemcpy(r.dbg + 7, &kTraceSentinel, sizeof(int),
@@ -1416,12 +1432,8 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                        (size_t)L.src_index_table_bytes));
                         CHECK(mcMemset(r.sym + L.barrier_slots_off, 0,
                                        (size_t)o.scene.ranks * o.scene.ranks * 4));
-                        CHECK(mcMemset(r.bar_flags, 0,
-                                       deep_gemm::layout::kFp8BarFlagsNumInt32 *
-                                           sizeof(uint32_t)));
-                        CHECK(mcMemset(r.epoch_ctr, 0, sizeof(unsigned)));
-                        CHECK(mcMemset(r.last_release, 0, kGrid * sizeof(unsigned)));
-                        CHECK(mcMemset(r.last_ready, 0, kGrid * sizeof(unsigned)));
+                        CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
+                        CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
                         CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
                         CHECK(mcMemset(r.ck_dbg, 0,
                                        (size_t)kEPR * 16 * sizeof(uint32_t)));
@@ -2066,18 +2078,23 @@ static int run_aligned(RunOpts o) {
                     CHECK(mcMalloc(&p, (size_t)sym_alloc));
                 r.sym = static_cast<uint8_t*>(p);
                 CHECK(mcMemset(r.sym, 0, (size_t)sym_alloc));
-                CHECK(mcMalloc((void**)&r.bar_flags,
-                               deep_gemm::layout::kFp8BarFlagsNumInt32 *
-                                   sizeof(uint32_t)));
-                CHECK(mcMemset(r.bar_flags, 0,
-                               deep_gemm::layout::kFp8BarFlagsNumInt32 *
-                                   sizeof(uint32_t)));
-                CHECK(mcMalloc((void**)&r.epoch_ctr, sizeof(unsigned)));
-                CHECK(mcMemset(r.epoch_ctr, 0, sizeof(unsigned)));
-                CHECK(mcMalloc((void**)&r.last_release, kGrid * sizeof(unsigned)));
-                CHECK(mcMemset(r.last_release, 0, kGrid * sizeof(unsigned)));
-                CHECK(mcMalloc((void**)&r.last_ready, kGrid * sizeof(unsigned)));
-                CHECK(mcMemset(r.last_ready, 0, kGrid * sizeof(unsigned)));
+                // local_flags：本 rank 私有，普通显存
+                CHECK(mcMalloc((void**)&r.lf, sizeof(local_flags)));
+                CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
+                // ranks_flags：跨 rank，FG 显存（与 sym 同款；普通显存跨 rank 写丢写）
+                {
+                    void* rfp = nullptr;
+                    const mcError_t rme = mcExtMallocWithFlags(
+                        &rfp, sizeof(ranks_flags), mcDeviceMallocFinegrained);
+                    if (rme != mcSuccess || rfp == nullptr) {
+                        std::fprintf(stderr,
+                                     "rank%d ranks_flags FG 分配失败(%d)，回退普通显存\n",
+                                     rank, (int)rme);
+                        CHECK(mcMalloc(&rfp, sizeof(ranks_flags)));
+                    }
+                    r.rf = static_cast<ranks_flags*>(rfp);
+                    CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
+                }
                 CHECK(mcMalloc((void**)&r.out_total, kGrid * sizeof(int)));
                 CHECK(mcMemset(r.out_total, 0, kGrid * sizeof(int)));
                 CHECK(mcMalloc((void**)&r.out_processed, kGrid * sizeof(int)));
@@ -2132,6 +2149,8 @@ static int run_aligned(RunOpts o) {
                 }
                 r.peer_sym.assign(R, nullptr);
                 CHECK(mcIpcGetMemHandle(&r.handle, r.sym));
+                r.peer_rf.assign(R, nullptr);
+                CHECK(mcIpcGetMemHandle(&r.rf_handle, r.rf));
                 ready.fetch_add(1);
             });
         while (ready.load() < R) {}
@@ -2157,6 +2176,15 @@ static int run_aligned(RunOpts o) {
                         std::exit(1);
                     }
                     r.peer_sym[d] = static_cast<uint8_t*>(q);
+                    void* qr = nullptr;
+                    const mcError_t er = mcIpcOpenMemHandle(
+                        &qr, res[d].rf_handle, mcIpcMemLazyEnablePeerAccess);
+                    if (er != mcSuccess) {
+                        std::fprintf(stderr, "rank%d open peer%d rf failed: %d\n",
+                                     rank, d, (int)er);
+                        std::exit(1);
+                    }
+                    r.peer_rf[d] = static_cast<ranks_flags*>(qr);
                 }
                 for (int d = 0; d < R; ++d) {
                     if (d == rank) continue;
@@ -2165,11 +2193,18 @@ static int run_aligned(RunOpts o) {
                         mcDeviceEnablePeerAccess(d, 0);
                 }
                 std::vector<uint8_t*> base_ptrs(R);
-                for (int d = 0; d < R; ++d)
+                std::vector<ranks_flags*> rf_ptrs(R);
+                for (int d = 0; d < R; ++d) {
                     base_ptrs[d] = (d == rank) ? r.sym : r.peer_sym[d];
+                    rf_ptrs[d] = (d == rank) ? r.rf : r.peer_rf[d];
+                }
                 CHECK(mcMalloc((void**)&r.d_base_ptrs, R * sizeof(uint8_t*)));
                 CHECK(mcMemcpy(r.d_base_ptrs, base_ptrs.data(),
                                R * sizeof(uint8_t*), mcMemcpyHostToDevice));
+                CHECK(mcMalloc((void**)&r.d_rf_ptrs, R * sizeof(ranks_flags*)));
+                CHECK(mcMemcpy(r.d_rf_ptrs, rf_ptrs.data(),
+                               R * sizeof(ranks_flags*),
+                               mcMemcpyHostToDevice));
                 ready.fetch_add(1);
             });
         while (ready.load() < R) {}
@@ -2196,12 +2231,8 @@ static int run_aligned(RunOpts o) {
                                    (size_t)L.src_index_table_bytes));
                     CHECK(mcMemset(r.sym + L.barrier_slots_off, 0,
                                    (size_t)R * R * 4));
-                    CHECK(mcMemset(r.bar_flags, 0,
-                                   deep_gemm::layout::kFp8BarFlagsNumInt32 *
-                                       sizeof(uint32_t)));
-                    CHECK(mcMemset(r.epoch_ctr, 0, sizeof(unsigned)));
-                    CHECK(mcMemset(r.last_release, 0, kGrid * sizeof(unsigned)));
-                    CHECK(mcMemset(r.last_ready, 0, kGrid * sizeof(unsigned)));
+                    CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
+                    CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
                     CHECK(mcMemset(r.dbg, 0, 8 * sizeof(int)));
                     CHECK(mcMemset(r.ck_dbg, 0,
                                    (size_t)kEPR * 16 * sizeof(uint32_t)));

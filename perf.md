@@ -50,6 +50,25 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 31) timeout -k 3 15 ./bench \
 > 注：v0 的 TPR=128 实测 1023µs，与 v1 1027µs 基本一致——早前对照的
 > “test/59 1007.7µs”属不同测量条件，并非本会话引入的回归。
 
+## v2：flag 结构体改造（local_flags / ranks_flags + current_time）
+
+时间标签：`[261005]`（未提交 git）。按参考实现 `mega/src/kernel/mega_fp8.cuh`
+把扁平 flag 数组收敛为 `local_flags`（普通显存，本 rank 私有）+
+`ranks_flags`（FG 显存，跨 rank peer 可写）；每 block 的 `current_time[b]`
+单调 launch 计数取代 `epoch_ctr + last_release`，xbar 跨 rank 旗迁入
+`ranks_flags::xbar_barrier`。`bar[]` 索引与原 `kBar*Idx` 逐一对应，可见性
+顺序与超时语义不变。
+
+同机同口径（test/70 graph，4 次采样取均值；基线为任务给定改前值）：
+
+| TPR | 基线 (µs) | v2 (µs) | v2 相对基线 |
+|---:|---:|---:|---:|
+| 16 | 353 | 350.3 | **+0.76%** |
+| 64 | 651 | 644.9 | **+0.94%** |
+| 256 | 1915 | 1906.6 | **+0.44%** |
+
+> 结论：三档均略快于基线（全在 ±3% 内，无性能下降）；正确性 R=2/8/32 全 `[总体] PASS`。
+
 ## 追加方式（后续每次优化）
 在表尾新增一列：`| vN (µs) | vN 提升 |`，其中 `vN 提升 = (v0 − vN) / v0`，
 并在「版本记录」追加一行说明该版本改动。示例（v2 占位，勿填入未测数据）：

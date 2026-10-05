@@ -21,6 +21,12 @@
 
 #include <mcr/mc_runtime.h>
 
+// flag 结构体定义在 src/flags_defs.cuh（设备与 host 共享的 POD 布局）。
+// 此处仅前向声明指针类型，避免公共头依赖设备侧头；bench 需要 sizeof 时
+// 直接 include "flags_defs.cuh"。
+struct local_flags;
+struct ranks_flags;
+
 // 设备侧权重生成的值函数（host 参考与 device 生成必须逐字节一致，故同头共享）。
 // -DWPROBE=1 切到「非周期 + 小值」诊断模式（见 bench.cu 注释）。
 #ifndef WPROBE
@@ -55,12 +61,11 @@ struct MegaLaunchArgs {
     int k_in = 0, topk = 0, ring = 0;
     int64_t src_off = 0, rsc_off = 0, recv_off = 0, prefix_off = 0,
             barrier_off = 0;
-    uint32_t* bar_flags = nullptr;
+    local_flags* lf = nullptr;             // 本 rank 私有旗区（普通显存）
+    ranks_flags* rf = nullptr;             // 跨 rank 旗区（FG 显存）
+    ranks_flags* const* rf_peers = nullptr;  // 各 rank ranks_flags 基址表
     int64_t xrelease_idx = 0, task_ready_idx = 0, task_counter_idx = 0,
             l2_done_idx = 0, slice_flags_idx = 0, l1_prog_idx = 0;
-    unsigned* epoch_ctr = nullptr;
-    unsigned* last_release = nullptr;
-    unsigned* last_ready = nullptr;
     int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;
     int* out_total = nullptr;
     int* out_processed = nullptr;

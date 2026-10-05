@@ -58,16 +58,15 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.recv_off = a.recv_off;
     m.prefix_off = a.prefix_off;
     m.barrier_off = a.barrier_off;
-    m.bar_flags = a.bar_flags;
+    m.lf = a.lf;
+    m.rf = a.rf;
+    m.rf_peers = a.rf_peers;
     m.xrelease_idx = a.xrelease_idx;
     m.task_ready_idx = a.task_ready_idx;
     m.task_counter_idx = a.task_counter_idx;
     m.l2_done_idx = a.l2_done_idx;
     m.slice_flags_idx = a.slice_flags_idx;
     m.l1_prog_idx = a.l1_prog_idx;
-    m.epoch_ctr = a.epoch_ctr;
-    m.last_release = a.last_release;
-    m.last_ready = a.last_ready;
     m.x_off = a.x_off;
     m.weights_off = a.weights_off;
     m.pool_off = a.pool_off;
@@ -114,7 +113,7 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
     mega_reduce_kernel<<<2 * a.tokens, 256, 0, stream>>>(
         a.self, a.y, a.R, a.tokens, a.combine_cap, a.combine_rows_off,
-        a.combine_sums_off, a.topk_idx_off, a.weights_off, a.bar_flags,
+        a.combine_sums_off, a.topk_idx_off, a.weights_off, a.lf,
         a.task_ready_idx, a.dbg, a.max_spins, a.sums_stride);
 }
 

@@ -34,12 +34,11 @@ struct MegaArgs {
     int tbl_cap;        // src_index_table 行容量（= max_tokens）
     int k_in, topk, ring;
     int64_t src_off, rsc_off, recv_off, prefix_off, barrier_off;
-    uint32_t* bar_flags;  // flag 区（普通显存）
+    local_flags* lf;               // flag 区（本 rank 私有，普通显存）
+    ranks_flags* rf;               // 跨 rank flag 区（FG 显存）
+    ranks_flags* const* rf_peers;  // 各 rank ranks_flags 基址表（设备数组，含 self）
     int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
     int64_t slice_flags_idx, l1_prog_idx;
-    unsigned* epoch_ctr;      // [1] xbar epoch 自增
-    unsigned* last_release;   // [kGrid] xbar 每 block 水位
-    unsigned* last_ready;     // [kGrid] task_ready 每 block 水位
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
     int* out_total;           // [kGrid] 每 block 总窗口数
     int* out_processed;       // [kGrid] 每 block 处理任务数
@@ -136,7 +135,7 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
     dispatch_pull_body<TaskTail, kSmallOnly>(
         a.self, a.peer_bases, a.R, a.rank, a.win_cap, a.pool_stride,
         a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off, a.src_off, a.x_off,
-        a.weights_off, a.pool_off, a.w_off, a.meta_off, a.bar_flags,
+        a.weights_off, a.pool_off, a.w_off, a.meta_off, a.lf->bar,
         a.task_counter_idx, a.l2_done_idx, a.task_ready_idx, a.slice_flags_idx,
         a.l1_prog_idx, a.out_processed, a.dbg, a.max_spins, a.w1,
         a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.l1_chk, a.w2,
@@ -178,15 +177,14 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
         if (kTick) a.pre_ticks[1] = clock64();
     }
     // 2) XBAR_ROUTE_READY（全 grid，mode3：转置 + warp 并行发布）
-    xbar_route_ready_body(a.self, a.peer_bases, a.R, a.rank, a.barrier_off,
-                          a.epoch_ctr, a.bar_flags, a.xrelease_idx,
-                          a.last_release, a.dbg, a.max_spins, 0, ctr);
+    xbar_route_ready_body(a.rf, a.rf_peers, a.lf, a.R, a.rank,
+                          a.xrelease_idx, a.dbg, a.max_spins, 0, ctr);
     if (kTick) a.pre_ticks[2] = clock64();
     // 3) TASK_SETUP（block0 leader：checksum -> prefix -> 窗口表 -> task_ready）
     task_setup_body(a.self, a.R, a.rank, a.slot_capacity, a.recv_off,
-                    a.prefix_off, a.bar_flags, a.task_ready_idx,
-                    a.task_counter_idx, a.l2_done_idx, a.epoch_ctr,
-                    a.last_ready, a.out_total, a.dbg, a.max_spins,
+                    a.prefix_off, a.lf, a.task_ready_idx,
+                    a.task_counter_idx, a.l2_done_idx,
+                    a.out_total, a.dbg, a.max_spins,
                     a.recv_stride, /*reset_ring=*/true, /*tid_base=*/0,
                     /*sb_cnt=*/nullptr, /*smem_off=*/0, a.prefix_ptr,
                     a.ck_dbg, ctr);
@@ -254,7 +252,7 @@ __global__ void mega_reduce_kernel(const uint8_t* self, float* y, int R,
                                    int tokens, int combine_cap,
                                    int64_t rows_off, int64_t sums_off,
                                    int64_t topk_idx_off, int64_t weights_off,
-                                   const uint32_t* bar_flags,
+                                   const local_flags* lf,
                                    int64_t task_ready_idx, int* dbg,
                                    int max_spins, int sums_stride
 #if MX_DBG_COUNT
@@ -264,7 +262,7 @@ __global__ void mega_reduce_kernel(const uint8_t* self, float* y, int R,
 #endif
 ) {
     reduce_body(self, y, R, tokens, combine_cap, rows_off, sums_off,
-                topk_idx_off, weights_off, bar_flags, task_ready_idx, dbg,
+                topk_idx_off, weights_off, lf, task_ready_idx, dbg,
                 max_spins, sums_stride
 #if MX_DBG_COUNT
                 , mx_ctr_open(dbg_count, exec_ctr)

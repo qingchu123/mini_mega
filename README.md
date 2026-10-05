@@ -82,3 +82,22 @@ launch）。实测单次全链：均衡 354.6µs → 不均衡 1.81/3.46/4.72ms�
 | full (µs/kernel) | 343.5 | 651.0 | 1918.3 |
 
 详见 `test/70.r32_tpr_perf/results.md`。
+
+## flag 结构体改造（local_flags / ranks_flags + current_time）
+
+按参考实现 `mega/src/kernel/mega_fp8.cuh` 重构同步标志（2026-10-05，未提交 git）：
+
+- 新增 `src/flags_defs.cuh`：
+  - `struct alignas(256) local_flags { int64_t current_time[kGrid][64];
+    uint32_t bar[1032]; unsigned last_ready[kGrid]; }`（普通显存，本 rank 私有）；
+  - `struct alignas(256) ranks_flags { uint32_t xbar_barrier[kGrid][kGrid]; }`
+    （FG 显存，跨 rank peer 可写）。
+- `MegaArgs` / `MegaLaunchArgs` 的 `bar_flags` 改 `local_flags* lf`，
+  `epoch_ctr/last_release` 由每 block 单调 launch 计数 `lf->current_time[b][*]` 取代，
+  `last_ready` 并入 `lf->last_ready`；xbar 跨 rank 旗从 sym 迁到 `rf->xbar_barrier`。
+- 行为不变：`bar[]` 索引逐一对齐原 `kBar*Idx`；可见性顺序（payload→fence→ready）
+  与自旋/超时语义保持。
+
+正确性（旧口径 R=2/8/32，`--perf-only 0 --compute 1`）全部 `[总体] PASS`；
+性能（test/70，graph，4 次采样均值）：TPR=16/64/256 = 350.3/644.9/1906.6 µs/kernel，
+相对改前基线 353/651/1915 均略快（全在 ±3% 内，见 `perf.md` v2）。
