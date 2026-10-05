@@ -72,8 +72,8 @@ bash test/71.r32_tk_imbalance/run.sh
 
 日志行 `[TK_INFO] rank=r launch=n : c0..c7`；`ci` = rank r 物理专家 i 收到的 pair
 数。`--tk-launch N` 指定 launch（缺省自动选「单专家最大收行」最大的全 rank
-launch）。实测单次全链：均衡 354.6µs → 不均衡 1.81/3.46/4.72ms（max 176/362/512），
-详见 `test/71.r32_tk_imbalance/results.md`。
+launch）。实测单次全链：均衡 343.9µs → 不均衡 1.29/1.03/1.30ms（max 176/362/512，
+v5 窗口切分后；改前为 1.78/3.46/4.71ms），详见 `test/71.r32_tk_imbalance/results.md`。
 
 ## 基准（本机 202，C600UL 32 卡）
 
@@ -124,3 +124,22 @@ test/71 不均衡 1788/3483/4749µs vs 基线 1776~1810/3458~3502/4686~4717，�
 性能：test/70 TPR16/64/256 = 337.6~340.6/637.0~639.5/1904.1~1906.7µs（全在
 基线 ±3% 内，TPR64 略快）；test/71 全档 1787/3448/4721µs（±3% 内）；R=2/32
 全 `[总体] PASS`。
+
+## 真实不均衡路由长尾优化（窗口切分 + COMBINE 标记修复）
+
+时间标签 `[261005_23_23]`（未提交 git）。根因：`win_cap` 缺省被抬到
+`max_tokens=512`，收到 512 行的专家 `ceil(512/512)=1` 个窗口 → 整段串行落在
+单个 block（长尾 4.7ms）。另外 `win_cap<max_tokens` 时各 rank 的 `merge/
+nslice_eff` 可不一致，而 COMBINE 只写 1 个物理 slice 的完成标记，源 rank 的
+REDUCE 按自身 `nslice_eff` 等待会漏槽 → 4M 级自旋超时（多节点 graph 累积为
+秒级“伪死锁”）。改动：
+
+1. `combine.cuh`：`combine_push_pair` / `combine_mark_rows` 把物理任务覆盖的
+   **全部逻辑 slice**（`slice*merge + [0,merge)`）标记写满（`merge=1` 逐字节等价）。
+2. `bench.cu` `run_aligned`：逐测例检测长尾不均衡（`max_expert ≥ 4×非零中位数`）
+   时把 `win_cap` 收缩到 `round16(cap_need/kRing)`（约 kRing 个窗口）；均衡分布
+   保持 `max(128,max_tokens)` 不变。
+
+性能：目标 `--tk-launch 853000`（max512）**4708.8 → ~1295µs（−72.5%，<2000）**；
+804300（max362）3479→1030、804400（max176）1784→1289；均衡 test/70 三档
+345/646/1915µs（±3% 内）。正确性 R=2 与 R=32 全 `[总体] PASS`（见 `perf.md` v5）。

@@ -1958,8 +1958,43 @@ static int run_aligned(RunOpts o) {
         o.max_tokens_set
             ? std::max(std::max(o.scene.max_tokens, tmax), cap_need)
             : std::max(std::max(512, tmax), cap_need);
-    const int win_cap_req = (o.scene.win_cap < 0) ? 128 : o.scene.win_cap;
-    const int win_cap = std::max(win_cap_req, max_tokens);
+    // win_cap 策略（不均衡路由专项）：
+    //   背景：单专家收行数远大于其余（TK_INFO 真实路由，如一个专家 512 行、
+    //   其余 16~100），窗口数 = ceil(count/win_cap)，win_cap 大时大专家只有
+    //   1 个任务 → 整个长尾串行落在一个 block（4700µs）。把 win_cap 压到
+    //   ≈cap_need/kRing，让大专家切成 ~kRing 个窗口 → 多任务摊到多 block。
+    //   边界：win_cap 过小（>>kRing 个窗口）会令池槽 ring 复用 + 任务数暴涨，
+    //   反而变慢（实测 64 最优、32 变差）；均衡分布（各专家行数相近）下压
+    //   win_cap 反而把短任务切碎、回归显著（TPR=256 1914→2946µs），故只在
+    //   检测到「长尾不均衡」（max_expert 远大于非零中位数）时收缩。
+    //   显式 --win-cap 时始终按值取（下限 kM）。
+    // 逐测例判「长尾不均衡」：该例 max_expert 是否 >= 4×该例非零中位数。
+    // 逐例判断（不能跨例合并中位数：均衡多档列表 16/64/256 合并后会误判）。
+    bool imbalanced = false;
+    for (const TkCase& c : cases) {
+        std::map<int, int> cnt;
+        for (const auto& r : c.routes)
+            for (int64_t e : r)
+                if (e >= 0 && e < (int64_t)R * kEPR) ++cnt[(int)e];
+        if (cnt.empty()) continue;
+        std::vector<int> nz;
+        nz.reserve(cnt.size());
+        for (const auto& kv : cnt) nz.push_back(kv.second);
+        std::sort(nz.begin(), nz.end());
+        const int med = nz[nz.size() / 2];
+        if (c.max_expert >= 4 * std::max(1, med)) imbalanced = true;
+    }
+    int win_cap;
+    if (o.scene.win_cap > 0) {
+        win_cap = o.scene.win_cap;
+    } else if (imbalanced) {
+        int tgt = (cap_need + kRing - 1) / kRing;        // ~kRing 个窗口
+        tgt = ((tgt + kM - 1) / kM) * kM;                // 对齐 M tile 行数
+        win_cap = std::min(max_tokens, std::max((int)kM, tgt));
+    } else {
+        win_cap = std::max(128, max_tokens);
+    }
+    if (win_cap < kM) win_cap = kM;
     const int nodes = o.nodes_set ? o.scene.nodes : 20;
     const int replays = o.replays_set ? o.measure_replays : 2;
     o.scene.tokens = tmax;

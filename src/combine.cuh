@@ -394,10 +394,18 @@ __device__ __forceinline__ void combine_mark_rows(
         const int src = m[0];
         const int stok = m[1];
         const int kk = m[2];
-        if (lane == 0)
+        if (lane == 0) {
             // 完成标记迁入目标 rank 的 ranks_flags::combine_sums[c][k][token][slice]
-            __stwt(&c.rf_peers[src]->combine_sums[c.cycle][kk][stok][c.slice],
-                   c.epoch);
+            // [FIX-NSE] 本物理任务覆盖 merge 个逻辑 slice（[R35] 粗化）：必须把
+            // 覆盖到的全部逻辑 slice 标记写满，否则源 rank 的 REDUCE 按其自身
+            // nslice_eff 等待时会漏槽超时（win_cap<max_tokens 时各 rank 的
+            // nslice_eff 不一致的核心根因）。物理 slice 覆盖逻辑
+            // [c.slice*c.merge, c.slice*c.merge + c.merge)。
+            uint32_t* base = &c.rf_peers[src]
+                                  ->combine_sums[c.cycle][kk][stok]
+                                  [c.slice * c.merge];
+            for (int mi = 0; mi < c.merge; ++mi) __stwt(base + mi, c.epoch);
+        }
     }
 }
 
@@ -442,11 +450,15 @@ __device__ __forceinline__ void combine_push_pair(
             const uint4 v = *reinterpret_cast<const uint4*>(srow + col);
             __stwt(reinterpret_cast<uint4*>(drow_h + col), v);
         }
-        // slice 完成标记：槽 = 物理 slice，值 = epoch（REDUCE 以 >= epoch 放行）
-        // [R37] 粒度=物理 slice（每任务 1 个标记），REDUCE 按 nslice_eff 等待
-        if (lane == 0)
-            __stwt(&c.rf_peers[src]->combine_sums[c.cycle][kk][stok][c.slice],
-                   c.epoch);
+        // slice 完成标记：值 = epoch（REDUCE 以 >= epoch 放行）
+        // [FIX-NSE] 写满本物理任务覆盖的全部逻辑 slice（merge 个），与
+        // combine_mark_rows 同因：保证任意源 rank 按其 nslice_eff 等待都不漏槽。
+        if (lane == 0) {
+            uint32_t* base = &c.rf_peers[src]
+                                  ->combine_sums[c.cycle][kk][stok]
+                                  [c.slice * c.merge];
+            for (int mi = 0; mi < c.merge; ++mi) __stwt(base + mi, c.epoch);
+        }
     }
 }
 
