@@ -14,7 +14,8 @@
 namespace fp8mega {
 
 // 设备侧权重生成（16B/lane supertile 布局；替代 host 生成 + 大体积上传）。
-__global__ void fill_w_lane_kernel(uint8_t* __restrict__ w, int n_rows,
+__global__ void __launch_bounds__(256) fill_w_lane_kernel(
+                                   uint8_t* __restrict__ w, int n_rows,
                                    int k_cols, uint32_t seed) {
     const int k_iters = k_cols / 32;
     const size_t total = (size_t)(n_rows / 32) * k_iters;

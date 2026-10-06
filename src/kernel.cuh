@@ -17,7 +17,9 @@
 #include "combine.cuh"
 
 // 空 kernel（M0 基准：测 launch/graph 地板）
-__global__ void mega_empty_kernel() {}
+// __launch_bounds__ 覆盖 bench 全部启动线程数（G0=32 / G1/G2=512 或 1024），
+// 固定 AOT 编译上限，避免按实际 block 大小重复编译。
+__global__ void __launch_bounds__(1024) mega_empty_kernel() {}
 
 // ---------------------------------------------------------------- 主 kernel --
 // host -> device 参数（按值传结构体；全部为 POD）
@@ -269,7 +271,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
 // 独立 kernel：每 token 2 个 block 列分半（grid=32 覆盖 TPR=16）
 // [集71] 末尾两个参数为带默认值的可选项：老调用点（bench.cu）不传即 nullptr，
 //        编译期 MX_DBG_COUNT=0 时统计代码整体消除。
-__global__ void mega_reduce_kernel(const uint8_t* self, float* y, int R,
+__global__ void __launch_bounds__(256) mega_reduce_kernel(
+                                   const uint8_t* self, float* y, int R,
                                    int tokens, int combine_cap,
                                    int64_t rows_off,
                                    int64_t topk_idx_off, int64_t weights_off,
