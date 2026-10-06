@@ -2327,7 +2327,20 @@ static int run_aligned(RunOpts o) {
                     CHECK(mcStreamCreate(&st));
                     fp8mega::MegaLaunchArgs a = make_mega_args(
                         o, L, r, win_cap, combine_f32_off);
-                    if (c.imbalanced) a.merge_grid = 0x3fffffff;  // [LONGTAIL] 不粗化
+                    if (c.imbalanced) {
+                        // [LONGTAIL-MED] 中等不均衡（单专家最多 ~2~4 窗，如
+                        //   863400 max=156、804400 max=176）：允许粗化到 ≤32 个
+                        //   物理任务且每窗最少 2 片，减少 A 重读与每任务固定开销。
+                        //   极端长尾（单专家 >256 行，如 512 行 11 窗）保持
+                        //   merge=1 不粗化，避免物理任务过大。阈值由实测确定。
+                        if (c.max_expert <= 256) {
+                            a.merge_grid = 32;
+                            a.merge_floor = 2;
+                        } else {
+                            a.merge_grid = 0x3fffffff;
+                            a.merge_floor = 1;
+                        }
+                    }
                     while (go.load(std::memory_order_acquire) == 0) {}
                     bool cap = false;
                     cal[rank] = chain_measure(
@@ -2361,9 +2374,9 @@ static int run_aligned(RunOpts o) {
             const double clk = 2000.0;
             for (int rank = 0; rank < R; ++rank) {
                 CHECK(mcSetDevice(res[rank].dev));
-                unsigned long long tp[8] = {0};
+                unsigned long long tp[16] = {0};
                 CHECK(mcMemcpy(tp, res[rank].lf->pre_ticks,
-                               8 * sizeof(unsigned long long),
+                               16 * sizeof(unsigned long long),
                                mcMemcpyDeviceToHost));
                 if (tp[7] > tp[3]) {
                     int proc[kGrid] = {0};
