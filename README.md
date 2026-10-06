@@ -151,3 +151,33 @@ REDUCE 按自身 `nslice_eff` 等待会漏槽 → 4M 级自旋超时（多节点
 12 窗×4 片的小任务摊满 32 block。均衡测例保持原粗化（零回归）。
 目标 853000 **1295 → ~1034µs（再降 20.2%）**；804400=967、804300=877。正确性
 （含强制 merge=1）R=2/R=32 全 `[总体] PASS`（见 `perf.md` v6）。
+
+## torch 层（pybind + Python 包，可安装 wheel）
+
+时间标签 `[261006_12_40]`（未提交 git）。新增 `torch/`：pybind11 扩展
+`mxmegakernel._C` + Python 包 `mxmegakernel`，对齐 sglang megamoe 后端
+（C600UL fp8xfp8）所需的最小 API 面，并真实绑定 mini_mega kernel。
+
+| 能力 | 状态 |
+|---|---|
+| `get_token_alignment_for_mega_moe` | 已实现 |
+| `select_fp8_mega_moe_window`（FP8 AUTO 表） | 已实现 |
+| `get_symm_buffer_size_for_mega_moe` / 布局偏移 | 已实现 |
+| `transform_weights_for_mega_moe`（fp8xfp8） | 已实现（与源项目逐字节等价） |
+| `SymmBuffer` 多 rank FG/IPC + 建档预热 + 输入视图 | 已实现 |
+| `_C.mega_launch_empty` / `fill_weights_lane` | 已实现（真实 kernel 绑定） |
+| `fp8_mega_moe` 融合发射（`fp8mega::launch_full`） | 已实现 |
+| `bf16/fp8_fp4` 路线、`transform_sf_into_required_layout` | not_implemented |
+
+构建：`cd torch && MACA_PATH=/opt/maca python setup.py bdist_wheel`
+→ `torch/dist/mxmegakernel-0.0.0+mini.mega.20261006b-cp310-cp310-linux_x86_64.whl`。
+
+数值自检：`tests/smoke.py`（单卡）→ `SMOKE OK`；
+`torchrun --nproc_per_node=32 tests/test_fp8_mega_moe.py --ranks 32`（71，真实
+R=32/E=256 几何，随机权重 vs 参考）→ 32/32 PASS；本地 R=16 window=64 亦全过。
+
+71 跑通：GLM-5.2-FP8（tp32/dp32/megamoe/fp8）服务 ready（`/health=200`，
+`max_total_num_tokens=148160`），`/generate` 输出连贯文本；并发压测
+48 请求 / 并发 8：`output_throughput=114.5 tok/s`。需要三个 sglang 侧补丁
+（权重原位接管、SwiGLU 缩放契约修复、预热），详见 `torch/README_torch.md`
+与 `torch/sglang_patches/`。

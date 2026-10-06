@@ -2,3 +2,14 @@
 /megakernel.so
 .opencode/
 .deep-copilot/
+
+# torch 层构建产物
+/torch/build/
+/torch/dist/
+/torch/*.egg-info/
+/torch/mxmegakernel/_C*.so
+/torch/mxmegakernel/megakernel.so
+
+# python 缓存
+__pycache__/
+*.pyc
