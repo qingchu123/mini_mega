@@ -113,6 +113,13 @@
 #define R30_DEFER1 0
 #endif
 
+// [CC·261006] 中等 count（33..48）改走 r24 A-smem 异步路径（A 只搬一遍/块，
+//   消除每 warp 重复的 8× global A 散射装载，并借 bsm 异步隐藏 A 延迟）。
+//   kBatch 用 CM_L1_BATCH（=4，偶数，gate/up 配对）。默认开。
+#ifndef CM_MED_R24
+#define CM_MED_R24 1
+#endif
+
 // [R29] tail → 融合上下文获取/回写（默认无融合；kernel.cuh 对 CombineTail 特化）。
 //   任务体在进入 r24 L2 路径且 staging 有效时激活 fuse.on，并在任务尾把该状态
 //   写回 tail，供 CombineTail 选择"只写标记"路径。
@@ -1385,6 +1392,18 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // [OPT-33] 33..48 档：MT3（恰好 ceil(count/16)=3 个 tile），acc 比
             //   MT4 小（[4][3][2] → [4][3][2] 不变，但省 1 个 M tile 的寄存器/
             //   发射槽），减少尾块 M 空转（原 MT4 对 33..48 仍按 4 tile 分配）。
+            bool med_r24 = false;
+#if CM_MED_R24
+            if (fbase != nullptr && ((S.k_in / 32) % 16 == 0)) {
+                r24_l1_big<3, 16, CM_L1_BATCH, true>(
+                    a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
+                    S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                    S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                    S.l1_k_out);
+                med_r24 = true;
+            }
+#endif
+            if (!med_r24) {
 #if CM_USE_BSM
             l1_gemm_swiglu_body_bsm<3, CM_L1_BATCH, CM_BR>(
                 b_smem, pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
@@ -1414,6 +1433,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
                     out_col_base, S.l1_k_out, nullptr, nullptr, 0, ffn2);
             }
 #endif
+            }
         } else if (count <= 48 && g_l1 % 2 == 0 && g_l1 >= 2) {
             // [OPT-NS8] NSLICE=8 时 g_l1=2：33..48 档用 MT3/B2（A 装一遍、
             //   runtime M 裁剪），避免落入 r19_l1_big<4,...> 的 MT4 慢档。
@@ -1554,6 +1574,17 @@ __device__ R19_BIG_ATTR void r19_big_task(
         } else if (count <= 48 && g_l2 % 6 == 0) {
             // [OPT-33] 33..48 档：MT3 单批（ceil(count/16)=3 tile），acc[3][3][2]；
             //   原 MT4/3 分两批（acc[3][4][2]=24）→ MT3 更小且只一次调用。
+            bool med_r24 = false;
+#if CM_MED_R24
+            if (f2 != nullptr && ((S.l1_k_out / 32) % 16 == 0)) {
+                r24_l2_big<3, 16, 3, true>(
+                    a_smem, f2, S.mt_total, w2_e, 0, count, S.l1_k_out,
+                    S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps,
+                    S.l2_chk, g0_l2, g_l2, out_slot, S.l2_k_out, nullptr);
+                med_r24 = true;
+            }
+#endif
+            if (!med_r24) {
 #if CM_FRAG_L2
             if constexpr (kFragCap) {
                 if (f2 != nullptr)
@@ -1572,6 +1603,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
                     ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
                     S.l2_k_out, nullptr, 0);
+            }
         } else if (count > 48 && count <= 64 && f2 != nullptr &&
                    (count % (4 * kM) == 0) &&
                    ((S.l1_k_out / 32) % R24_KS == 0)) {
