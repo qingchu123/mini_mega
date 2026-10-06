@@ -330,6 +330,7 @@ struct RunOpts {
     // 不均衡测例：从 TK_INFO 日志复现某次 launch 的每专家收行分布
     std::string tk_info;          // --tk-info <path>
     int tk_launch = 0;            // --tk-launch <N>（0=自动选最不均衡的全 rank launch）
+    bool tk_all = false;          // --tk-all：单进程扫描日志全部 launch 出性能表
 };
 
 // 16B/lane 配对 packed tile 权重填充（layout16b 契约，与 megakernel.cu 设备侧同式）：
@@ -490,6 +491,7 @@ static void usage(const char* argv0) {
         "  --tk-info FILE      不均衡测例：从 TK_INFO 日志复现某 launch 的每专家\n"
         "                      收行分布（覆盖 --tprs，tpk/tokens 由日志推导）\n"
         "  --tk-launch N       指定 TK_INFO 中的 launch 号（缺省=自动选最不均衡者）\n"
+        "  --tk-all            扫描 TK_INFO 全部 launch 出性能表（单进程，需 --tk-info）\n"
         "  --nodes N           graph 链节点数（对齐默认 20；legacy 默认 2000）\n"
         "  --replays R         graph replay 次数，取 min（对齐默认 2；legacy 默认 5）\n"
         "  --balanced          对齐模式强制均衡路由（默认即均衡）\n"
@@ -623,6 +625,7 @@ static bool parse_args(int argc, char** argv, RunOpts* o, std::string* err) {
             }
             o->tk_info = argv[i];
         } else if (a == "--tk-launch") o->tk_launch = value();
+        else if (a == "--tk-all") o->tk_all = true;
         else {
             *err = "未知参数: " + a;
             return false;
@@ -1791,8 +1794,65 @@ struct TkCase {
     int launch = 0;            // 选中的 launch 号
     int max_expert = 0;        // 单专家最大收行数（最不均衡处）
     int nz_expert = 0;         // 非零收行的专家数
+    int ranks = 0;             // 日志中出现的 rank 数（<R 表示抽样/部分）
+    bool imbalanced = false;   // 该例是否判为长尾不均衡
     std::vector<std::vector<int64_t>> routes;  // [R][tokens*topk] 全局专家号
 };
+
+// 由 cnt[R][epr] 构造路由（round-robin 分给源 rank）+ 自检。total 须整除 R*topk。
+static bool build_tk_case(const std::vector<std::vector<int>>& cnt, int launch,
+                          int nranks, int R, int topk, int epr, TkCase* out,
+                          std::string* err) {
+    long long total = 0;
+    int max_expert = 0, nz = 0;
+    for (int r = 0; r < R; ++r)
+        for (int e = 0; e < epr; ++e) {
+            total += cnt[r][e];
+            if (cnt[r][e] > max_expert) max_expert = cnt[r][e];
+            if (cnt[r][e] > 0) ++nz;
+        }
+    const int per = R * topk;
+    if (total <= 0 || total % per != 0) {
+        *err = "launch=" + std::to_string(launch) + " 总 pair=" +
+               std::to_string(total) + " 不能被 R*topk=" + std::to_string(per) +
+               " 整除";
+        return false;
+    }
+    const int tokens = (int)(total / per);
+    if (tokens <= 0) {
+        *err = "推导出 tokens<=0";
+        return false;
+    }
+    out->routes.assign(R, std::vector<int64_t>((size_t)tokens * topk, 0));
+    long long j = 0;
+    for (int r = 0; r < R; ++r)
+        for (int e = 0; e < epr; ++e) {
+            const int64_t ge = (int64_t)r * epr + e;
+            for (int c = 0; c < cnt[r][e]; ++c, ++j) {
+                const int src = (int)(j % R);
+                const int idx = (int)(j / R);
+                out->routes[src][(size_t)(idx / topk) * topk + (idx % topk)] = ge;
+            }
+        }
+    std::vector<std::vector<int>> got(R, std::vector<int>(epr, 0));
+    for (int s = 0; s < R; ++s)
+        for (int64_t e : out->routes[s])
+            if (e >= 0 && e < (int64_t)R * epr)
+                ++got[(int)(e / epr)][(int)(e % epr)];
+    for (int r = 0; r < R; ++r)
+        for (int e = 0; e < epr; ++e)
+            if (got[r][e] != cnt[r][e]) {
+                *err = "路由自检失败 rank=" + std::to_string(r) + " expert=" +
+                       std::to_string(e);
+                return false;
+            }
+    out->tokens = tokens;
+    out->launch = launch;
+    out->max_expert = max_expert;
+    out->nz_expert = nz;
+    out->ranks = nranks;
+    return true;
+}
 
 static bool load_tk_case(const std::string& path, int want_launch, int R,
                          int topk, int epr, TkCase* out, std::string* err) {
@@ -1853,56 +1913,57 @@ static bool load_tk_case(const std::string& path, int want_launch, int R,
         if (rk.first < 0 || rk.first >= R) continue;
         cnt[rk.first] = rk.second;
     }
-    long long total = 0;
-    int max_expert = 0, nz = 0;
-    for (int r = 0; r < R; ++r)
-        for (int e = 0; e < epr; ++e) {
-            total += cnt[r][e];
-            if (cnt[r][e] > max_expert) max_expert = cnt[r][e];
-            if (cnt[r][e] > 0) ++nz;
-        }
-    const int per = R * topk;
-    if (total <= 0 || total % per != 0) {
-        *err = "TK_INFO launch=" + std::to_string(sel) + " 总 pair=" +
-               std::to_string(total) + " 不能被 R*topk=" + std::to_string(per) +
-               " 整除";
+    return build_tk_case(cnt, sel, (int)data[sel].size(), R, topk, epr, out, err);
+}
+
+// [TK-ALL] 解析全部 launch（跳过非法/空的），返回按 launch 升序的测例表。
+static bool load_tk_all(const std::string& path, int R, int topk, int epr,
+                        std::vector<TkCase>* out, std::string* err) {
+    std::ifstream f(path);
+    if (!f) {
+        *err = "无法打开 TK_INFO 文件: " + path;
         return false;
     }
-    const int tokens = (int)(total / per);
-    if (tokens <= 0) {
-        *err = "TK_INFO 推导出 tokens<=0";
+    std::map<int, std::map<int, std::vector<int>>> data;
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t p = line.find("[TK_INFO]");
+        if (p == std::string::npos) continue;
+        int rank = -1, launch = -1, n = -1;
+        if (std::sscanf(line.c_str() + p, "[TK_INFO] rank=%d launch=%d n=%d :",
+                        &rank, &launch, &n) != 3)
+            continue;
+        const size_t colon = line.find(':', p);
+        if (colon == std::string::npos) continue;
+        std::istringstream is(line.substr(colon + 1));
+        std::vector<int> vals;
+        int v = 0;
+        while (is >> v) vals.push_back(v);
+        if ((int)vals.size() != n || n != epr) continue;
+        data[launch][rank] = vals;
+    }
+    out->clear();
+    int skipped = 0;
+    for (const auto& kv : data) {
+        std::vector<std::vector<int>> cnt(R, std::vector<int>(epr, 0));
+        for (const auto& rk : kv.second)
+            if (rk.first >= 0 && rk.first < R) cnt[rk.first] = rk.second;
+        TkCase c;
+        std::string e;
+        if (!build_tk_case(cnt, kv.first, (int)kv.second.size(), R, topk, epr,
+                           &c, &e)) {
+            ++skipped;
+            continue;
+        }
+        out->push_back(std::move(c));
+    }
+    if (out->empty()) {
+        *err = "TK_INFO 中没有可用 launch（skipped=" + std::to_string(skipped) +
+               "）";
         return false;
     }
-    // pool：全局专家 e=r*epr+le 重复 cnt[r][le] 次；round-robin 分给各源 rank
-    out->routes.assign(R, std::vector<int64_t>((size_t)tokens * topk, 0));
-    long long j = 0;
-    for (int r = 0; r < R; ++r)
-        for (int e = 0; e < epr; ++e) {
-            const int64_t ge = (int64_t)r * epr + e;
-            for (int c = 0; c < cnt[r][e]; ++c, ++j) {
-                const int src = (int)(j % R);
-                const int idx = (int)(j / R);
-                out->routes[src][(size_t)(idx / topk) * topk + (idx % topk)] = ge;
-            }
-        }
-    // 自检：按构造出的路由回跑统计，必须逐专家等于日志值
-    std::vector<std::vector<int>> got(R, std::vector<int>(epr, 0));
-    for (int s = 0; s < R; ++s)
-        for (int64_t e : out->routes[s])
-            if (e >= 0 && e < (int64_t)R * epr) ++got[(int)(e / epr)][(int)(e % epr)];
-    for (int r = 0; r < R; ++r)
-        for (int e = 0; e < epr; ++e)
-            if (got[r][e] != cnt[r][e]) {
-                *err = "TK_INFO 路由自检失败 rank=" + std::to_string(r) +
-                       " expert=" + std::to_string(e) + " got=" +
-                       std::to_string(got[r][e]) + " want=" +
-                       std::to_string(cnt[r][e]);
-                return false;
-            }
-    out->tokens = tokens;
-    out->launch = sel;
-    out->max_expert = max_expert;
-    out->nz_expert = nz;
+    std::fprintf(stderr, "[tk-all] 解析 %zu 个可用 launch（跳过 %d）\n",
+                 out->size(), skipped);
     return true;
 }
 
@@ -1933,7 +1994,13 @@ static int run_aligned(RunOpts o) {
     // 缺省：均衡路由 × TPR 列表；--tk-info：从日志复现一次真实（不均衡）launch。
     const bool tk_mode = !o.tk_info.empty();
     std::vector<TkCase> cases;
-    if (tk_mode) {
+    if (o.tk_all) {
+        std::string e;
+        if (!load_tk_all(o.tk_info, R, kTopk, kEPR, &cases, &e)) {
+            std::fprintf(stderr, "[bench] %s\n", e.c_str());
+            return 2;
+        }
+    } else if (tk_mode) {
         TkCase c;
         std::string e;
         if (!load_tk_case(o.tk_info, o.tk_launch, R, kTopk, kEPR, &c, &e)) {
@@ -1976,7 +2043,8 @@ static int run_aligned(RunOpts o) {
     // 逐测例判「长尾不均衡」：该例 max_expert 是否 >= 4×该例非零中位数。
     // 逐例判断（不能跨例合并中位数：均衡多档列表 16/64/256 合并后会误判）。
     bool imbalanced = false;
-    for (const TkCase& c : cases) {
+    int imb_med = 0;
+    for (TkCase& c : cases) {
         std::map<int, int> cnt;
         for (const auto& r : c.routes)
             for (int64_t e : r)
@@ -1987,16 +2055,27 @@ static int run_aligned(RunOpts o) {
         for (const auto& kv : cnt) nz.push_back(kv.second);
         std::sort(nz.begin(), nz.end());
         const int med = nz[nz.size() / 2];
-        if (c.max_expert >= 4 * std::max(1, med)) imbalanced = true;
+        if (c.max_expert >= 3 * std::max(1, med)) {
+            c.imbalanced = true;
+            imbalanced = true;
+            imb_med = std::max(imb_med, med);
+        }
     }
     int win_cap;
     if (o.scene.win_cap > 0) {
         win_cap = o.scene.win_cap;
     } else if (imbalanced) {
         // [LONGTAIL] merge=1（不粗化）+ 窗口：把大专家切成多个任务摊到多 block。
-        // [OPT-AFRAG] A fragment 布局消除多窗口 A 散射惩罚后，最优窗口由 45 抬到
-        //   48（≤48 走小档 body；853000 934→832µs，804400/804300 同向改善）。
-        int tgt = std::min((int)48, cap_need);
+        // [OPT-AFRAG] A fragment 布局消除多窗口 A 散射惩罚后：
+        //   分布以「少量大专家 + 大量极小专家」为主（非零中位数小，如 853000 中位
+        //   6）→ 用小窗 48（多切大专家）；若是「多个中等专家」（中位数大，如 806600
+        //   中位 142）→ 用大窗 ~cap_need/kRing，减少任务数。
+        int tgt;
+        if (imb_med >= 32)
+            tgt = (cap_need + kRing - 1) / kRing;        // ~cap_need/kRing（~64）
+        else
+            tgt = std::min((int)48, cap_need);
+        tgt = ((tgt + kM - 1) / kM) * kM;                // 对齐 M tile
         win_cap = std::min(max_tokens, std::max((int)kM, tgt));
     } else {
         win_cap = std::max(128, max_tokens);
@@ -2034,14 +2113,19 @@ static int run_aligned(RunOpts o) {
 
     std::printf(
         "设备数=%d  topk=%d  路由=%s  graph: nodes=%d replays=%d（取最小）\n",
-        ndev, kTopk, tk_mode ? "不均衡(TK_INFO)" : "均衡", nodes, replays);
-    if (tk_mode) {
+        ndev, kTopk, o.tk_all ? "TK_ALL" : (tk_mode ? "不均衡(TK_INFO)" : "均衡"),
+        nodes, replays);
+    if (tk_mode && !o.tk_all) {
         const TkCase& c = cases[0];
         std::printf(
             "[TK_INFO] launch=%d tokens=%d 单专家最大收行=%d 非零专家=%d/%d\n",
             c.launch, c.tokens, c.max_expert, c.nz_expert, R * kEPR);
     }
-    std::printf("%-4s %-6s %12s %14s\n", "R", "TPR", "us/kernel", "口径");
+    if (o.tk_all)
+        std::printf("%-9s %-5s %-6s %-7s %-6s %12s %s\n", "launch", "ranks",
+                    "tokens", "maxexp", "nz", "us/kernel", "cal");
+    else
+        std::printf("%-4s %-6s %12s %14s\n", "R", "TPR", "us/kernel", "口径");
 
     std::vector<RankRes> res(R);
     g_rb_n = R;
@@ -2243,7 +2327,7 @@ static int run_aligned(RunOpts o) {
                     CHECK(mcStreamCreate(&st));
                     fp8mega::MegaLaunchArgs a = make_mega_args(
                         o, L, r, win_cap, combine_f32_off);
-                    if (imbalanced) a.merge_grid = 0x3fffffff;  // [LONGTAIL] 不粗化
+                    if (c.imbalanced) a.merge_grid = 0x3fffffff;  // [LONGTAIL] 不粗化
                     while (go.load(std::memory_order_acquire) == 0) {}
                     bool cap = false;
                     cal[rank] = chain_measure(
@@ -2264,8 +2348,14 @@ static int run_aligned(RunOpts o) {
         if (best >= 1e30) best = -1.0;
         const bool all_cap = std::count(caps.begin(), caps.end(), 1) == R;
         std::string note = all_cap ? cal[0] : (cal[0] + "(部分降级)");
-        if (tk_mode) note += " max_expert=" + std::to_string(c.max_expert);
-        std::printf("%-4d %-6d %12.2f %14s\n", R, T, best, note.c_str());
+        if (o.tk_all) {
+            std::printf("%-9d %-5d %-6d %-7d %-6d %12.2f %s\n", c.launch,
+                        c.ranks, c.tokens, c.max_expert, c.nz_expert, best,
+                        note.c_str());
+        } else {
+            if (tk_mode) note += " max_expert=" + std::to_string(c.max_expert);
+            std::printf("%-4d %-6d %12.2f %14s\n", R, T, best, note.c_str());
+        }
         std::fflush(stdout);
         if (std::getenv("PHASE_DUMP") != nullptr) {
             const double clk = 2000.0;
