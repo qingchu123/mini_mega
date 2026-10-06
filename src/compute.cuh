@@ -114,6 +114,28 @@
 #include "common.cuh"
 #include "flags.cuh"
 
+// [CM-SKIP] 分阶段消融诊断（默认 0，不影响基线；仅 perf-only 口径）：
+//   CM_SKIP_GEMM=1 同时跳过 L1+L2（纯通信）；CM_SKIP_L1/L2 单独跳过。
+#ifndef CM_SKIP_GEMM
+#define CM_SKIP_GEMM 0
+#endif
+#ifndef CM_SKIP_L1
+#define CM_SKIP_L1 0
+#endif
+#ifndef CM_SKIP_L2
+#define CM_SKIP_L2 0
+#endif
+#if CM_SKIP_GEMM || CM_SKIP_L1
+#define CM_L1_GATE (false)
+#else
+#define CM_L1_GATE (warp < kComputeWarps && count > 0)
+#endif
+#if CM_SKIP_GEMM || CM_SKIP_L2
+#define CM_L2_GATE (false)
+#else
+#define CM_L2_GATE (warp < kComputeWarps && count > 0)
+#endif
+
 // ---------------------------------------------------------------- 类型别名 --
 using Fp8MmaFragment = __NATIVE_VECTOR__(2, uint32_t);
 // 16B/lane 宽装载：一次得到同 lane 的两个 native fragment（低/高 8B）
@@ -864,7 +886,7 @@ struct NoTaskTail {
 //   test/31.tpr16_regress/results.md）。由 host 在 slot_capacity<=kM 时选择该实例；
 //   语义要求 win_cap<=slot_capacity<=kM（此时 count>kM 分支恒不可达，协议不变）。
 template <typename TaskTail = NoTaskTail, bool kSmallOnly = false,
-          bool kFragCap = false, bool kCap64 = false>
+          bool kFragCap = false, int kCap = 0>
 __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* self, uint8_t* const* peer_bases, int R, int rank,
         int win_cap, int pool_stride, int tbl_cap, int k_in, int topk, int ring,
@@ -1073,7 +1095,7 @@ __device__ __forceinline__ void dispatch_pull_body(
                                                epoch, pool_slot, pfx, tail,
                                                a_smem, b_smem);
         } else if (count > kM) {
-            r19_big_task<TaskTail, kFragCap, kCap64>(S, task, e, w, count, slice,
+            r19_big_task<TaskTail, kFragCap, kCap>(S, task, e, w, count, slice,
                                                      epoch, pool_slot, pfx, tail,
                                                      a_smem, b_smem);
         } else {

@@ -336,3 +336,23 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 7) timeout -k 3 15 ./bench \
 
 > 目标 700µs 仍未达；tk_first 剩余 ~810µs 的暴露主要来自 B（权重）HBM 流量
 > （BFIX 诊断地板 ~542µs，n=0 变址 ~587µs），需 B 复用/L2 驻留类重构。
+
+## v9：tk_first 前 50 launch：kCap 上界再下探到 48，裁掉 MT4 大 GEMM 兜底
+
+时间标签：`[261007_02_29]`（分支 agent/opt10h/1）。
+
+- 口径：`./bench --tk-info ... --tk-first 50`（n=50 平均）。
+- 阶段消融（同会话，`-DCM_SKIP_L1/L2`）：full=807.8、comm=201.9、
+  L1=379.6（46.9%）、L2=241.5（29.9%）；L1 最大 → 优先攻 L1。
+- 根因：v8 的 kCap64 只删了不可达的 MT8 异步档；但 tk 逐例 win_cap 多数=48，
+  此时 count>48 全部不可达，`r19_big_task` 里 **MT4 大 GEMM 兜底
+  `r19_l1_big<4,R19_L1_PF,4>`（acc 4×4×2×4=128 floats）与
+  `r19_l2_big<4,...>`** 仍被实例化并抬高寄存器/栈。
+- 改动：把 v8 的 `bool kCap64` 泛化为编译期 `int kCap`（0/48/64）。win_cap<=48
+  选 `kCap=48` 实例：`else if constexpr (kCap48)` 用**已实例化的 paired MT3**
+  兜底替换两个大 GEMM，`if constexpr` 保证不实例化 `r19_l1_big/r19_l2_big`。
+  该兜底对生产 g_l1=4/g_l2=6 几何不可达（正确性不受影响）。
+- 前 50 平均 **810.7 → 776.1~778.2µs（-4.0%，多次）**；相对 v7 835.8 累计 -7.1%。
+- 回归：test/70 TPR16/64/256 = 347~351 / 649 / 1932~1935（基线内）；
+  test/71 均衡 349、804300=672、804400=724、853000=711（均优于 v8）。
+- 正确性：R=2 `[总体] PASS`（L1/L2/REDUCE 三行 PASS）。

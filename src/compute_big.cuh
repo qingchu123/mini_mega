@@ -1293,7 +1293,7 @@ __device__ __forceinline__ void r19_tail_common(
 //   → L2（M 档位）→ tail。调用者（dispatch_pull_body 循环）只做领号/解码与
 //   任务尾 l2_done/processed 计数（与基线逐字一致）。
 // ============================================================================
-template <typename TaskTail, bool kFragCap = false, bool kCap64 = false>
+template <typename TaskTail, bool kFragCap = false, int kCap = 0>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,
@@ -1301,6 +1301,10 @@ __device__ R19_BIG_ATTR void r19_big_task(
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
+    // [OPT-TK-CAP] 编译期任务 count 上界（0=不限）：win_cap<=kCap 时相应重档
+    //   不可达，用 if constexpr 删除其模板实例以缩寄存器/栈。
+    constexpr bool kCap64 = (kCap > 0);
+    constexpr bool kCap48 = (kCap > 0 && kCap <= 48);
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
     // [R29] 融合推送上下文（capable=tail 支持；on 在本任务 L2 段按条件激活）
     CombineFuseCtx fuse = R29TailFuse<TaskTail>::get(tail);
@@ -1315,7 +1319,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     const int g0_l1 = slice * g_l1;
     // [集71] L1 阶段执行次数（count>0 的任务，tid0 计一次）
     if (tid == 0 && count > 0) MX_CTR_ADD(S.ctr, kCtrL1Exec, 1);
-    if (warp < kComputeWarps && count > 0) {
+    if (CM_L1_GATE) {
         uint8_t* ffn_slot = (S.ffn_hidden != nullptr)
             ? S.ffn_hidden + (size_t)pool_slot * S.win_cap * S.l1_k_out
             : nullptr;
@@ -1454,6 +1458,15 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
                 S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
                 S.l1_k_out);
+        } else if constexpr (kCap48) {
+            // [OPT-TK-CAP48] win_cap<=48：count<=48，上述小/中档分支对生产
+            //   g_l1 几何恒命中；此处仅为兜底（保持正确），用已实例化的 paired
+            //   MT3 替换 r19_l1_big<4> 重档 → 不实例化大 GEMM（省寄存器/栈）。
+            l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3, CM_L1_BATCH,
+                                       false>(
+                pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n, lane,
+                warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
+                out_col_base, S.l1_k_out, nullptr, nullptr, 0, ffn2);
         } else if constexpr (kCap64) {
             // [OPT-TK-CAP64] cap64 变体：count<=64，MT8 异步档不可达 → 直接
             //   走固定 MT4 回退；if constexpr 保证不实例化 MT8 模板（不占栈）。
@@ -1523,7 +1536,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     const int g0_l2 = slice * g_l2;
     // [集71] L2 阶段执行次数（count>0 的任务，tid0 计一次）
     if (tid == 0 && count > 0) MX_CTR_ADD(S.ctr, kCtrL2Exec, 1);
-    if (warp < kComputeWarps && count > 0) {
+    if (CM_L2_GATE) {
         const uint8_t* ffn_slot =
             (S.ffn_hidden != nullptr)
                 ? S.ffn_hidden + (size_t)pool_slot * S.win_cap * S.l1_k_out
@@ -1623,6 +1636,13 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 a_smem, f2, S.mt_total, w2_e, 0, count, S.l1_k_out,
                 S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps,
                 S.l2_chk, g0_l2, g_l2, out_slot, S.l2_k_out, nullptr);
+        } else if constexpr (kCap48) {
+            // [OPT-TK-CAP48] 兜底：count<=48，用已实例化的 paired MT3 替换
+            //   r19_l2_big<4> 重档（不实例化大 GEMM）。
+            l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, false>(
+                ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n, lane,
+                warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot, S.l2_k_out,
+                nullptr, 0);
         } else if constexpr (kCap64) {
             // [OPT-TK-CAP64] cap64 变体：count<=64，MT8 异步档不可达 → 固定
             //   MT4/B3，if constexpr 保证不实例化 MT8 模板。
@@ -1699,7 +1719,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     const int g0_l1 = slice * g_l1;
     // [集71] L1 阶段执行次数（count>0 的任务，tid0 计一次）
     if (tid == 0 && count > 0) MX_CTR_ADD(S.ctr, kCtrL1Exec, 1);
-    if (warp < kComputeWarps && count > 0) {
+    if (CM_L1_GATE) {
         uint8_t* ffn_slot = (S.ffn_hidden != nullptr)
             ? S.ffn_hidden + (size_t)pool_slot * S.win_cap * S.l1_k_out
             : nullptr;
@@ -1737,7 +1757,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     const int g0_l2 = slice * g_l2;
     // [集71] L2 阶段执行次数（count>0 的任务，tid0 计一次）
     if (tid == 0 && count > 0) MX_CTR_ADD(S.ctr, kCtrL2Exec, 1);
-    if (warp < kComputeWarps && count > 0) {
+    if (CM_L2_GATE) {
         const uint8_t* ffn_slot =
             (S.ffn_hidden != nullptr)
                 ? S.ffn_hidden + (size_t)pool_slot * S.win_cap * S.l1_k_out

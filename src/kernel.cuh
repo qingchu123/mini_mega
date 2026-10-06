@@ -129,7 +129,7 @@ struct R29TailFuseSet<CombineTail> {
 
 // 计算链任务循环（tail 类型由调用点按运行期开关选择）
 template <typename TaskTail, bool kSmallOnly = false, bool kFragCap = false,
-          bool kCap64 = false>
+          int kCap = 0>
 __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
                                                    TaskTail tail, int cycle,
                                                    uint8_t* a_smem = nullptr,
@@ -137,7 +137,7 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
                                                    uint8_t* frag_a = nullptr,
                                                    uint8_t* frag2 = nullptr,
                                                    unsigned long long* ctr = nullptr) {
-    dispatch_pull_body<TaskTail, kSmallOnly, kFragCap, kCap64>(
+    dispatch_pull_body<TaskTail, kSmallOnly, kFragCap, kCap>(
         a.self, a.peer_bases, a.R, a.rank, a.win_cap, a.pool_stride,
         a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off, a.src_off, a.x_off,
         a.weights_off, a.pool_off, a.w_off, a.meta_off, a.lf->bar[cycle],
@@ -153,7 +153,7 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
 //   kWithCompute=false：只跑前序（M1 验证）；true：完整任务循环（M2/M3）；
 //   kWithCompute=true 且 combine_rows_off>=0：任务尾接 COMBINE（M3）
 template <bool kWithCompute, typename TaskTail = NoTaskTail,
-          bool kSmallOnly = false, bool kFragCap = false, bool kCap64 = false>
+          bool kSmallOnly = false, bool kFragCap = false, int kCap = 0>
 __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     // 相位时间戳（block0 tid0；[6]=入口 [0]=route后 [1]=publish后 [2]=xbar后 [3]=setup后）
     const bool kTick = (blockIdx.x == 0) && (threadIdx.x == 0);
@@ -265,7 +265,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
 #if MX_DBG_COUNT
             tail.ctr = ctr;
 #endif
-            mega_dispatch_loop<CombineTail, kSmallOnly, kFragCap, kCap64>(
+            mega_dispatch_loop<CombineTail, kSmallOnly, kFragCap, kCap>(
                 a, tail, cyc, &s_ab.a[0][0], &s_ab.b[0], a.frag_a, a.frag2,
                 ctr);
         }

@@ -102,13 +102,17 @@ void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream) {
 }
 
 void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
-    // [OPT-TK-CAP64] 仅当宿主提供了 fragment 专用缓冲（不均衡长尾/tk 场景）
-    //   且 win_cap<=64 时，用 kCap64 实例：count>64 的 MT8 异步大档不可达 →
-    //   编译期删除该档，缩小任务体寄存器/栈，提升小/中档路径（tk 前 50
-    //   launch 约 -3%）。均衡 test/70（无 frag）与 TPR=256 大档走原实例不变。
+    // [OPT-TK-CAP] 仅当宿主提供了 fragment 专用缓冲（不均衡长尾/tk 场景）时，
+    //   按 win_cap 选编译期 count 上界实例（kCap=48/64）：不可达的重档
+    //   （MT8 异步 / MT4 大 GEMM 兜底）被 if constexpr 删除，缩任务体寄存器/栈。
+    //   均衡 test/70（无 frag）与 TPR=256 大档走原实例不变。
     if (a.frag_a != nullptr) {
-        if (a.win_cap <= 64)   // [OPT-AFRAG] 多窗口 fragment + cap64 实例
-            mega_kernel<true, NoTaskTail, false, true, true>
+        if (a.win_cap <= 48)
+            mega_kernel<true, NoTaskTail, false, true, 48>
+                <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a),
+                                                                NoTaskTail{});
+        else if (a.win_cap <= 64)
+            mega_kernel<true, NoTaskTail, false, true, 64>
                 <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a),
                                                                 NoTaskTail{});
         else
