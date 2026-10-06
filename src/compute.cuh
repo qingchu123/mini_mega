@@ -148,6 +148,17 @@ constexpr int kNTilesPerWarp = 2;
 #ifndef CM_BPTR
 #define CM_BPTR 1
 #endif
+// [OPT-BPTR-L2] L2 的 B k=0 基址预计算（省去每次装载的 64bit 乘加寻址）
+#ifndef CM_BPTR_L2
+#define CM_BPTR_L2 0
+#endif
+// [OPT-SMALL-BSM] 小档 L1 的 B 走 smem 异步分级流水（kBR 级）
+#ifndef CM_SMALL_BSM
+#define CM_SMALL_BSM 0
+#endif
+#ifndef CM_SMALL_BR
+#define CM_SMALL_BR 2
+#endif
 // [OPT-AFRAG] 子开关（诊断用）
 #ifndef CM_FRAG_A
 #define CM_FRAG_A 1
@@ -289,12 +300,22 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
         const uint8_t* b_base[kBatch];
         #pragma unroll
         for (int q = 0; q < kBatch; ++q)
+#ifdef CM_DIAG_BFIX
+            b_base[q] = w_e + (size_t)(lane & 63) * 16;
+#else
             b_base[q] = w_e + (size_t)(nbase[q] >> 5) *
                                   (size_t)(k_hidden >> 5) * 1024 +
                         (size_t)(lane & 63) * 16;
+#endif
+#ifdef CM_DIAG_BFIX
+#define CM_LDB_L1(q, step)                                                  \
+    (*reinterpret_cast<const Fp8MmaFragment2*>(b_base[(q)] +                \
+                                               (size_t)((step) & 7) * 1024))
+#else
 #define CM_LDB_L1(q, step)                                                  \
     (*reinterpret_cast<const Fp8MmaFragment2*>(b_base[(q)] +                \
                                                (size_t)(step) * 1024))
+#endif
 #else
 #define CM_LDB_L1(q, step) cm_load_b_lane16(w_e, nbase[q], (step) * kKStep, k_hidden)
 #endif
@@ -430,8 +451,21 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
 //   sbuf 布局：[kBR][kBatch][8 个 n-tile][1024B]；每题消费一 stage 后补发下一。
 // ============================================================================
 __device__ __forceinline__ void cm_bsm_wait(int outstanding) {
-    (void)outstanding;
-    __builtin_mxc_arrive(4096);
+    // outstanding = 当前 stage 之后仍在飞的 stage 数（issued-consumed）。
+    // 只等「当前 stage 已落地」，允许之后的 (outstanding-1) 个 stage 继续在飞。
+    // __builtin_mxc_arrive(64+N) 语义：等到 gvmcnt 在飞数 ≤ N（64=清空阈值）。
+    // 该内建要求常量实参，故按 outstanding（≤8）分派到常量调用。
+    switch (outstanding) {
+        case 1: __builtin_mxc_arrive(64); break;
+        case 2: __builtin_mxc_arrive(65); break;
+        case 3: __builtin_mxc_arrive(66); break;
+        case 4: __builtin_mxc_arrive(67); break;
+        case 5: __builtin_mxc_arrive(68); break;
+        case 6: __builtin_mxc_arrive(69); break;
+        case 7: __builtin_mxc_arrive(70); break;
+        case 8: __builtin_mxc_arrive(71); break;
+        default: __builtin_mxc_arrive(64); break;
+    }
 }
 
 template <int kMTiles = 1, int kBatch = 4, int kBR = 4>
@@ -607,6 +641,20 @@ __device__ __forceinline__ void l2_gemm_body(
         #pragma unroll
         for (int q = 0; q < kBatch; ++q)
             nbase[q] = (g0 + q) * block_n + warp * n_per_warp;
+#if CM_BPTR_L2
+        // [OPT-BPTR-L2] B 的 k=0 基址（含 lane 偏移）；k step 递进 = +1024B
+        const uint8_t* b_base[kBatch];
+        #pragma unroll
+        for (int q = 0; q < kBatch; ++q)
+            b_base[q] = w2 + (size_t)(nbase[q] >> 5) * (size_t)(k_in >> 5) *
+                                 1024 +
+                        (size_t)(lane & 63) * 16;
+#define CM_LDB_L2(q, step)                                                  \
+    (*reinterpret_cast<const Fp8MmaFragment2*>(b_base[(q)] +                \
+                                               (size_t)(step) * 1024))
+#else
+#define CM_LDB_L2(q, step) cm_load_b_lane16(w2, nbase[q], (step) * kKStep, k_in)
+#endif
         Fp8MmaFragment a_pipe[kPrefetch][kMTiles];
         Fp8MmaFragment2 b_pair[kPrefetch][kBatch];
         #pragma unroll
@@ -621,8 +669,7 @@ __device__ __forceinline__ void l2_gemm_body(
             }
             #pragma unroll
             for (int q = 0; q < kBatch; ++q)
-                b_pair[sp][q] =
-                    cm_load_b_lane16(w2, nbase[q], sp * kKStep, k_in);
+                b_pair[sp][q] = CM_LDB_L2(q, sp);
         }
         Fp8Accumulator acc[kBatch][kMTiles][kNTiles];
         #pragma unroll
@@ -662,8 +709,7 @@ __device__ __forceinline__ void l2_gemm_body(
                 }
                 #pragma unroll
                 for (int q = 0; q < kBatch; ++q)
-                    b_pair[sp][q] =
-                        cm_load_b_lane16(w2, nbase[q], nk * kKStep, k_in);
+                    b_pair[sp][q] = CM_LDB_L2(q, nk);
             }
         }
         // 输出 BF16（acc lane 布局同 L1；每组写自己的列块）

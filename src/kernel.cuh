@@ -174,7 +174,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     //   a 布局 [2][R24_MT*R24_KS*512]。
     union __align__(16) ABShared {
         uint8_t a[2][R24_MT * R24_KS * 512];
-        uint8_t b[CM_BR * 4 * 8 * 1024];
+        uint8_t b[((CM_BR > CM_SMALL_BR) ? CM_BR : CM_SMALL_BR) * 4 * 8 * 1024];
     };
     __shared__ ABShared s_ab;
     if (kTick) a.lf->pre_ticks[6] = clock64();
