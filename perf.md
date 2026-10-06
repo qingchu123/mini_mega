@@ -289,3 +289,18 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 7) timeout -k 3 15 ./bench \
 ### 正确性
 - R=2 / R=32 `[总体] PASS`（L1/L2/REDUCE 数值三行 PASS）。
 - fragment 路径与行主序路径 **bit-exact**（同 win_cap=48 下 l1_chk/l2_chk 累加和逐位相同）。
+
+## v7：tk_log 前 50 launch 平均优化（并行 4+2 agent；接受 −7%）
+
+- 口径：`./bench --tk-info <log> --tk-first 50`（升序 804300..809200，n=50 平均）。
+- 目标：−20%（898.5 → 718.8µs）；**实际 −7.0%（898.5 → 835.8µs）**。
+- 合入：
+  - 逐例自适应 win_cap（消除全局聚合被离群例抬高）：855.4（−4.8%，eb8774b）；
+  - 中等档 count∈33..48 的 L1/L2 改走 r24 A-smem + bsm 异步：835.8（再 −2.3%，cce2fdf）。
+- 负结果（已回退/默认关）：远写 push dispatch（+4.0%，核内远端读已被计算隐藏）；
+  跨任务软件流水（pull/wait-all 已隐藏，≤4%）；B 权重重读减量（暴露 ~247µs，但减 B 须减窗口，
+  与长尾均衡强耦合；win_cap=48 已最优）。
+- 卡点：目标 718.8µs 低于 Bfix 地板（B 地址 L1 常驻、指令保留）≈745µs；进一步需
+  **多级 async smem B 深流水 / B-stationary** 这类高风险重构（现有 B-smem 因
+  `__mxc_arrive(4096)` 一次排空而失效）。
+- 回归：test/70、test/71 均 <3%；正确性 R=2/R=32 `[总体] PASS`。
