@@ -748,8 +748,7 @@ __device__ __forceinline__ void dispatch_pull_body(
         const int* prefix_ptr = nullptr, unsigned long long* pt = nullptr,
         uint8_t* a_smem = nullptr, uint8_t* b_smem = nullptr,
         uint8_t* frag_a = nullptr, uint8_t* frag2 = nullptr,
-        unsigned long long* ctr = nullptr, int merge_grid = 0,
-        int merge_floor = 1) {
+        unsigned long long* ctr = nullptr, int merge_grid = 0) {
     extern __shared__ __align__(16) uint8_t smem_raw[];
     int* s_count = reinterpret_cast<int*>(smem_raw);   // EPR：每专家总行数
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）
@@ -798,11 +797,6 @@ __device__ __forceinline__ void dispatch_pull_body(
     while (merge < kNSlice &&
            ((raw_tasks + merge - 1) / merge) > merge_cap)
         merge <<= 1;
-    // [LONGTAIL-MED] 中等不均衡：强制每窗最少 merge_floor 个物理 slice，
-    //   降低 A 重读与任务固定开销（大专家仍按 merge_cap 继续粗化）。
-    if (merge_floor > 1 && merge < merge_floor && merge_floor <= kNSlice &&
-        (kNSlice % merge_floor == 0))
-        merge = merge_floor;
     if (kNSlice % merge != 0) merge = 1;   // 兜底（kNSlice 非 2 的幂）
     const int nslice_eff = kNSlice / merge;
     const int total_tasks = raw_tasks / merge;
