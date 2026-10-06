@@ -884,3 +884,19 @@
 | 908700 | 6 | 1 | 32 | 8 | 337.7 |
 | 912600 | 6 | 1 | 32 | 8 | 337.0 |
 | 916500 | 6 | 1 | 32 | 8 | 337.1 |
+
+## v2 对比（merge_floor 合入，commit 3540123）
+
+- 上一版（A-fragment 后，n=838）：mean **925.7** / median **849.0** / min 334.8 / max 3212.2 µs。
+- 本版全量 `--tk-all` 复测：**暂不可行**——202 共享机 GPU 运行时队列异常
+  （`mxkwCreateQueueBlock ioctl create queue block failed -1` / `mxc_queue_acquire failed`），
+  **基线代码同样段错误**（2-rank 正常、32-rank 失败），与本次改动无关；待机器恢复补跑。
+- 定向实测（Agent2，机器正常时，同口径 nodes=20/replays=2）：
+  - `--tk-launch 863400`：~855 → **~800-810µs（约 −6%）**；
+  - `--tk-launch 804400`：834 → 769µs；
+  - test/70 TPR16/64/256 无回退（~352/654/1956）。
+- 影响面：仅 `imbalanced(tk)` 且 `max_expert<=256`（中等不均衡）生效
+  （merge_grid=32 + merge_floor=2）；极端长尾(>256)与均衡档路径不变。
+
+> 待 202 GPU 队列恢复后，用 `./bench --tk-info <log> --tk-all` 重跑并与上表
+> (mean 925.7 / median 849.0) 做全量平均对比。
