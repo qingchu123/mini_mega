@@ -159,6 +159,11 @@ constexpr int kNTilesPerWarp = 2;
 #ifndef CM_SMALL_BR
 #define CM_SMALL_BR 2
 #endif
+// 小档 B 流水的 N 组批宽（stage 大小 = CM_SMALL_BATCH*8KB；须与 kernel.cuh 的
+// b 缓冲表达式中的 4 一致，改动时同步）
+#ifndef CM_SMALL_BATCH
+#define CM_SMALL_BATCH 4
+#endif
 // [OPT-AFRAG] 子开关（诊断用）
 #ifndef CM_FRAG_A
 #define CM_FRAG_A 1
@@ -450,20 +455,21 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
 //   个 8KB stage），把权重 DRAM 延迟藏到 MMA 之后。A 仍直装。
 //   sbuf 布局：[kBR][kBatch][8 个 n-tile][1024B]；每题消费一 stage 后补发下一。
 // ============================================================================
-__device__ __forceinline__ void cm_bsm_wait(int outstanding) {
-    // outstanding = 当前 stage 之后仍在飞的 stage 数（issued-consumed）。
-    // 只等「当前 stage 已落地」，允许之后的 (outstanding-1) 个 stage 继续在飞。
-    // __builtin_mxc_arrive(64+N) 语义：等到 gvmcnt 在飞数 ≤ N（64=清空阈值）。
-    // 该内建要求常量实参，故按 outstanding（≤8）分派到常量调用。
-    switch (outstanding) {
-        case 1: __builtin_mxc_arrive(64); break;
-        case 2: __builtin_mxc_arrive(65); break;
-        case 3: __builtin_mxc_arrive(66); break;
-        case 4: __builtin_mxc_arrive(67); break;
-        case 5: __builtin_mxc_arrive(68); break;
-        case 6: __builtin_mxc_arrive(69); break;
-        case 7: __builtin_mxc_arrive(70); break;
-        case 8: __builtin_mxc_arrive(71); break;
+// [微基准结论 · 261006] arrive(64+N) 的计数单位 = 每条 warp 级异步访存指令
+//   （bsm 拷贝与普通 ldg 共用该在飞计数，FIFO 完成）。N=0 全排空；N=k 允许 k 条
+//   在飞。bit6=0 的参数（如 4096）不构成等待。因此分级等待必须
+//   N = 当前 stage 之后的 stage 数 × 每 stage 的 bsm 指令条数（= kBatch）。
+template <int kBatch>
+__device__ __forceinline__ void cm_bsm_wait(int stages_ahead) {
+    switch (stages_ahead) {
+        case 0: __builtin_mxc_arrive(64); break;
+        case 1: __builtin_mxc_arrive(64 + kBatch); break;
+        case 2: __builtin_mxc_arrive(64 + 2 * kBatch); break;
+        case 3: __builtin_mxc_arrive(64 + 3 * kBatch); break;
+        case 4: __builtin_mxc_arrive(64 + 4 * kBatch); break;
+        case 5: __builtin_mxc_arrive(64 + 5 * kBatch); break;
+        case 6: __builtin_mxc_arrive(64 + 6 * kBatch); break;
+        case 7: __builtin_mxc_arrive(64 + 7 * kBatch); break;
         default: __builtin_mxc_arrive(64); break;
     }
 }
@@ -473,7 +479,14 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_bsm(
         uint8_t* __restrict__ sbuf, const uint8_t* pool, const uint8_t* w1,
         int expert, int count, int k_hidden, int n_total, int block_n, int lane,
         int warp, int nwarps, float* checksum, int n_group_begin,
-        int n_group_count, uint8_t* ffn_out, int out_col_base, int k_out) {
+        int n_group_count, uint8_t* ffn_out, int out_col_base, int k_out,
+#ifdef CM_SMALL_BSM_PROF
+        unsigned long long* prof = nullptr
+#else
+        void* prof = nullptr
+#endif
+        ) {
+    (void)prof;
     constexpr int kKStep = 32;
     constexpr int kNTiles = 2;
     constexpr int kStage = kBatch * 8 * 1024;   // 一 kstep 全部 N 组的 B 字节
@@ -485,22 +498,47 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_bsm(
     const uint8_t* w_e = w1 + (size_t)expert * n_total * k_hidden;
     const int tid = (int)threadIdx.x;
     float acc_chk = 0.0f;
+#ifdef CM_SMALL_BSM_PROF
+    long long wsum = 0;
+#endif
     for (int g0 = n_group_begin; g0 + kBatch <= n_group_begin + n_group_count;
          g0 += kBatch) {
+        // [OPT-BPTR] B 源/目标基址预计算（issue 每次只加 1024B/槽偏移）
+        const uint8_t* bsrc[kBatch];
+        uint8_t* bdst[kBatch];
+        #pragma unroll
+        for (int q = 0; q < kBatch; ++q) {
+            const int nt = ((g0 + q) * block_n >> 5) + (tid >> 6);
+            bsrc[q] = w_e + (size_t)nt * (k_hidden >> 5) * 1024 +
+                      (size_t)(tid & 63) * 16;
+            bdst[q] = sbuf + (size_t)q * 8192 + (tid >> 6) * 1024 +
+                      (size_t)(tid & 63) * 16;
+        }
         // 发一 stage：d = K step；每线程 kBatch 次 16B 异步拷贝
         auto issue = [&](int d) {
-            uint8_t* base = sbuf + (size_t)(d % kBR) * kStage;
+#ifndef CM_SMALL_BSM_DIAG_NOISSUE
+#ifdef CM_SMALL_BSM_B64
+            // [实验] b64：请求数翻倍（8B/lane），试探在飞请求数是否为瓶颈
             #pragma unroll
             for (int q = 0; q < kBatch; ++q) {
-                const int nt = ((g0 + q) * block_n >> 5) + (tid >> 6);
-                const uint8_t* src =
-                    w_e + ((size_t)nt * (k_hidden >> 5) + d) * 1024 +
-                    (size_t)(tid & 63) * 16;
-                uint8_t* dst = base + (size_t)q * 8192 + (tid >> 6) * 1024 +
-                               (size_t)(tid & 63) * 16;
-                __builtin_mxc_ldg_b128_bsm(dst, const_cast<uint8_t*>(src), 0,
-                                           -1, true, true, false, true);
+                const uint8_t* src = bsrc[q] + (size_t)d * 1024;
+                uint8_t* dst = bdst[q] + (size_t)(d % kBR) * kStage;
+                #pragma unroll
+                for (int h = 0; h < 2; ++h)
+                    __builtin_mxc_ldg_b64_bsm(dst + h * 8, const_cast<uint8_t*>(src + h * 8),
+                                              0, -1, true, true, false, true);
             }
+#else
+            #pragma unroll
+            for (int q = 0; q < kBatch; ++q)
+                __builtin_mxc_ldg_b128_bsm(
+                    bdst[q] + (size_t)(d % kBR) * kStage,
+                    const_cast<uint8_t*>(bsrc[q] + (size_t)d * 1024), 0, -1,
+                    true, true, false, true);
+#endif
+#else
+            (void)d;
+#endif
         };
         int issued = 0;
         #pragma unroll
@@ -527,17 +565,22 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_bsm(
             }
         }
         int consumed = 0;
-        for (int kk = 0; kk < k_iters; ++kk) {
-            cm_bsm_wait(issued - consumed);
-            const int nk = kk + 2;
-            if (nk < k_iters) {
-                #pragma unroll
-                for (int m = 0; m < kMTiles; ++m) {
-                    if constexpr (kMTiles > 1) { if (m >= m_tiles) break; }
-                    a_pipe[kk & 1][m] =
-                        cm_load_a(pool, k_hidden, nk * kKStep, count, m);
-                }
-            }
+        int kk = 0;
+#ifdef CM_SMALL_BSM_PROF
+        const long long t_loop0 = clock64();
+#endif
+        // [OPT-SMALL-BSM] 稳态段：issued-consumed == kBR，stages_ahead == kBR-1
+        //   恒为编译期常量（消除运行期 switch/取模，等待只留一条常量 arrive）。
+        const int steady_end = (k_iters > kBR) ? (k_iters - kBR) : 0;
+        #pragma unroll 4
+        for (; kk < steady_end; ++kk) {
+#ifdef CM_SMALL_BSM_PROF
+            const long long t0 = clock64();
+#endif
+            cm_bsm_wait<kBatch>(kBR - 1);
+#ifdef CM_SMALL_BSM_PROF
+            wsum += clock64() - t0;
+#endif
             #pragma unroll
             for (int m = 0; m < kMTiles; ++m) {
                 if constexpr (kMTiles > 1) { if (m >= m_tiles) break; }
@@ -557,8 +600,43 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_bsm(
                                                                acc[q][m][1]);
                 }
             }
+            // A 预取 step kk+2 到「刚消费」的槽：必须先读后写（消除原
+            // 先写后读造成的 A 串行停顿）。
+            {
+                const int nk = kk + 2;
+                #pragma unroll
+                for (int m = 0; m < kMTiles; ++m) {
+                    if constexpr (kMTiles > 1) { if (m >= m_tiles) break; }
+                    a_pipe[kk & 1][m] =
+                        cm_load_a(pool, k_hidden, nk * kKStep, count, m);
+                }
+            }
+            issue(kk + kBR);
             ++consumed;
-            if (issued < k_iters) { issue(issued); ++issued; }
+            ++issued;
+        }
+        // 收尾段：不再补发，等在飞 ≤ (k_iters-kk-1)*kBatch（运行期小值）
+        for (; kk < k_iters; ++kk) {
+            cm_bsm_wait<kBatch>(k_iters - kk - 1);
+            #pragma unroll
+            for (int m = 0; m < kMTiles; ++m) {
+                if constexpr (kMTiles > 1) { if (m >= m_tiles) break; }
+                const uint8_t* sb = sbuf +
+                    (size_t)(kk % kBR) * kStage + (size_t)warp * 1024;
+                const Fp8MmaFragment af = a_pipe[kk & 1][m];
+                #pragma unroll
+                for (int q = 0; q < kBatch; ++q) {
+                    const Fp8MmaFragment2 bp =
+                        *reinterpret_cast<const Fp8MmaFragment2*>(
+                            sb + (size_t)q * 8192 + (size_t)(lane & 63) * 16);
+                    const Fp8MmaFragment b0 = {bp[0], bp[1]};
+                    const Fp8MmaFragment b1 = {bp[2], bp[3]};
+                    acc[q][m][0] = __builtin_mxc_mma_16x16x32f8(af, b0,
+                                                               acc[q][m][0]);
+                    acc[q][m][1] = __builtin_mxc_mma_16x16x32f8(af, b1,
+                                                               acc[q][m][1]);
+                }
+            }
         }
         #pragma unroll
         for (int pi = 0; pi < kBatch / 2; ++pi) {
@@ -597,9 +675,17 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_bsm(
         }
         // 等所有在飞拷贝落地，下一 g0 组复用同一 sbuf（每线程只读写自身 lane）
         __builtin_mxc_arrive(64);
+#ifdef CM_SMALL_BSM_PROF
+        if (lane == 0 && warp == 0 && prof != nullptr)
+            atomicAdd(prof + 1, (unsigned long long)(clock64() - t_loop0));
+#endif
     }
     if (checksum != nullptr && lane == 0)
         atomicAdd(checksum, acc_chk + (float)count * 0.0f);
+#ifdef CM_SMALL_BSM_PROF
+    if (prof != nullptr && lane == 0 && warp == 0)
+        atomicAdd(prof, (unsigned long long)wsum);
+#endif
 }
 
 // ============================================================================
@@ -778,7 +864,7 @@ struct NoTaskTail {
 //   test/31.tpr16_regress/results.md）。由 host 在 slot_capacity<=kM 时选择该实例；
 //   语义要求 win_cap<=slot_capacity<=kM（此时 count>kM 分支恒不可达，协议不变）。
 template <typename TaskTail = NoTaskTail, bool kSmallOnly = false,
-          bool kFragCap = false>
+          bool kFragCap = false, bool kCap64 = false>
 __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* self, uint8_t* const* peer_bases, int R, int rank,
         int win_cap, int pool_stride, int tbl_cap, int k_in, int topk, int ring,
@@ -987,9 +1073,9 @@ __device__ __forceinline__ void dispatch_pull_body(
                                                epoch, pool_slot, pfx, tail,
                                                a_smem, b_smem);
         } else if (count > kM) {
-            r19_big_task<TaskTail, kFragCap>(S, task, e, w, count, slice, epoch,
-                                             pool_slot, pfx, tail, a_smem,
-                                             b_smem);
+            r19_big_task<TaskTail, kFragCap, kCap64>(S, task, e, w, count, slice,
+                                                     epoch, pool_slot, pfx, tail,
+                                                     a_smem, b_smem);
         } else {
             r19_small_task<TaskTail, kFragCap>(S, task, e, w, count, slice,
                                                epoch, pool_slot, pfx, tail,

@@ -102,13 +102,23 @@ void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream) {
 }
 
 void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
-    if (a.frag_a != nullptr)   // [OPT-AFRAG] 多窗口 fragment 专用实例
-        mega_kernel<true, NoTaskTail, false, true>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a),
-                                                            NoTaskTail{});
-    else
+    // [OPT-TK-CAP64] 仅当宿主提供了 fragment 专用缓冲（不均衡长尾/tk 场景）
+    //   且 win_cap<=64 时，用 kCap64 实例：count>64 的 MT8 异步大档不可达 →
+    //   编译期删除该档，缩小任务体寄存器/栈，提升小/中档路径（tk 前 50
+    //   launch 约 -3%）。均衡 test/70（无 frag）与 TPR=256 大档走原实例不变。
+    if (a.frag_a != nullptr) {
+        if (a.win_cap <= 64)   // [OPT-AFRAG] 多窗口 fragment + cap64 实例
+            mega_kernel<true, NoTaskTail, false, true, true>
+                <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a),
+                                                                NoTaskTail{});
+        else
+            mega_kernel<true, NoTaskTail, false, true>
+                <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a),
+                                                                NoTaskTail{});
+    } else {
         mega_kernel<true><<<a.grid, a.threads, (size_t)a.smem, stream>>>(
             to_mega_args(a), NoTaskTail{});
+    }
 }
 
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {

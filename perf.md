@@ -304,3 +304,35 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 7) timeout -k 3 15 ./bench \
   **多级 async smem B 深流水 / B-stationary** 这类高风险重构（现有 B-smem 因
   `__mxc_arrive(4096)` 一次排空而失效）。
 - 回归：test/70、test/71 均 <3%；正确性 R=2/R=32 `[总体] PASS`。
+
+## v8：tk_first 前 50 launch：编译期裁掉不可达的 MT8 大档（kCap64）
+
+时间标签：`[261007_00_57]`（分支 agent/opt10h1/1，commit 见下）。
+
+- 口径：`./bench --tk-info test/70.r32_tpr_perf/0928_tk_info.log --tk-first 50`
+  （升序 804300..809200，n=50 平均）。
+- 根因（探针）：tk 场景 win_cap 逐例自适应后恒 ≤64（多数 48，806600 为 64），
+  因此单个任务 `count = min(remain, win_cap) ≤ 64`，`count>64` 的 **MT8 异步
+  大档（r24_l1_big/r24_l2_big<MT8>）永不可达**；但该档的 `acc[kBatch][MT8][kNT][4]`
+  与内联主体仍参与 `r19_big_task`（`__noinline__`）的寄存器/栈分配，把同函数内
+  `count≤64` 的小/中档路径一并拖慢。
+- 改动：新增编译期模板参 `kCap64`（`mega_kernel`→`mega_dispatch_loop`→
+  `dispatch_pull_body`→`r19_big_task`）。`win_cap<=64` 且宿主提供 fragment 缓冲
+  （不均衡/tk）时选用该实例；`else if constexpr (kCap64)` 直接落到固定 MT4 回退，
+  **保证不实例化 MT8 模板**（不占栈）。均衡 test/70（无 frag）与 TPR=256 大档
+  仍走原实例，零影响。
+- 前 50 launch 平均 **835.8 → 809.9µs（-3.1%）**（多次 810.6/809.9/810.8）。
+- 回归：test/70 TPR16/64/256 = 345~354 / 661~668 / 1930~1935µs（基线
+  346~353 / 657~661 / 1946~1956，全在 ±3% 内，TPR=256 反降）；test/71
+  均衡 343.7、804300=697、804400=763、853000=750µs（均不劣于基线）。
+- 正确性：R=2 `[总体] PASS`（L1/L2/REDUCE 三行数值 PASS）。
+- 负结果（本会话，已回退/默认关）：
+  - B smem 异步分级流水（`CM_SMALL_BSM`/`CM_USE_BSM`，并修正原 A 预取
+    「先写后读」串行 bug）→ tk 前 50 中性/略负（831~844µs）；微基准证实
+    `arrive(64+N)` 分级语义正确，B 非纯延迟受限。
+  - 全局 `R19_L1_MT=R19_L2_MT=4`（tk -4.1%）但 TPR=256 **+13%**，不可接受；
+    故改为仅在不可达的 cap64 实例上删档。
+  - 加大 win_cap / kRing / kNSlice / 寄存器 B 预取深度（L1PF/L2PF/BPF）均回退。
+
+> 目标 700µs 仍未达；tk_first 剩余 ~810µs 的暴露主要来自 B（权重）HBM 流量
+> （BFIX 诊断地板 ~542µs，n=0 变址 ~587µs），需 B 复用/L2 驻留类重构。

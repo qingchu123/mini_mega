@@ -529,6 +529,10 @@ __device__ __forceinline__ void r19_l1_big(
 // [R27·delivered] A-smem 阶段步长由 16 降为 8：MT8 下 smem 双缓冲保持
 //   2*8*8*512=64KB（KS=16 会到 128KB，加动态 smem 后超设备 131072B/block
 //   上限，实测启动失败）。KS=8 在 71 机与 KS=16 中性，本地略优。
+// [OPT-TK-CAP64] tk_first 扫描发现：MT8 大档 acc（kBatch*kMT*kNT*4）把
+//   r19_big_task 的寄存器/栈顶高，拖慢同函数内 count<=64 的小/中档路径。
+//   win_cap<=64 时 count>64 不可达 → 用 kCap64 实例（见 megakernel.cu）
+//   编译期删除 MT8 异步档，前 50 launch 平均 ~-4%，大档 TPR=256 不变。
 #ifndef R24_KS
 #define R24_KS 8
 #endif
@@ -1289,7 +1293,7 @@ __device__ __forceinline__ void r19_tail_common(
 //   → L2（M 档位）→ tail。调用者（dispatch_pull_body 循环）只做领号/解码与
 //   任务尾 l2_done/processed 计数（与基线逐字一致）。
 // ============================================================================
-template <typename TaskTail, bool kFragCap = false>
+template <typename TaskTail, bool kFragCap = false, bool kCap64 = false>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,
@@ -1450,6 +1454,13 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
                 S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
                 S.l1_k_out);
+        } else if constexpr (kCap64) {
+            // [OPT-TK-CAP64] cap64 变体：count<=64，MT8 异步档不可达 → 直接
+            //   走固定 MT4 回退；if constexpr 保证不实例化 MT8 模板（不占栈）。
+            r19_l1_big<4, R19_L1_PF, 4>(
+                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
+                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
         } else if (kAsync) {
             // [R34] 全块（无掩码，原 async 快路径）+ 尾块（kMask=true）两段式：
             //   尾块 A 读取折叠到 F 最后一 tile、写/checksum 按 row<cc 掩码，
@@ -1612,6 +1623,13 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 a_smem, f2, S.mt_total, w2_e, 0, count, S.l1_k_out,
                 S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps,
                 S.l2_chk, g0_l2, g_l2, out_slot, S.l2_k_out, nullptr);
+        } else if constexpr (kCap64) {
+            // [OPT-TK-CAP64] cap64 变体：count<=64，MT8 异步档不可达 → 固定
+            //   MT4/B3，if constexpr 保证不实例化 MT8 模板。
+            r19_l2_big<4, R19_L2_PF, 3>(
+                ffn_slot, f2, S.mt_total, w2_e, count, S.l1_k_out,
+                S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
+                g0_l2, g_l2, out_slot, S.l2_k_out);
         } else if (kAsyncL2) {
             // [R34] 同 L1：全块 + 尾块（尾块掩码；融合推送对两段都生效）
             const int full = count - count % (R19_L2_MT * kM);
@@ -1688,12 +1706,26 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         const int out_col_base = slice * (S.l1_k_out / S.nslice_eff);
         // 均衡场景 g_l1=4：一次 K 循环处理全部 4 组（A 装载减半）；
         // kPrefetch=2 是为把 32 个 B fragment 槽控制在寄存器预算内。
-        if (g_l1 % 4 == 0)
+        if (g_l1 % 4 == 0) {
+#if CM_SMALL_BSM
+            // [OPT-SMALL-BSM] B 经 smem 分级异步流水（kBR 级），A 仍直装。
+            //   提前 step 数 = kBR；smem = kBR*kBatch*8KB。函数内部按批宽
+            //   循环覆盖 g_l1 组（批宽为偶，gate/up 配对）。
+            l1_gemm_swiglu_body_bsm<1, CM_SMALL_BATCH, CM_SMALL_BR>(
+                b_smem, pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1,
+                ffn_slot, out_col_base, S.l1_k_out
+#ifdef CM_SMALL_BSM_PROF
+                , S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 2
+#endif
+            );
+#else
             l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 1, CM_L1_BATCH>(
                 pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
                 lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
                 out_col_base, S.l1_k_out, nullptr);
-        else
+#endif
+        } else
             l1_gemm_swiglu_body_paired<4, kNTilesPerWarp, 1, 2>(
                 pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
                 lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
