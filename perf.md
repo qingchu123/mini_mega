@@ -249,3 +249,43 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 7) timeout -k 3 15 ./bench \
 > 结论：R=8 全档随 TPR 单调上升，1→384 由 283.6µs 增至 2421.4µs；
 > TPR≥16 后进入近似线性区间（每档约 +100µs/16 TPR 量级），符合计算/通信随 token 数扩展的预期。
 > 全档数值校验与总体校验均 PASS。
+
+## [261006_02_40] 不均衡长尾专项：多窗口 A fragment 布局（未提交 git）
+
+### 背景与根因
+- 目标场景 `--tk-info ... --tk-launch 853000`（R=32，max_expert=512，win_cap=45）基线 ~1034µs。
+- 消融发现 **A（激活）装载** 与 B（权重）同为主成本：把 A 装载置零（`CM_DIAG_NOA`）
+  1034→818µs（约 −210µs）。原因：该场景每专家多窗口 → `afrag_ok=false`，
+  A 走**行主序散射装载**（每条 warp 指令跨 16 行 × 32B = 16 cache line）；
+  单窗口场景才走已交付的 fragment（4 line）快路径。
+- B 侧：寄存器预取加深会溢出（256 reg 顶格）；smem 异步分级流水实测更慢
+  （gvmcnt 在飞级数受限 + LDS 往返），放弃。
+
+### 改动要点
+1. `compute.cuh`：`l1_gemm_swiglu_body_paired` / `l2_gemm_body` 增加**编译期**
+   `bool kUseFrag` 模板参 + A fragment 装载（`cm_load_a_frag`）与 L1 输出
+   fragment 写（`cm_store_ffn_frag`）。**注意：运行时 `fbase!=nullptr` 分支会
+   破坏热路径调度（实测 3× 回退），必须编译期选择。**
+2. `compute_big.cuh`：多窗口 `frag_all` 路径——pull 按 `(expert, w%ring)` 槽
+   同时写行主序 pool（bench 校验用）与 A fragment；L1 读 A fragment、写 F2
+   fragment；L2 读 F2 fragment。
+3. `bench.cu`：仅不均衡长尾场景分配 A/F2 fragment 专用缓冲（`[EPR*ring]` 槽），
+   并启用 fragment；**均衡场景不分配 → 走精简内核，避免 collateral**。
+4. `kernel.cuh`/`megakernel.cu`：`mega_kernel` 增加 `kFragCap` 模板参，host 按
+   `frag_a != nullptr` 选择 fragment 实例（均衡 TPR 测例不受代码膨胀影响）。
+5. host 自动 win_cap：不均衡场景由 45 抬到 **48**（fragment 消除 A 散射惩罚后，
+   较大窗口减少 B 重复装载且不再有 A 惩罚）。
+
+### 结果（同机多次采样，R=32）
+| 场景 | 基线 (µs) | 优化后 (µs) | 提升 |
+|---|---:|---:|---:|
+| 853000（目标） | 1032~1040 | **813~819** | **−21%** |
+| 804400（max176） | ~968 | 808 | −16% |
+| 804300（max362） | ~878 | 727 | −17% |
+| test/70 TPR16 | 341~346 | 344~351 | +0.5~1.5% |
+| test/70 TPR64 | 641~653 | 653~666 | +1~2% |
+| test/70 TPR256 | 1921 | 1952~1956 | +1.6~1.8% |
+
+### 正确性
+- R=2 / R=32 `[总体] PASS`（L1/L2/REDUCE 数值三行 PASS）。
+- fragment 路径与行主序路径 **bit-exact**（同 win_cap=48 下 l1_chk/l2_chk 累加和逐位相同）。

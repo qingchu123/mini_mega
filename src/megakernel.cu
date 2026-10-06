@@ -82,6 +82,8 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.l1_block_n = a.l1_block_n;
     m.l1_k_out = a.l1_k_out;
     m.ffn_hidden = a.ffn_hidden;
+    m.frag_a = a.frag_a;
+    m.frag2 = a.frag2;
     m.w2 = a.w2;
     m.l2_out = a.l2_out;
     m.l2_k_out = a.l2_k_out;
@@ -99,8 +101,13 @@ void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream) {
 }
 
 void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
-    mega_kernel<true><<<a.grid, a.threads, (size_t)a.smem, stream>>>(
-        to_mega_args(a), NoTaskTail{});
+    if (a.frag_a != nullptr)   // [OPT-AFRAG] 多窗口 fragment 专用实例
+        mega_kernel<true, NoTaskTail, false, true>
+            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a),
+                                                            NoTaskTail{});
+    else
+        mega_kernel<true><<<a.grid, a.threads, (size_t)a.smem, stream>>>(
+            to_mega_args(a), NoTaskTail{});
 }
 
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {

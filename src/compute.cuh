@@ -126,12 +126,52 @@ using Fp32x2 = __NATIVE_VECTOR__(2, float);
 constexpr int kComputeWarps = 8;
 constexpr int kNTilesPerWarp = 2;
 
+// [OPT] 小 count 任务体 B 预取深度 / N 批宽（可 -D 扫描；PF 为 2 的幂）
+#ifndef CM_L1_PF
+#define CM_L1_PF 2
+#endif
+#ifndef CM_L1_BATCH
+#define CM_L1_BATCH 4
+#endif
+#ifndef CM_L2_PF
+#define CM_L2_PF 2
+#endif
+// [OPT-BSM] B 的 smem 异步流水级数（gvmcnt 最多 4 级；默认 2 保持静态 smem 不变）
+#ifndef CM_BR
+#define CM_BR 2
+#endif
+// [OPT-BSM] 开关：L1/L2 小任务体是否改走 B 的 smem 异步流水
+#ifndef CM_USE_BSM
+#define CM_USE_BSM 0
+#endif
+// [OPT-BPTR] B 装载指针强度削减：每次 k step 只 +1024B，去掉 64 位乘移
+#ifndef CM_BPTR
+#define CM_BPTR 1
+#endif
+// [OPT-AFRAG] 子开关（诊断用）
+#ifndef CM_FRAG_A
+#define CM_FRAG_A 1
+#endif
+#ifndef CM_FRAG_F2
+#define CM_FRAG_F2 1
+#endif
+#ifndef CM_FRAG_A2
+#define CM_FRAG_A2 1
+#endif
+#ifndef CM_FRAG_L2
+#define CM_FRAG_L2 1
+#endif
+
 // ------------------------------------------------------------ 装载/数学工具 --
 // A（激活）native-map 直装：row = m_tile*16 + (lane&15)，k8 = (lane>>4)&3；
 // 越界行（row >= count）返回零 fragment（尾部 M tile 安全）。
 __device__ __forceinline__ Fp8MmaFragment cm_load_a(
         const uint8_t* __restrict__ pool, int k_stride, int k0, int count,
         int m_tile = 0) {
+#ifdef CM_DIAG_NOA
+    (void)pool; (void)k_stride; (void)k0; (void)count; (void)m_tile;
+    return Fp8MmaFragment{0u, 0u};
+#endif
     const int lane = threadIdx.x & 63;
     const int row = m_tile * kM + (lane & 15);
     Fp8MmaFragment f = {0u, 0u};
@@ -146,6 +186,9 @@ __device__ __forceinline__ Fp8MmaFragment cm_load_a(
 // 低 8B = 逻辑行 n 的 fragment，高 8B = 逻辑行 n+16 的 fragment（本 K 段）。
 __device__ __forceinline__ Fp8MmaFragment2 cm_load_b_lane16(
         const uint8_t* __restrict__ w, int n, int k, int k_hidden) {
+#ifdef CM_DIAG_BFIX
+    n = 0; k = 0;   // 诊断：固定地址（L1 命中），保留装载指令
+#endif
     const int lane = threadIdx.x & 63;
     const size_t n_tiles = (size_t)(k_hidden >> 5);
     const uint8_t* tile =
@@ -163,6 +206,28 @@ __device__ __forceinline__ uint32_t cm_pack_f2bf16(float a, float b) {
     return __builtin_bit_cast(uint32_t, __builtin_mxc_cvt_pk_f32tobf16(v));
 }
 
+// [OPT-AFRAG] A/f2 fragment 装载（4-line/指令）；fbase 布局 [step][m][row][k]：
+//   addr = (step*mt_total + m)*512 + (row&15)*32 + (k&31)
+__device__ __forceinline__ Fp8MmaFragment cm_load_a_frag(
+        const uint8_t* __restrict__ fbase, int kk, int m_abs, int mt_total,
+        int row_limit) {
+    const int lane = threadIdx.x & 63;
+    const int row = m_abs * kM + (lane & 15);
+    Fp8MmaFragment f = {0u, 0u};
+    if (row < row_limit)
+        f = *reinterpret_cast<const Fp8MmaFragment*>(
+            fbase + ((size_t)kk * mt_total + m_abs) * 512 + (lane & 15) * 32 +
+            ((lane >> 4) & 3) * 8);
+    return f;
+}
+
+// [OPT-AFRAG] L1 输出 fragment 写（与 cm_load_a_frag 同布局，step=col/32）
+__device__ __forceinline__ void cm_store_ffn_frag(
+        uint8_t* __restrict__ f2, int row, int col, uint8_t v, int mt_total) {
+    f2[((size_t)(col >> 5) * mt_total + (row >> 4)) * 512 + (row & 15) * 32 +
+       (col & 31)] = v;
+}
+
 // ============================================================================
 // L1：N 组批量共享 A（kBatch 组一个 K 循环）+ SwiGLU + FP8 量化回写
 //
@@ -174,7 +239,7 @@ __device__ __forceinline__ uint32_t cm_pack_f2bf16(float a, float b) {
 //                  col = warp*n_per_warp + t*16 + (lane&15)。
 // ============================================================================
 template <int kPrefetch = 4, int kNTiles = kNTilesPerWarp, int kMTiles = 1,
-          int kBatch = 4>
+          int kBatch = 4, bool kUseFrag = false>
 __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
         const uint8_t* pool,      // 本窗口 A 基址（pool_slot 已定位）
         const uint8_t* w1,        // W1 张量基址 [EPR][2I][H]
@@ -189,7 +254,9 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
         uint8_t* ffn_out,         // 本窗口 ffn_hidden 基址（可 nullptr）
         int out_col_base,         // 本 slice 的隐藏列起点
         int k_out,                // I（ffn_hidden 行 stride）
-        const SliceGate* gate) {  // 分片就绪门（nullptr → 关闭）
+        const SliceGate* gate,    // 分片就绪门（nullptr → 关闭）
+        const uint8_t* fbase = nullptr, int mt_total = 0,
+        uint8_t* ffn2 = nullptr) {   // [OPT-AFRAG] A/f2 fragment（可 nullptr）
     constexpr int kKStep = 32;
     static_assert(kNTiles == 2, "layout16b 配对装载要求 kNTiles==2");
     const int k_iters = k_hidden / kKStep;
@@ -203,6 +270,12 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
     const bool gate_on =
         (gate != nullptr && gate->flags != nullptr && gate->k_iters_per_slice > 0);
     float acc_chk = 0.0f;
+    // [OPT-AFRAG] A 装载：fbase 非空走 fragment（4-line），否则行主序池
+    // [OPT-AFRAG] 编译期选择（运行时分支会破坏热路径调度：实测 3× 回退）
+    auto lda = [&](int kk, int m) -> Fp8MmaFragment {
+        return kUseFrag ? cm_load_a_frag(fbase, kk, m, mt_total, count)
+                        : cm_load_a(pool, k_hidden, kk * kKStep, count, m);
+    };
     // n_group_count 必须为 kBatch 的整数倍（组对）；调用点按余数选择实例。
     for (int g0 = n_group_begin; g0 + kBatch <= n_group_begin + n_group_count;
          g0 += kBatch) {
@@ -211,6 +284,20 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
         #pragma unroll
         for (int q = 0; q < kBatch; ++q)
             nbase[q] = (g0 + q) * block_n + warp * n_per_warp;
+#if CM_BPTR
+        // [OPT-BPTR] B 的 k=0 基址（含 lane 偏移）；k step 递进 = +1024B
+        const uint8_t* b_base[kBatch];
+        #pragma unroll
+        for (int q = 0; q < kBatch; ++q)
+            b_base[q] = w_e + (size_t)(nbase[q] >> 5) *
+                                  (size_t)(k_hidden >> 5) * 1024 +
+                        (size_t)(lane & 63) * 16;
+#define CM_LDB_L1(q, step)                                                  \
+    (*reinterpret_cast<const Fp8MmaFragment2*>(b_base[(q)] +                \
+                                               (size_t)(step) * 1024))
+#else
+#define CM_LDB_L1(q, step) cm_load_b_lane16(w_e, nbase[q], (step) * kKStep, k_hidden)
+#endif
         Fp8MmaFragment a_pipe[kPrefetch][kMTiles];
         // [layout16b] 16B/槽：低/高 8B = t=0/t=1 两个 native fragment
         Fp8MmaFragment2 b_pair[kPrefetch][kBatch];
@@ -226,14 +313,13 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
                 if constexpr (kMTiles > 1) {
                     if (m >= m_tiles) break;
                 }
-                a_pipe[sp][m] = cm_load_a(pool, k_hidden, sp * kKStep, count, m);
+                a_pipe[sp][m] = lda(sp, m);
             }
             // [layout16b] 一次 16B 装载覆盖 t=0/t=1 两个 N16 tile（免 shuffle）；
             // 指令序保持 q 反序（[H5] 物理落点分散）
             #pragma unroll
             for (int q = 0; q < kBatch; ++q)
-                b_pair[sp][kBatch - 1 - q] = cm_load_b_lane16(
-                    w_e, nbase[q], sp * kKStep, k_hidden);
+                b_pair[sp][kBatch - 1 - q] = CM_LDB_L1(q, sp);
         }
         Fp8Accumulator acc[kBatch][kMTiles][kNTiles];
         #pragma unroll
@@ -282,13 +368,11 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
                     if constexpr (kMTiles > 1) {
                         if (m >= m_tiles) break;
                     }
-                    a_pipe[sp][m] =
-                        cm_load_a(pool, k_hidden, nk * kKStep, count, m);
+                    a_pipe[sp][m] = lda(nk, m);
                 }
                 #pragma unroll
                 for (int q = 0; q < kBatch; ++q)
-                    b_pair[sp][kBatch - 1 - q] = cm_load_b_lane16(
-                        w_e, nbase[q], nk * kKStep, k_hidden);
+                    b_pair[sp][kBatch - 1 - q] = CM_LDB_L1(q, nk);
             }
         }
         // SwiGLU + FP8 量化回写：批次内每 2 组（gate, up）产出一个隐藏列块
@@ -301,6 +385,154 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
                 if constexpr (kMTiles > 1) {
                     if (m >= m_tiles) break;
                 }
+                #pragma unroll
+                for (int t = 0; t < kNTiles; ++t) {
+                    Fp8Accumulator sw;
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const float gv = acc[qa][m][t][i];
+                        const float uv = acc[qb][m][t][i];
+                        sw[i] = cm_silu(gv) * uv;
+                        acc_chk += sw[i];
+                    }
+                    if (ffn_out != nullptr || ffn2 != nullptr) {
+                        const uint32_t packed = __builtin_mxc_cvt_pk4_f32tof8_cfg(
+                            sw, _MACA_FROUND_TO_NEAREST_EVEN,
+                            _MACA_DENORMAL_FLUSH_NONE, _MACA_SRC_NO_MODIFIER,
+                            false, true);
+                        const int col = out_col_base + pair_idx * block_n +
+                                        warp * n_per_warp + t * 16 + (lane & 15);
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int row = m * kM + (lane >> 4) * 4 + i;
+                            if (row < count) {
+                                const uint8_t byte = (uint8_t)(packed >> (8 * i));
+                                if (ffn_out != nullptr)
+                                    ffn_out[(size_t)row * k_out + col] = byte;
+                                if (ffn2 != nullptr)
+                                    cm_store_ffn_frag(ffn2, row, col, byte,
+                                                      mt_total);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (checksum != nullptr && lane == 0)
+        atomicAdd(checksum, acc_chk + (float)count * 0.0f);
+}
+
+// ============================================================================
+// [OPT-BSM] L1 B 经 smem 异步分级流水（kBR 级）：B 用 ldg_b128_bsm 深流水搬入
+//   smem，MMA 时 LDS 读取。消除寄存器预取深度限制（在飞 B 装载 = kBR*kBatch
+//   个 8KB stage），把权重 DRAM 延迟藏到 MMA 之后。A 仍直装。
+//   sbuf 布局：[kBR][kBatch][8 个 n-tile][1024B]；每题消费一 stage 后补发下一。
+// ============================================================================
+__device__ __forceinline__ void cm_bsm_wait(int outstanding) {
+    (void)outstanding;
+    __builtin_mxc_arrive(4096);
+}
+
+template <int kMTiles = 1, int kBatch = 4, int kBR = 4>
+__device__ __forceinline__ void l1_gemm_swiglu_body_bsm(
+        uint8_t* __restrict__ sbuf, const uint8_t* pool, const uint8_t* w1,
+        int expert, int count, int k_hidden, int n_total, int block_n, int lane,
+        int warp, int nwarps, float* checksum, int n_group_begin,
+        int n_group_count, uint8_t* ffn_out, int out_col_base, int k_out) {
+    constexpr int kKStep = 32;
+    constexpr int kNTiles = 2;
+    constexpr int kStage = kBatch * 8 * 1024;   // 一 kstep 全部 N 组的 B 字节
+    const int k_iters = k_hidden / kKStep;
+    const int n_per_warp = block_n / nwarps;
+    const int m_tiles = kMTiles > 1
+        ? ((count + kM - 1) / kM < kMTiles ? (count + kM - 1) / kM : kMTiles)
+        : 1;
+    const uint8_t* w_e = w1 + (size_t)expert * n_total * k_hidden;
+    const int tid = (int)threadIdx.x;
+    float acc_chk = 0.0f;
+    for (int g0 = n_group_begin; g0 + kBatch <= n_group_begin + n_group_count;
+         g0 += kBatch) {
+        // 发一 stage：d = K step；每线程 kBatch 次 16B 异步拷贝
+        auto issue = [&](int d) {
+            uint8_t* base = sbuf + (size_t)(d % kBR) * kStage;
+            #pragma unroll
+            for (int q = 0; q < kBatch; ++q) {
+                const int nt = ((g0 + q) * block_n >> 5) + (tid >> 6);
+                const uint8_t* src =
+                    w_e + ((size_t)nt * (k_hidden >> 5) + d) * 1024 +
+                    (size_t)(tid & 63) * 16;
+                uint8_t* dst = base + (size_t)q * 8192 + (tid >> 6) * 1024 +
+                               (size_t)(tid & 63) * 16;
+                __builtin_mxc_ldg_b128_bsm(dst, const_cast<uint8_t*>(src), 0,
+                                           -1, true, true, false, true);
+            }
+        };
+        int issued = 0;
+        #pragma unroll
+        for (int d = 0; d < kBR; ++d) {
+            if (d < k_iters) { issue(d); ++issued; }
+        }
+        Fp8MmaFragment a_pipe[2][kMTiles];
+        Fp8Accumulator acc[kBatch][kMTiles][kNTiles];
+        #pragma unroll
+        for (int q = 0; q < kBatch; ++q)
+            #pragma unroll
+            for (int m = 0; m < kMTiles; ++m)
+                #pragma unroll
+                for (int t = 0; t < kNTiles; ++t)
+                    acc[q][m][t] = Fp8Accumulator{0.f, 0.f, 0.f, 0.f};
+        // A 预取 2 槽
+        #pragma unroll
+        for (int sp = 0; sp < 2; ++sp) {
+            if (sp >= k_iters) break;
+            #pragma unroll
+            for (int m = 0; m < kMTiles; ++m) {
+                if constexpr (kMTiles > 1) { if (m >= m_tiles) break; }
+                a_pipe[sp][m] = cm_load_a(pool, k_hidden, sp * kKStep, count, m);
+            }
+        }
+        int consumed = 0;
+        for (int kk = 0; kk < k_iters; ++kk) {
+            cm_bsm_wait(issued - consumed);
+            const int nk = kk + 2;
+            if (nk < k_iters) {
+                #pragma unroll
+                for (int m = 0; m < kMTiles; ++m) {
+                    if constexpr (kMTiles > 1) { if (m >= m_tiles) break; }
+                    a_pipe[kk & 1][m] =
+                        cm_load_a(pool, k_hidden, nk * kKStep, count, m);
+                }
+            }
+            #pragma unroll
+            for (int m = 0; m < kMTiles; ++m) {
+                if constexpr (kMTiles > 1) { if (m >= m_tiles) break; }
+                const uint8_t* sb = sbuf +
+                    (size_t)(kk % kBR) * kStage + (size_t)warp * 1024;
+                const Fp8MmaFragment af = a_pipe[kk & 1][m];
+                #pragma unroll
+                for (int q = 0; q < kBatch; ++q) {
+                    const Fp8MmaFragment2 bp =
+                        *reinterpret_cast<const Fp8MmaFragment2*>(
+                            sb + (size_t)q * 8192 + (size_t)(lane & 63) * 16);
+                    const Fp8MmaFragment b0 = {bp[0], bp[1]};
+                    const Fp8MmaFragment b1 = {bp[2], bp[3]};
+                    acc[q][m][0] = __builtin_mxc_mma_16x16x32f8(af, b0,
+                                                               acc[q][m][0]);
+                    acc[q][m][1] = __builtin_mxc_mma_16x16x32f8(af, b1,
+                                                               acc[q][m][1]);
+                }
+            }
+            ++consumed;
+            if (issued < k_iters) { issue(issued); ++issued; }
+        }
+        #pragma unroll
+        for (int pi = 0; pi < kBatch / 2; ++pi) {
+            const int pair_idx = ((g0 - n_group_begin) >> 1) + pi;
+            const int qa = 2 * pi, qb = 2 * pi + 1;
+            #pragma unroll
+            for (int m = 0; m < kMTiles; ++m) {
+                if constexpr (kMTiles > 1) { if (m >= m_tiles) break; }
                 #pragma unroll
                 for (int t = 0; t < kNTiles; ++t) {
                     Fp8Accumulator sw;
@@ -329,6 +561,8 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
                 }
             }
         }
+        // 等所有在飞拷贝落地，下一 g0 组复用同一 sbuf（每线程只读写自身 lane）
+        __builtin_mxc_arrive(64);
     }
     if (checksum != nullptr && lane == 0)
         atomicAdd(checksum, acc_chk + (float)count * 0.0f);
@@ -340,7 +574,7 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
 //   kBatch 个 N 组共享一份 a_pipe：A 装载次数 = kBatch 分之一。
 // ============================================================================
 template <int kPrefetch = 4, int kNTiles = kNTilesPerWarp, int kMTiles = 1,
-          int kBatch = 6>
+          int kBatch = 6, bool kUseFrag = false>
 __device__ __forceinline__ void l2_gemm_body(
         const uint8_t* a_pool,    // 本窗口 ffn_hidden 基址
         const uint8_t* w2,        // W2 本 expert 基址
@@ -352,7 +586,8 @@ __device__ __forceinline__ void l2_gemm_body(
         float* checksum,          // 可选（nullptr 关闭）
         int n_group_begin, int n_group_count,
         uint16_t* out,            // 本块 staging 槽（可 nullptr）
-        int k_out) {              // H（行 stride）
+        int k_out,                // H（行 stride）
+        const uint8_t* f2 = nullptr, int mt_total = 0) {  // [OPT-AFRAG]
     constexpr int kKStep = 32;
     static_assert(kNTiles == 2, "layout16b 配对装载要求 kNTiles==2");
     const int k_iters = k_in / kKStep;
@@ -362,6 +597,10 @@ __device__ __forceinline__ void l2_gemm_body(
             ? ((count + kM - 1) / kM < kMTiles ? (count + kM - 1) / kM : kMTiles)
             : 1;
     float acc_chk = 0.0f;
+    auto lda = [&](int kk, int m) -> Fp8MmaFragment {
+        return kUseFrag ? cm_load_a_frag(f2, kk, m, mt_total, count)
+                        : cm_load_a(a_pool, k_in, kk * kKStep, count, m);
+    };
     for (int g0 = n_group_begin; g0 + kBatch <= n_group_begin + n_group_count;
          g0 += kBatch) {
         int nbase[kBatch];
@@ -378,7 +617,7 @@ __device__ __forceinline__ void l2_gemm_body(
                 if constexpr (kMTiles > 1) {
                     if (m >= m_tiles) break;
                 }
-                a_pipe[sp][m] = cm_load_a(a_pool, k_in, sp * kKStep, count, m);
+                a_pipe[sp][m] = lda(sp, m);
             }
             #pragma unroll
             for (int q = 0; q < kBatch; ++q)
@@ -419,7 +658,7 @@ __device__ __forceinline__ void l2_gemm_body(
                     if constexpr (kMTiles > 1) {
                         if (m >= m_tiles) break;
                     }
-                    a_pipe[sp][m] = cm_load_a(a_pool, k_in, nk * kKStep, count, m);
+                    a_pipe[sp][m] = lda(nk, m);
                 }
                 #pragma unroll
                 for (int q = 0; q < kBatch; ++q)
@@ -492,7 +731,8 @@ struct NoTaskTail {
 //   不含重型 GEMM 实例（246 MTregs vs 256），TPR=16 恢复 ~24µs（见
 //   test/31.tpr16_regress/results.md）。由 host 在 slot_capacity<=kM 时选择该实例；
 //   语义要求 win_cap<=slot_capacity<=kM（此时 count>kM 分支恒不可达，协议不变）。
-template <typename TaskTail = NoTaskTail, bool kSmallOnly = false>
+template <typename TaskTail = NoTaskTail, bool kSmallOnly = false,
+          bool kFragCap = false>
 __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* self, uint8_t* const* peer_bases, int R, int rank,
         int win_cap, int pool_stride, int tbl_cap, int k_in, int topk, int ring,
@@ -506,8 +746,9 @@ __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* w2, uint16_t* l2_out, int l2_k_out, float* l2_chk,
         int rep, int n_reps, TaskTail tail = TaskTail{},
         const int* prefix_ptr = nullptr, unsigned long long* pt = nullptr,
-        uint8_t* a_smem = nullptr, unsigned long long* ctr = nullptr,
-        int merge_grid = 0) {
+        uint8_t* a_smem = nullptr, uint8_t* b_smem = nullptr,
+        uint8_t* frag_a = nullptr, uint8_t* frag2 = nullptr,
+        unsigned long long* ctr = nullptr, int merge_grid = 0) {
     extern __shared__ __align__(16) uint8_t smem_raw[];
     int* s_count = reinterpret_cast<int*>(smem_raw);   // EPR：每专家总行数
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）
@@ -597,6 +838,8 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.l1_block_n = l1_block_n;
     S.l1_k_out = l1_k_out;
     S.ffn_hidden = ffn_hidden;
+    S.frag_a = frag_a;
+    S.frag2 = frag2;
     S.l1_chk = l1_chk;
     S.w2 = w2;
     S.l2_out = l2_out;
@@ -636,6 +879,15 @@ __device__ __forceinline__ void dispatch_pull_body(
     const bool one_window_per_expert = (s_cum[kEPR] == kEPR);
     S.afrag_ok = (ffn_hidden != nullptr) && (total_tasks <= (int)gridDim.x) &&
                  one_window_per_expert && afrag_fit;
+    // [OPT-AFRAG] 多窗口 fragment：afrag_ok 不成立但 host 提供专用缓冲时启用，
+    //   使 A/f2 装载走 4-line fragment 布局（替换多窗口的行主序散射装载）。
+#ifdef CM_NO_FRAGALL
+    S.frag_all = false;
+#else
+    S.frag_all = kFragCap && (frag_a != nullptr) && (frag2 != nullptr) &&
+                 !S.afrag_ok && (l1_k_out > 0) && (mt_total > 0) &&
+                 (win_cap > 0);
+#endif
     S.merge = merge;
     S.nslice_eff = nslice_eff;
     int processed = 0;
@@ -685,14 +937,17 @@ __device__ __forceinline__ void dispatch_pull_body(
         // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
         // [R31] kSmallOnly 实例：大任务体不实例化（小核专用路径）
         if constexpr (kSmallOnly) {
-            r19_small_task<TaskTail>(S, task, e, w, count, slice, epoch,
-                                     pool_slot, pfx, tail, a_smem);
+            r19_small_task<TaskTail, kFragCap>(S, task, e, w, count, slice,
+                                               epoch, pool_slot, pfx, tail,
+                                               a_smem, b_smem);
         } else if (count > kM) {
-            r19_big_task<TaskTail>(S, task, e, w, count, slice, epoch,
-                                   pool_slot, pfx, tail, a_smem);
+            r19_big_task<TaskTail, kFragCap>(S, task, e, w, count, slice, epoch,
+                                             pool_slot, pfx, tail, a_smem,
+                                             b_smem);
         } else {
-            r19_small_task<TaskTail>(S, task, e, w, count, slice, epoch,
-                                     pool_slot, pfx, tail, a_smem);
+            r19_small_task<TaskTail, kFragCap>(S, task, e, w, count, slice,
+                                               epoch, pool_slot, pfx, tail,
+                                               a_smem, b_smem);
         }
         // ---- 任务尾 l2_done 递增（仅后续窗口会复用该槽或多轮时）----
         // [H3] 不发布 l2_done 时省略全线程 threadfence（无消费者，协议语义不变）

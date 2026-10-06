@@ -91,6 +91,11 @@
 #include "flags.cuh"
 #include "combine.cuh"   // [R29] CombineFuseCtx/combine_push_chunk（融合推送）
 
+// [OPT] 相位诊断（默认 0；写入 pre_ticks 第二 bank 的每 block L1/L2 累计周期）
+#ifndef R24_DIAG_PHASE
+#define R24_DIAG_PHASE 0
+#endif
+
 // [R29] COMBINE×L2 融合总开关（0 = 完全回退旧行为：L2 不推送、任务尾整段推送）
 #ifndef R29_COMBINE_FUSE
 #define R29_COMBINE_FUSE 1
@@ -230,6 +235,10 @@ __device__ __forceinline__ R19Frag r19_load_a_frag(
 __device__ __forceinline__ void r19_store_a_frag(
         uint8_t* __restrict__ fbase, int s2, int o, const uint4 v,
         int mt_total) {
+#ifdef CM_DIAG_NOFWRITE
+    (void)fbase; (void)s2; (void)o; (void)v; (void)mt_total;
+    return;
+#endif
     const int c = o >> 4;   // 16B chunk 号
     uint8_t* p = fbase + (size_t)(s2 >> 4) * 512 + (s2 & 15) * 32 +
                  (size_t)(c >> 1) * mt_total * 512 + (c & 1) * 16;
@@ -274,6 +283,9 @@ struct R19Sched {
     const uint8_t* w1;
     int l1_n_total, l1_block_n, l1_k_out;
     uint8_t* ffn_hidden;
+    uint8_t* frag_a;    // [OPT-AFRAG] A 输入 fragment 缓冲（nullptr=关闭）
+    uint8_t* frag2;     // [OPT-AFRAG] L1 输出 fragment 缓冲（nullptr=关闭）
+    bool frag_all;      // [OPT-AFRAG] 多窗口下的 fragment 布局启用
     float* l1_chk;
     const uint8_t* w2;
     uint16_t* l2_out;
@@ -1074,8 +1086,21 @@ __device__ __forceinline__ void r19_pull_flags(
     const int ll = lane & 31;             // 半 warp 内 lane
     // [R21] A fragment 副本（拉取时顺带写 F_A：pool 仍行主序，供 bench 校验）
     // [R34] count<=32 走小档（runtime M 裁剪 + 小档 body），无需 F/F2 副本
-    const bool kAfrag = S.afrag_ok && count > 32;
-    uint8_t* frag_base = kAfrag ? r19_afrag_base(S, e) : nullptr;
+    const bool kAfrag = (S.afrag_ok && count > 32) || (S.frag_all && count > 0);
+    // [OPT-AFRAG] frag_all 时 L1 只读 fragment，行主序 pool 仅 bench 校验用，
+    //   故跳过 pool 写（省 A 写带宽；fragment 写已含同数据）
+    const bool kSkipPool = false;   // [OPT-AFRAG] 实测跳过 pool 写更慢，保留
+    uint8_t* frag_base = nullptr;
+    if (kAfrag) {
+        if (S.afrag_ok) {
+            frag_base = r19_afrag_base(S, e);
+        } else {
+            // [OPT-AFRAG] 多窗口：按 (expert, window-slot) 定位专用 A fragment
+            const size_t fsz =
+                (size_t)(S.k_in / 32) * (size_t)S.mt_total * 512;
+            frag_base = S.frag_a + (size_t)(e * S.ring + (w % S.ring)) * fsz;
+        }
+    }
     const int mt_total = S.mt_total;   // [R34] ceil(win_cap/16)
     // [R26] warp 独占一段连续行（= 同源 rank 段）：每个 warp 的 8 次迭代
     // 始终读同一 peer，消除跨 peer 轮转的 fabric 排队惩罚（71 机 TPR=128
@@ -1110,9 +1135,11 @@ __device__ __forceinline__ void r19_pull_flags(
                 const uint4 v0 = srcp[ll];
                 const uint4 v1 = srcp[ll + 32];
                 const uint4 v2 = srcp[ll + 64];
-                dstp[u4_off + ll] = v0;
-                dstp[u4_off + ll + 32] = v1;
-                dstp[u4_off + ll + 64] = v2;
+                if (!kSkipPool) {
+                    dstp[u4_off + ll] = v0;
+                    dstp[u4_off + ll + 32] = v1;
+                    dstp[u4_off + ll + 64] = v2;
+                }
                 if (kAfrag) {
                     r19_store_a_frag(frag_base, s2, (u4_off + ll) * 16, v0,
                                      mt_total);
@@ -1124,7 +1151,7 @@ __device__ __forceinline__ void r19_pull_flags(
             } else {
                 for (int i = ll; i < u4_slice; i += 32) {
                     const uint4 v = srcp[i];
-                    dstp[u4_off + i] = v;
+                    if (!kSkipPool) dstp[u4_off + i] = v;
                     if (kAfrag)
                         r19_store_a_frag(frag_base, s2, (u4_off + i) * 16, v,
                                          mt_total);
@@ -1141,7 +1168,7 @@ __device__ __forceinline__ void r19_pull_flags(
             // 非法行零填充（本 K 片 + staging），保证确定性与 COMBINE 跳过
             const uint4 z4{0u, 0u, 0u, 0u};
             for (int i = ll; i < u4_slice; i += 32) {
-                dstp[u4_off + i] = z4;
+                if (!kSkipPool) dstp[u4_off + i] = z4;
                 if (kAfrag)
                     r19_store_a_frag(frag_base, s2, (u4_off + i) * 16, z4,
                                      mt_total);
@@ -1255,11 +1282,11 @@ __device__ __forceinline__ void r19_tail_common(
 //   → L2（M 档位）→ tail。调用者（dispatch_pull_body 循环）只做领号/解码与
 //   任务尾 l2_done/processed 计数（与基线逐字一致）。
 // ============================================================================
-template <typename TaskTail>
+template <typename TaskTail, bool kFragCap = false>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,
-        uint8_t* a_smem) {
+        uint8_t* a_smem, uint8_t* b_smem) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
@@ -1267,6 +1294,9 @@ __device__ R19_BIG_ATTR void r19_big_task(
     // [R29] 融合推送上下文（capable=tail 支持；on 在本任务 L2 段按条件激活）
     CombineFuseCtx fuse = R29TailFuse<TaskTail>::get(tail);
     r19_pull_flags(S, task, e, w, count, slice, epoch, pool_slot, pfx);
+#if R24_DIAG_PHASE
+    const unsigned long long t_l1s = (tid == 0) ? clock64() : 0ull;
+#endif
     // ---- L1：M 档位（kMT 个 16 行 tile 共享 B 一遍）----
     const uint8_t* pool = const_cast<uint8_t*>(S.self) + S.pool_off;
     const uint8_t* pool_w = pool + (size_t)pool_slot * S.pool_stride * S.k_in;
@@ -1279,19 +1309,29 @@ __device__ R19_BIG_ATTR void r19_big_task(
             ? S.ffn_hidden + (size_t)pool_slot * S.win_cap * S.l1_k_out
             : nullptr;
         const int out_col_base = slice * (S.l1_k_out / S.nslice_eff);
-        // [R21] A fragment 副本（单波大任务）；[R24] 由 bsm 直搬 smem
+        // [R21] A fragment 副本（单波大任务）；[OPT-AFRAG] 多窗口走专用缓冲
         // [R34] count<=32 不用 F/F2（小档 runtime M 裁剪，行主序直接算）
-        const bool kFrag = S.afrag_ok && count > 32 &&
-                           S.ffn_hidden != nullptr;
-        const uint8_t* fbase = kFrag ? r19_afrag_base(S, e) : nullptr;
-        // 行主序 ffn_hidden 仅 bench 数值校验读 slot0；kFrag 时其余槽只写 F2
-        if (kFrag && pool_slot != 0) ffn_slot = nullptr;
-        // L2 的 A（ffn_hidden）fragment 副本：F 之后的空闲槽（[R34] win_cap 非
-        // 16 整除时 F 需更多槽，槽号 f2_slot 由 dispatch 计算）
-        uint8_t* ffn2 = kFrag
-            ? S.ffn_hidden +
-                  ((size_t)e * S.ring + S.f2_slot) * S.win_cap * S.l1_k_out
-            : nullptr;
+        const bool kFragOld = S.afrag_ok && count > 32 &&
+                              S.ffn_hidden != nullptr;
+        const bool kFragNew = kFragCap && S.frag_all && count > 0;
+        const uint8_t* fbase = nullptr;
+        uint8_t* ffn2 = nullptr;
+        if (kFragOld) {
+            fbase = r19_afrag_base(S, e);
+            ffn2 = S.ffn_hidden +
+                   ((size_t)e * S.ring + S.f2_slot) * S.win_cap * S.l1_k_out;
+        } else if (kFragNew) {
+            const size_t asz =
+                (size_t)(S.k_in / 32) * (size_t)S.mt_total * 512;
+            const size_t f2sz =
+                (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
+            const size_t soff = (size_t)(e * S.ring + (w % S.ring));
+            if (CM_FRAG_A) fbase = S.frag_a + soff * asz;
+            if (CM_FRAG_L2 && CM_FRAG_F2) ffn2 = S.frag2 + soff * f2sz;
+        }
+        // 行主序 ffn_hidden 仅 bench 数值校验读 slot0；fragment 时其余槽只写 F2
+        if ((kFragOld || (kFragNew && CM_FRAG_L2)) && pool_slot != 0)
+            ffn_slot = nullptr;
         // [R24/R34] A-smem 路径：F 可用 + kKS 整除 + 单批（g_l1==kBatch）。
         // [R34] 去掉 count%(MT*16)==0 门控：count>64 时走"全块 + 尾块"两段式
         // （尾块按 row<cc 掩码），权重遍数 = ceil(count/(MT*16))（旧整段 MT4
@@ -1304,10 +1344,35 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // [R34] count∈(kM,32]：小档同构（runtime M 裁剪，空 tile 不参与
             //   MMA/A 装载；单批 N 组）。旧 MT4/B4 对 17 行空转 4 tile(64 行)
             //   且 L2 三批 A，是 TPR=17 L1/L2 各近翻倍的主因。
-            l1_gemm_swiglu_body_paired<2, kNTilesPerWarp, 2, 4>(
-                pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
-                lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                out_col_base, S.l1_k_out, nullptr);
+#if CM_USE_BSM
+            l1_gemm_swiglu_body_bsm<2, CM_L1_BATCH, CM_BR>(
+                b_smem, pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk, g0_l1,
+                g_l1, ffn_slot, out_col_base, S.l1_k_out);
+#else
+            if constexpr (kFragCap) {
+                if (fbase != nullptr)
+                    l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 2,
+                                               CM_L1_BATCH, true>(
+                        pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                        S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                        g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
+                        fbase, S.mt_total, ffn2);
+                else
+                    l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 2,
+                                               CM_L1_BATCH, false>(
+                        pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                        S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                        g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
+                        nullptr, 0, ffn2);
+            } else {
+                l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 2,
+                                           CM_L1_BATCH, false>(
+                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
+                    lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
+                    out_col_base, S.l1_k_out, nullptr, nullptr, 0, ffn2);
+            }
+#endif
         } else if (count <= 32 && g_l1 % 2 == 0 && g_l1 >= 2) {
             // [R35] NSLICE=8 等 g_l1=2 几何：单批 2 组小档（A 装载一遍、MT2
             //   runtime 裁剪），与 NSLICE=4 的 <2,kNT,2,4> 同构按比例缩小；
@@ -1320,7 +1385,39 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // [OPT-33] 33..48 档：MT3（恰好 ceil(count/16)=3 个 tile），acc 比
             //   MT4 小（[4][3][2] → [4][3][2] 不变，但省 1 个 M tile 的寄存器/
             //   发射槽），减少尾块 M 空转（原 MT4 对 33..48 仍按 4 tile 分配）。
-            l1_gemm_swiglu_body_paired<2, kNTilesPerWarp, 3, 4>(
+#if CM_USE_BSM
+            l1_gemm_swiglu_body_bsm<3, CM_L1_BATCH, CM_BR>(
+                b_smem, pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk, g0_l1,
+                g_l1, ffn_slot, out_col_base, S.l1_k_out);
+#else
+            if constexpr (kFragCap) {
+                if (fbase != nullptr)
+                    l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3,
+                                               CM_L1_BATCH, true>(
+                        pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                        S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                        g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
+                        fbase, S.mt_total, ffn2);
+                else
+                    l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3,
+                                               CM_L1_BATCH, false>(
+                        pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                        S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                        g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
+                        nullptr, 0, ffn2);
+            } else {
+                l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3,
+                                           CM_L1_BATCH, false>(
+                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
+                    lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
+                    out_col_base, S.l1_k_out, nullptr, nullptr, 0, ffn2);
+            }
+#endif
+        } else if (count <= 48 && g_l1 % 2 == 0 && g_l1 >= 2) {
+            // [OPT-NS8] NSLICE=8 时 g_l1=2：33..48 档用 MT3/B2（A 装一遍、
+            //   runtime M 裁剪），避免落入 r19_l1_big<4,...> 的 MT4 慢档。
+            l1_gemm_swiglu_body_paired<2, kNTilesPerWarp, 3, 2>(
                 pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
                 lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
                 out_col_base, S.l1_k_out, nullptr);
@@ -1381,7 +1478,15 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
     }
+#if R24_DIAG_PHASE
+    if (tid == 0)
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8,
+                  clock64() - t_l1s);
+#endif
     r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot);
+#if R24_DIAG_PHASE
+    const unsigned long long t_l2s = (tid == 0) ? clock64() : 0ull;
+#endif
     // ---- L2：M 档位（K=I、N=H），BF16 写每块 staging 槽 ----
     const int g_l2 = (S.l2_k_out / S.l1_block_n) / S.nslice_eff;
     const int g0_l2 = slice * g_l2;
@@ -1397,11 +1502,16 @@ __device__ R19_BIG_ATTR void r19_big_task(
             : nullptr;
         const uint8_t* w2_e = S.w2 + (size_t)e * S.l2_k_out * S.l1_k_out;
         // [R21] L2 的 A 走 ffn_hidden 的 fragment 副本（同一单波大任务条件）
-        const uint8_t* f2 = (S.afrag_ok && count > 32 &&
-                             S.ffn_hidden != nullptr)
-            ? S.ffn_hidden +
-                  ((size_t)e * S.ring + S.f2_slot) * S.win_cap * S.l1_k_out
-            : nullptr;
+        const uint8_t* f2 = nullptr;
+        if (S.afrag_ok && count > 32 && S.ffn_hidden != nullptr) {
+            f2 = S.ffn_hidden +
+                 ((size_t)e * S.ring + S.f2_slot) * S.win_cap * S.l1_k_out;
+        } else if (CM_FRAG_L2 && S.frag_all && count > 0) {
+            const size_t f2sz =
+                (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
+            if (CM_FRAG_A2)
+                f2 = S.frag2 + (size_t)(e * S.ring + (w % S.ring)) * f2sz;
+        }
         // [R24/R34] L2 A-smem 路径（同 L1：count>64 才走，≤64 保持回退）
         // [R35] 去掉 g_l2%R19_L2_BATCH==0 门控：奇数 g_l2（NSLICE=8 → 24/8=3）
         //   由 r24_l2_big 的 kBatch=1 余量路径补齐，不再回退 MT4 慢路径。
@@ -1416,10 +1526,24 @@ __device__ R19_BIG_ATTR void r19_big_task(
         R29TailFuseSet<TaskTail>::on(tail, fuse);
         if (count <= 32 && g_l2 % 6 == 0) {
             // [R34] 同 L1：小档单批（A 只装一遍，B 一遍）
-            l2_gemm_body<2, kNTilesPerWarp, 2, 6>(
-                ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
-                lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                S.l2_k_out);
+#if CM_FRAG_L2
+            if constexpr (kFragCap) {
+                if (f2 != nullptr)
+                    l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, true>(
+                        ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
+                        S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
+                        g0_l2, g_l2, out_slot, S.l2_k_out, f2, S.mt_total);
+                else
+                    l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, false>(
+                        ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
+                        S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
+                        g0_l2, g_l2, out_slot, S.l2_k_out, nullptr, 0);
+            } else
+#endif
+                l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, false>(
+                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
+                    S.l2_k_out, nullptr, 0);
         } else if (count <= 32 && g_l2 % 3 == 0 && g_l2 >= 3) {
             // [R35] NSLICE=8 等 g_l2=3 几何：单批 3 组小档（A 一遍、MT2 裁剪），
             //   避免落入 r19_l2_big<4,PF,3> 的 MT4 档（M 空转）。
@@ -1430,10 +1554,24 @@ __device__ R19_BIG_ATTR void r19_big_task(
         } else if (count <= 48 && g_l2 % 6 == 0) {
             // [OPT-33] 33..48 档：MT3 单批（ceil(count/16)=3 tile），acc[3][3][2]；
             //   原 MT4/3 分两批（acc[3][4][2]=24）→ MT3 更小且只一次调用。
-            l2_gemm_body<2, kNTilesPerWarp, 3, 3>(
-                ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
-                lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                S.l2_k_out);
+#if CM_FRAG_L2
+            if constexpr (kFragCap) {
+                if (f2 != nullptr)
+                    l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, true>(
+                        ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
+                        S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
+                        g0_l2, g_l2, out_slot, S.l2_k_out, f2, S.mt_total);
+                else
+                    l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, false>(
+                        ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
+                        S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
+                        g0_l2, g_l2, out_slot, S.l2_k_out, nullptr, 0);
+            } else
+#endif
+                l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, false>(
+                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
+                    S.l2_k_out, nullptr, 0);
         } else if (count > 48 && count <= 64 && f2 != nullptr &&
                    (count % (4 * kM) == 0) &&
                    ((S.l1_k_out / 32) % R24_KS == 0)) {
@@ -1482,6 +1620,11 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 g0_l2, g_l2, out_slot, S.l2_k_out);
     }
     __syncthreads();
+#if R24_DIAG_PHASE
+    if (tid == 0)
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 1,
+                  clock64() - t_l2s);
+#endif
     r19_tail_common(S, tail, task, e, w, count, slice, epoch, pool_slot);
 }
 
@@ -1489,14 +1632,15 @@ __device__ R19_BIG_ATTR void r19_big_task(
 // 小 count（count<=kM）任务体：与基线逐字一致的热路径，独立 __noinline__
 // 声明以隔离大任务的寄存器分配（探针：空体调用点对 TPR=16 中性）。
 // ============================================================================
-template <typename TaskTail>
+template <typename TaskTail, bool kFragCap = false>
 __device__ R19_SMALL_ATTR void r19_small_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,
-        uint8_t* a_smem) {
+        uint8_t* a_smem, uint8_t* b_smem) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
+    (void)b_smem;
     r19_pull_flags(S, task, e, w, count, slice, epoch, pool_slot, pfx);
     // ---- L1：小 count 档位（与基线实例选择一致）----
     const uint8_t* pool = const_cast<uint8_t*>(S.self) + S.pool_off;
@@ -1513,7 +1657,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         // 均衡场景 g_l1=4：一次 K 循环处理全部 4 组（A 装载减半）；
         // kPrefetch=2 是为把 32 个 B fragment 槽控制在寄存器预算内。
         if (g_l1 % 4 == 0)
-            l1_gemm_swiglu_body_paired<2, kNTilesPerWarp, 1, 4>(
+            l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 1, CM_L1_BATCH>(
                 pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
                 lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
                 out_col_base, S.l1_k_out, nullptr);
@@ -1542,23 +1686,23 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         //   B 字节不变，acc 48 floats。71 机 TPR=16 −10µs，TPR=256 中性）。
         //   原 [O3] 3+3 两批保留为 g_l2%3==0 的回退几何（g_l2=6/12 优先走单批）。
         if (g_l2 % 6 == 0) {
-            l2_gemm_body<2, kNTilesPerWarp, 1, 6>(
+            l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, 6>(
                 ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
                 lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
                 S.l2_k_out);
         } else if (g_l2 % 4 == 0) {
-            l2_gemm_body<2, kNTilesPerWarp, 1, 4>(
+            l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, 4>(
                 ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
                 lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
                 S.l2_k_out);
         } else if (g_l2 % 3 == 0) {
             // [O3] g_l2 为 3 的倍数（6/12/…）→ 3+3 两批对称
             const int gb = g_l2 / 2;
-            l2_gemm_body<2, kNTilesPerWarp, 1, 3>(
+            l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, 3>(
                 ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
                 lane, warp, kComputeWarps, S.l2_chk, g0_l2, gb, out_slot,
                 S.l2_k_out);
-            l2_gemm_body<2, kNTilesPerWarp, 1, 3>(
+            l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, 3>(
                 ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
                 lane, warp, kComputeWarps, S.l2_chk, g0_l2 + gb, g_l2 - gb,
                 out_slot, S.l2_k_out);

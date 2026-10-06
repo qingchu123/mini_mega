@@ -76,6 +76,8 @@ struct RankRes {
     uint8_t* w1 = nullptr;          // [EPR][2I][H] lane 序 packed tile
     uint8_t* w2 = nullptr;          // [EPR][H][I] lane 序 packed tile
     uint8_t* ffn_hidden = nullptr;  // [EPR][ring][win_cap][I] FP8
+    uint8_t* frag_a = nullptr;      // [OPT-AFRAG] A 输入 fragment 缓冲
+    uint8_t* frag2 = nullptr;       // [OPT-AFRAG] L1 输出 fragment 缓冲
     uint16_t* l2_out = nullptr;     // [kGrid][win_cap][H] BF16
     float* y = nullptr;             // M3：REDUCE 输出 [max_tokens][H] FP32
     uint8_t** d_base_ptrs = nullptr;
@@ -415,6 +417,8 @@ static fp8mega::MegaLaunchArgs make_mega_args(
     a.l1_block_n = 256;
     a.l1_k_out = kIntermediate;
     a.ffn_hidden = r.ffn_hidden;
+    a.frag_a = r.frag_a;
+    a.frag2 = r.frag2;
     a.w2 = r.w2;
     a.l2_out = r.l2_out;
     a.l2_k_out = kHidden;
@@ -1989,9 +1993,10 @@ static int run_aligned(RunOpts o) {
     if (o.scene.win_cap > 0) {
         win_cap = o.scene.win_cap;
     } else if (imbalanced) {
-        // [LONGTAIL] merge=1（不粗化）+ 小窗口：把大专家切成更多小任务摊到更多
-        // block。实测（853000/max512）最优窗口 ~45 行（45<46<48<44）。
-        int tgt = std::min((int)45, cap_need);
+        // [LONGTAIL] merge=1（不粗化）+ 窗口：把大专家切成多个任务摊到多 block。
+        // [OPT-AFRAG] A fragment 布局消除多窗口 A 散射惩罚后，最优窗口由 45 抬到
+        //   48（≤48 走小档 body；853000 934→832µs，804400/804300 同向改善）。
+        int tgt = std::min((int)48, cap_need);
         win_cap = std::min(max_tokens, std::max((int)kM, tgt));
     } else {
         win_cap = std::max(128, max_tokens);
@@ -2100,6 +2105,23 @@ static int run_aligned(RunOpts o) {
                                (size_t)max_tokens * kHidden * sizeof(float)));
                 CHECK(mcMemset(r.y, 0,
                                (size_t)max_tokens * kHidden * sizeof(float)));
+                // [OPT-AFRAG] 多窗口 A/f2 fragment 专用缓冲（每 (expert,窗槽) 一份）；
+                //   仅不均衡长尾场景启用（均衡场景走精简内核，避免 collateral 回退）
+                r.frag_a = nullptr;
+                r.frag2 = nullptr;
+                if (imbalanced) {
+                    const int mt_total = (win_cap + 15) >> 4;
+                    const size_t asz =
+                        (size_t)(kHidden / 32) * mt_total * 512;
+                    const size_t f2sz =
+                        (size_t)(kIntermediate / 32) * mt_total * 512;
+                    if (mt_total > 0) {
+                        CHECK(mcMalloc((void**)&r.frag_a,
+                                       (size_t)kEPR * kRing * asz));
+                        CHECK(mcMalloc((void**)&r.frag2,
+                                       (size_t)kEPR * kRing * f2sz));
+                    }
+                }
                 // x 视图 + topk_weights 视图（确定性填充）
                 {
                     std::vector<uint8_t> xb((size_t)max_tokens * kHidden);
@@ -2245,6 +2267,65 @@ static int run_aligned(RunOpts o) {
         if (tk_mode) note += " max_expert=" + std::to_string(c.max_expert);
         std::printf("%-4d %-6d %12.2f %14s\n", R, T, best, note.c_str());
         std::fflush(stdout);
+        if (std::getenv("PHASE_DUMP") != nullptr) {
+            const double clk = 2000.0;
+            for (int rank = 0; rank < R; ++rank) {
+                CHECK(mcSetDevice(res[rank].dev));
+                unsigned long long tp[8] = {0};
+                CHECK(mcMemcpy(tp, res[rank].lf->pre_ticks,
+                               8 * sizeof(unsigned long long),
+                               mcMemcpyDeviceToHost));
+                if (tp[7] > tp[3]) {
+                    int proc[kGrid] = {0};
+                    CHECK(mcMemcpy(proc, res[rank].lf->out_processed,
+                                   kGrid * sizeof(int), mcMemcpyDeviceToHost));
+                    int sm = 0, mx = 0;
+                    for (int b = 0; b < kGrid; ++b) {
+                        sm += proc[b];
+                        mx = std::max(mx, proc[b]);
+                    }
+                    float sm1 = 0.0f, sm2 = 0.0f;
+                    {
+                        std::vector<float> c1(kGrid, 0.0f), c2(kGrid, 0.0f);
+                        CHECK(mcMemcpy(c1.data(), res[rank].lf->l1_chk,
+                                       kGrid * sizeof(float),
+                                       mcMemcpyDeviceToHost));
+                        CHECK(mcMemcpy(c2.data(), res[rank].lf->l2_chk,
+                                       kGrid * sizeof(float),
+                                       mcMemcpyDeviceToHost));
+                        for (int b = 0; b < kGrid; ++b) {
+                            sm1 += c1[b];
+                            sm2 += c2[b];
+                        }
+                    }
+                    std::vector<unsigned long long> tr((size_t)kGrid * 8, 0);
+                    CHECK(mcMemcpy(tr.data(),
+                                   res[rank].lf->pre_ticks + (size_t)kGrid * 8,
+                                   tr.size() * sizeof(unsigned long long),
+                                   mcMemcpyDeviceToHost));
+                    unsigned long long maxl1 = 0, maxl2 = 0;
+                    for (int b = 0; b < kGrid; ++b) {
+                        maxl1 = std::max(maxl1, tr[(size_t)b * 8 + 0]);
+                        maxl2 = std::max(maxl2, tr[(size_t)b * 8 + 1]);
+                    }
+                    std::printf(
+                        "[phase] rank=%d us=%.0f mega=%.1f reduce=%.1f "
+                        "dispatch=%.1f L1=%.1f "
+                        "L2tail=%.1f chain=%.1f tasks=%d maxblk=%d "
+                        "maxL1=%.1f maxL2=%.1f ck1=%.4e ck2=%.4e\n",
+                        rank, per[rank],
+                        (double)(tp[15] - tp[6]) / clk,
+                        per[rank] - (double)(tp[15] - tp[6]) / clk,
+                        (double)(tp[4] - tp[3]) / clk,
+                        (double)(tp[5] - tp[4]) / clk,
+                        (double)(tp[7] - tp[5]) / clk,
+                        (double)(tp[7] - tp[3]) / clk, sm, mx,
+                        (double)maxl1 / 40.0 / clk,
+                        (double)maxl2 / 40.0 / clk, (double)sm1, (double)sm2);
+                }
+            }
+            std::fflush(stdout);
+        }
     }
     return 0;
 }

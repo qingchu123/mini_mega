@@ -18,8 +18,14 @@ constexpr int kTopk = 8;             // 每 token 路由专家数
 constexpr int kHidden = 6144;        // H（K_IN / K_OUT）
 constexpr int kIntermediate = 2048;  // I（中间维度）
 constexpr int kGrid = 32;            // grid 块数（= SM 数）
-constexpr int kNSlice = 4;           // 每窗口任务切片数（K 片 / N 组）
-constexpr int kRing = 8;             // 专家窗口槽数（ring 复用）
+#ifndef KNSLICE_OVERRIDE
+#define KNSLICE_OVERRIDE 4
+#endif
+constexpr int kNSlice = KNSLICE_OVERRIDE;  // 每窗口任务切片数（K 片 / N 组）
+#ifndef KRING_OVERRIDE
+#define KRING_OVERRIDE 8
+#endif
+constexpr int kRing = KRING_OVERRIDE;  // 专家窗口槽数（ring 复用）
 constexpr int kM = 16;               // M tile 行数
 
 // 自旋上限（异常保护）：约 1s（4M 周期 @2GHz）

@@ -52,6 +52,8 @@ struct MegaArgs {
     const uint8_t* w1;        // [EPR][2I][H] lane 序 packed tile（gate/up 配对布局）
     int l1_n_total, l1_block_n, l1_k_out;
     uint8_t* ffn_hidden;      // [EPR][ring][win_cap][I] FP8
+    uint8_t* frag_a;          // [OPT-AFRAG] A 输入 fragment 缓冲（可 nullptr）
+    uint8_t* frag2;           // [OPT-AFRAG] L1 输出 fragment 缓冲（可 nullptr）
     const uint8_t* w2;        // [EPR][H][I] lane 序 packed tile
     uint16_t* l2_out;         // [kGrid][win_cap][H] BF16
     int l2_k_out;
@@ -124,12 +126,15 @@ struct R29TailFuseSet<CombineTail> {
 };
 
 // 计算链任务循环（tail 类型由调用点按运行期开关选择）
-template <typename TaskTail, bool kSmallOnly = false>
+template <typename TaskTail, bool kSmallOnly = false, bool kFragCap = false>
 __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
                                                    TaskTail tail, int cycle,
                                                    uint8_t* a_smem = nullptr,
+                                                   uint8_t* b_smem = nullptr,
+                                                   uint8_t* frag_a = nullptr,
+                                                   uint8_t* frag2 = nullptr,
                                                    unsigned long long* ctr = nullptr) {
-    dispatch_pull_body<TaskTail, kSmallOnly>(
+    dispatch_pull_body<TaskTail, kSmallOnly, kFragCap>(
         a.self, a.peer_bases, a.R, a.rank, a.win_cap, a.pool_stride,
         a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off, a.src_off, a.x_off,
         a.weights_off, a.pool_off, a.w_off, a.meta_off, a.lf->bar[cycle],
@@ -137,14 +142,15 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
         a.l1_prog_idx, a.lf->out_processed, a.lf->dbg, a.max_spins, a.w1,
         a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.lf->l1_chk, a.w2,
         a.l2_out, a.l2_k_out, a.lf->l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
-        a.prefix_ptr, a.lf->pre_ticks, a_smem, ctr, a.merge_grid);
+        a.prefix_ptr, a.lf->pre_ticks, a_smem, b_smem, frag_a, frag2, ctr,
+        a.merge_grid);
 }
 
 // 主 kernel（单轮）。
 //   kWithCompute=false：只跑前序（M1 验证）；true：完整任务循环（M2/M3）；
 //   kWithCompute=true 且 combine_rows_off>=0：任务尾接 COMBINE（M3）
 template <bool kWithCompute, typename TaskTail = NoTaskTail,
-          bool kSmallOnly = false>
+          bool kSmallOnly = false, bool kFragCap = false>
 __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     // 相位时间戳（block0 tid0；[6]=入口 [0]=route后 [1]=publish后 [2]=xbar后 [3]=setup后）
     const bool kTick = (blockIdx.x == 0) && (threadIdx.x == 0);
@@ -161,7 +167,14 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
         MX_CTR_ADD(ctr, kCtrKernelBlocks, 1);
     }
     // [R24] A-smem 双缓冲（kernel 作用域，两类任务体共享同一块）
-    __shared__ __align__(16) uint8_t s_a_smem[2][R24_MT * R24_KS * 512];
+    // [OPT-BSM] A-smem（r24 路径）与 L1 B 异步流水缓冲互斥使用（union 折叠，
+    //   静态 smem 上限 128KB）。b 布局 [CM_BR][kBatch][8][1024]，
+    //   a 布局 [2][R24_MT*R24_KS*512]。
+    union __align__(16) ABShared {
+        uint8_t a[2][R24_MT * R24_KS * 512];
+        uint8_t b[CM_BR * 4 * 8 * 1024];
+    };
+    __shared__ ABShared s_ab;
     if (kTick) a.lf->pre_ticks[6] = clock64();
     // 0) [M_CYCLE] 预清 ct2=(c+2)%M_CYCLE 槽（本轮 copy c 尚未定，用 current_time
     //   [b][0] 派生；入口全 block 同为 L ⇒ c 一致）。ct1 留给下一轮，本轮不碰。
@@ -244,10 +257,12 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
 #if MX_DBG_COUNT
             tail.ctr = ctr;
 #endif
-            mega_dispatch_loop<CombineTail, kSmallOnly>(
-                a, tail, cyc, &s_a_smem[0][0], ctr);
+            mega_dispatch_loop<CombineTail, kSmallOnly, kFragCap>(
+                a, tail, cyc, &s_ab.a[0][0], &s_ab.b[0], a.frag_a, a.frag2,
+                ctr);
         }
     }
+    if (kTick) a.lf->pre_ticks[15] = clock64();
 }
 
 // ---------------------------------------------------------------- REDUCE --

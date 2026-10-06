@@ -20,9 +20,11 @@ mkdir -p "$HOME/_nvcc"
 CUCC="$MACA_PATH/tools/cu-bridge/bin/cucc"
 INC=(-I"$MACA_PATH/tools/cu-bridge/include" -I/opt/maca/include
      -I"$INCLUDE_ROOT" -Isrc)
+# [OPT] 扫描用额外编译宏（默认空；用于 -D 参数实验）
+KERNEL_CFLAGS=${KERNEL_CFLAGS:-}
 
 # 1) 接口层 + kernel -> megakernel.so（-fPIC -shared）
-"$CUCC" -O3 -std=c++17 -fPIC -shared "${INC[@]}" \
+"$CUCC" -O3 -std=c++17 -fPIC -shared "${INC[@]}" $KERNEL_CFLAGS \
   -o megakernel.so src/megakernel.cu
 
 # 2) bench：只 include megakernel.h，链接 megakernel.so（rpath=$ORIGIN 便于原地运行）
