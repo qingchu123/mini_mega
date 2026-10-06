@@ -331,6 +331,7 @@ struct RunOpts {
     std::string tk_info;          // --tk-info <path>
     int tk_launch = 0;            // --tk-launch <N>（0=自动选最不均衡的全 rank launch）
     bool tk_all = false;          // --tk-all：单进程扫描日志全部 launch 出性能表
+    int tk_first = 0;             // --tk-first N：只跑前 N 个（按 launch 升序）
 };
 
 // 16B/lane 配对 packed tile 权重填充（layout16b 契约，与 megakernel.cu 设备侧同式）：
@@ -626,6 +627,7 @@ static bool parse_args(int argc, char** argv, RunOpts* o, std::string* err) {
             o->tk_info = argv[i];
         } else if (a == "--tk-launch") o->tk_launch = value();
         else if (a == "--tk-all") o->tk_all = true;
+        else if (a == "--tk-first") { o->tk_first = value(); o->tk_all = true; }
         else {
             *err = "未知参数: " + a;
             return false;
@@ -2000,6 +2002,8 @@ static int run_aligned(RunOpts o) {
             std::fprintf(stderr, "[bench] %s\n", e.c_str());
             return 2;
         }
+        if (o.tk_first > 0 && (int)cases.size() > o.tk_first)
+            cases.resize(o.tk_first);   // 只跑前 N 个（map 已按 launch 升序）
     } else if (tk_mode) {
         TkCase c;
         std::string e;
