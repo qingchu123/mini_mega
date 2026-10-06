@@ -1798,6 +1798,7 @@ struct TkCase {
     int nz_expert = 0;         // 非零收行的专家数
     int ranks = 0;             // 日志中出现的 rank 数（<R 表示抽样/部分）
     bool imbalanced = false;   // 该例是否判为长尾不均衡
+    int win_cap = 0;           // [P50-D] 该例自适应窗口容量（逐例计算）
     std::vector<std::vector<int64_t>> routes;  // [R][tokens*topk] 全局专家号
 };
 
@@ -2046,45 +2047,47 @@ static int run_aligned(RunOpts o) {
     //   显式 --win-cap 时始终按值取（下限 kM）。
     // 逐测例判「长尾不均衡」：该例 max_expert 是否 >= 4×该例非零中位数。
     // 逐例判断（不能跨例合并中位数：均衡多档列表 16/64/256 合并后会误判）。
+    // [P50-D] 逐例自适应 win_cap：原实现把「是否存在长尾」与「用多大窗」都
+    //   按整个测例集合聚合（imb_med 取全体长尾例中位数最大者），单例集合下每例
+    //   各自最优，聚合后却被一个「中等专家」离群例（如 806600 med=142）抬高到 64，
+    //   把其余 49 个「小中位数」例一并拖慢。改为逐例判定 + 逐例取窗：
+    //     - 长尾例：中位小用 48（多切大专家）；中位大用 ~max_expert/kRing（减少任务）
+    //     - 均衡例：max(128,max_tokens)（与单例行为一致）
+    //   分配/布局仍用全集合最大值（各例 win_cap ≤ 全局，缓冲与 scratch 按全局分配
+    //   即可覆盖；各区域寻址均走 make_mega_args 的逐例 win_cap/pool_stride）。
     bool imbalanced = false;
-    int imb_med = 0;
     for (TkCase& c : cases) {
         std::map<int, int> cnt;
         for (const auto& r : c.routes)
             for (int64_t e : r)
                 if (e >= 0 && e < (int64_t)R * kEPR) ++cnt[(int)e];
-        if (cnt.empty()) continue;
-        std::vector<int> nz;
-        nz.reserve(cnt.size());
-        for (const auto& kv : cnt) nz.push_back(kv.second);
-        std::sort(nz.begin(), nz.end());
-        const int med = nz[nz.size() / 2];
-        if (c.max_expert >= 3 * std::max(1, med)) {
-            c.imbalanced = true;
-            imbalanced = true;
-            imb_med = std::max(imb_med, med);
+        int med = 1;
+        if (!cnt.empty()) {
+            std::vector<int> nz;
+            nz.reserve(cnt.size());
+            for (const auto& kv : cnt) nz.push_back(kv.second);
+            std::sort(nz.begin(), nz.end());
+            med = nz[nz.size() / 2];
         }
+        c.imbalanced = (c.max_expert >= 3 * std::max(1, med));
+        if (c.imbalanced) imbalanced = true;
+        int wc;
+        if (o.scene.win_cap > 0) {
+            wc = o.scene.win_cap;
+        } else if (c.imbalanced) {
+            int tgt = (med >= 32)
+                          ? (c.max_expert + kRing - 1) / kRing
+                          : std::min((int)48, c.max_expert);
+            tgt = ((tgt + kM - 1) / kM) * kM;   // 对齐 M tile
+            wc = std::min(max_tokens, std::max((int)kM, tgt));
+        } else {
+            wc = std::max(128, max_tokens);
+        }
+        c.win_cap = std::max((int)kM, wc);
     }
-    int win_cap;
-    if (o.scene.win_cap > 0) {
-        win_cap = o.scene.win_cap;
-    } else if (imbalanced) {
-        // [LONGTAIL] merge=1（不粗化）+ 窗口：把大专家切成多个任务摊到多 block。
-        // [OPT-AFRAG] A fragment 布局消除多窗口 A 散射惩罚后：
-        //   分布以「少量大专家 + 大量极小专家」为主（非零中位数小，如 853000 中位
-        //   6）→ 用小窗 48（多切大专家）；若是「多个中等专家」（中位数大，如 806600
-        //   中位 142）→ 用大窗 ~cap_need/kRing，减少任务数。
-        int tgt;
-        if (imb_med >= 32)
-            tgt = (cap_need + kRing - 1) / kRing;        // ~cap_need/kRing（~64）
-        else
-            tgt = std::min((int)48, cap_need);
-        tgt = ((tgt + kM - 1) / kM) * kM;                // 对齐 M tile
-        win_cap = std::min(max_tokens, std::max((int)kM, tgt));
-    } else {
-        win_cap = std::max(128, max_tokens);
-    }
-    if (win_cap < kM) win_cap = kM;
+    int win_cap = kM;   // 全局分配窗口容量 = max(逐例 win_cap)
+    for (const TkCase& c : cases) win_cap = std::max(win_cap, c.win_cap);
+    if (o.scene.win_cap > 0) win_cap = o.scene.win_cap;
     const int nodes = o.nodes_set ? o.scene.nodes : 20;
     const int replays = o.replays_set ? o.measure_replays : 2;
     o.scene.tokens = tmax;
@@ -2329,8 +2332,10 @@ static int run_aligned(RunOpts o) {
                     CHECK(mcSetDevice(rank));
                     mcStream_t st = nullptr;
                     CHECK(mcStreamCreate(&st));
+                    // [P50-D] 逐例 win_cap（≥kM，且 ≤ 全局分配窗口容量）
+                    const int wc_case = std::min(win_cap, c.win_cap);
                     fp8mega::MegaLaunchArgs a = make_mega_args(
-                        o, L, r, win_cap, combine_f32_off);
+                        o, L, r, wc_case, combine_f32_off);
                     if (c.imbalanced) a.merge_grid = 0x3fffffff;  // [LONGTAIL] 不粗化
                     while (go.load(std::memory_order_acquire) == 0) {}
                     bool cap = false;
