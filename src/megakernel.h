@@ -67,6 +67,8 @@ struct MegaLaunchArgs {
     int64_t xrelease_idx = 0, task_ready_idx = 0, task_counter_idx = 0,
             l2_done_idx = 0, slice_flags_idx = 0, l1_prog_idx = 0;
     int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;
+    // [A-RWK] pool 独立缓冲（普通显存 mcMalloc）；nullptr → 仍用 sym+pool_off
+    uint8_t* pool_ptr = nullptr;
     // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）
     // 已迁入 local_flags（lf->...）。
     int max_spins = 0;

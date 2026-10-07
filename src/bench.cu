@@ -76,6 +76,7 @@ struct RankRes {
     uint8_t* w1 = nullptr;          // [EPR][2I][H] lane 序 packed tile
     uint8_t* w2 = nullptr;          // [EPR][H][I] lane 序 packed tile
     uint8_t* ffn_hidden = nullptr;  // [EPR][ring][win_cap][I] FP8
+    uint8_t* pool_rwk = nullptr;    // [A-RWK] L1 A pool 独立普通显存缓冲（实验）
     uint8_t* frag_a = nullptr;      // [OPT-AFRAG] A 输入 fragment 缓冲
     uint8_t* frag2 = nullptr;       // [OPT-AFRAG] L1 输出 fragment 缓冲
     uint16_t* l2_out = nullptr;     // [kGrid][win_cap][H] BF16
@@ -407,6 +408,7 @@ static fp8mega::MegaLaunchArgs make_mega_args(
     a.x_off = L.x_off;
     a.weights_off = L.topk_weights_off;
     a.pool_off = L.expert_tokens_off;
+    a.pool_ptr = r.pool_rwk;   // [A-RWK] 非空 → pool 走独立普通显存
     a.w_off = L.token_route_weights_off;
     a.meta_off = L.token_src_meta_off;
     a.max_spins = (int)kSpinLimit;
@@ -431,6 +433,8 @@ static fp8mega::MegaLaunchArgs make_mega_args(
     a.y = r.y;
     a.grid = kGrid;
     a.merge_grid = kGrid;   // 缺省：任务粗化到 ≤ 单波（原行为）
+    // [TEST] env 开关：启用 merge=1（不粗化，多波）用于验证 GEN 修复
+    if (std::getenv("MX_MERGE1") != nullptr) a.merge_grid = 0x3fffffff;
     const int block_n = prod_block_n(o.scene.block_n);
     a.threads = block_n == 512 ? 1024 : 512;
     a.smem = prod_smem(o.scene.ranks, o.scene.window, block_n);
@@ -792,6 +796,13 @@ static int run_scene(RunOpts o, SceneResult* out) {
                                    (size_t)kGrid * win_cap * kHidden * 2));
                     CHECK(mcMemset(r.l2_out, 0,
                                    (size_t)kGrid * win_cap * kHidden * 2));
+                    // [A-RWK] 实验：L1 A pool 独立普通显存（env 开关，默认关）
+                    if (std::getenv("FP8MEGA_POOL_RWK") != nullptr) {
+                        const size_t pool_bytes = (size_t)kEPR * kRing *
+                            (size_t)(win_cap + o.scene.win_pad) * kHidden;
+                        CHECK(mcMalloc((void**)&r.pool_rwk, pool_bytes));
+                        CHECK(mcMemset(r.pool_rwk, 0, pool_bytes));
+                    }
                     // M3 REDUCE 输出 y [max_tokens][H] FP32
                     CHECK(mcMalloc((void**)&r.y,
                                    (size_t)o.scene.max_tokens * kHidden *
@@ -1282,10 +1293,14 @@ static int run_scene(RunOpts o, SceneResult* out) {
                     (void)E;
                     const int pool_stride = win_cap + o.scene.win_pad;
                     std::vector<uint8_t> pool_d((size_t)rows * kHidden);
-                    CHECK(mcMemcpy(pool_d.data(),
-                                   res[0].sym + L.expert_tokens_off +
-                                       (size_t)pool_slot * pool_stride * kHidden,
-                                   pool_d.size(), mcMemcpyDeviceToHost));
+                    const uint8_t* pool_src =
+                        res[0].pool_rwk != nullptr
+                            ? res[0].pool_rwk +
+                                  (size_t)pool_slot * pool_stride * kHidden
+                            : res[0].sym + L.expert_tokens_off +
+                                  (size_t)pool_slot * pool_stride * kHidden;
+                    CHECK(mcMemcpy(pool_d.data(), pool_src, pool_d.size(),
+                                   mcMemcpyDeviceToHost));
                     std::vector<float> ffn_exp((size_t)rows * kIntermediate);
                     ref_l1(pool_d.data(), w1_host.data(), e0, rows, kHidden,
                            kIntermediate, ffn_exp.data());
@@ -2188,12 +2203,19 @@ static int run_aligned(RunOpts o) {
                                (size_t)kEPR * kRing * win_cap * kIntermediate));
                 CHECK(mcMemset(r.ffn_hidden, 0,
                                (size_t)kEPR * kRing * win_cap * kIntermediate));
-                CHECK(mcMalloc((void**)&r.l2_out,
-                               (size_t)kGrid * win_cap * kHidden * 2));
-                CHECK(mcMemset(r.l2_out, 0,
-                               (size_t)kGrid * win_cap * kHidden * 2));
-                CHECK(mcMalloc((void**)&r.y,
-                               (size_t)max_tokens * kHidden * sizeof(float)));
+                 CHECK(mcMalloc((void**)&r.l2_out,
+                                (size_t)kGrid * win_cap * kHidden * 2));
+                 CHECK(mcMemset(r.l2_out, 0,
+                                (size_t)kGrid * win_cap * kHidden * 2));
+                 // [A-RWK] 实验：L1 A pool 独立普通显存（env 开关，默认关）
+                 if (std::getenv("FP8MEGA_POOL_RWK") != nullptr) {
+                     const size_t pool_bytes = (size_t)kEPR * kRing *
+                         (size_t)(win_cap + o.scene.win_pad) * kHidden;
+                     CHECK(mcMalloc((void**)&r.pool_rwk, pool_bytes));
+                     CHECK(mcMemset(r.pool_rwk, 0, pool_bytes));
+                 }
+                 CHECK(mcMalloc((void**)&r.y,
+                                (size_t)max_tokens * kHidden * sizeof(float)));
                 CHECK(mcMemset(r.y, 0,
                                (size_t)max_tokens * kHidden * sizeof(float)));
                 // [OPT-AFRAG] 多窗口 A/f2 fragment 专用缓冲（每 (expert,窗槽) 一份）；

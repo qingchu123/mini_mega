@@ -408,3 +408,103 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 7) timeout -k 3 15 ./bench \
   建立基线与逐项评估**。
 - **后续**：若要夺回约 200µs，须修 kernel 在 merge=1 多波下的 wait-all/旗子协议
   （而非简单开启不粗化）。
+
+## [261007] 负结果与相位分解（agent/layout/a-rwk 分支）
+
+同会话诊断（容器 cl_test，HEAD eb335a0），使用 `-DR24_DIAG_NOALOAD`/`-DR24_DIAG_NOB`
+编译消融；`test/75.fg_rwk_local_read` 为本机本地读带宽微基准。
+
+### 1) A→RWK：正确但无收益
+- 改动：L1 A pool 从 FG 对称区拆到独立 mcMalloc 普通显存（env `FP8MEGA_POOL_RWK`）。
+- 正确性：`[总体] R=2 PASS`（L1 max_abs=0，L2/REDUCE 全 PASS）。
+- test/70 TPR16/64/128 = 338.5/606.1/959.4 vs 基线 327.5/613.0/964.1（±3%，噪声内）；
+  tk-first-30 1014.5 vs 1014.2（0.03%）。**无端到端收益，不合并**。
+- 原因：A 工作集小（任务级 MB，L2 驻留）；微基准的 FG/RWK 差（~5%）只在超 L2
+  且行主序散射布局出现，而 fast fragment 路径是连续读。
+
+### 2) B：已到 HBM 峰值，空专家已跳过
+- 消融：test/70 TPR64 B≈203µs（34%）、tk-first-30 B≈241µs（24%）。
+  `W1+W2=288MB`，`288MB/203µs=1.42TB/s` ≈ 本机实测读峰值（test/75 contig16 1.35~1.65）。
+- 空专家已由任务数公式 `ceil(count/win_cap)` 跳过（prologue.cuh:431/470）：最空
+  launch(nz=19) 若读空专家需 ~8.5GB/5.7ms，远超实测，排除。
+- B 成本随 `max_expert`（热点集中度）上升（≤383→~130µs；≥448→427~784µs），
+  根因是**同专家多窗口的权重重读**，非空专家。布局/HBM 驻留无余量。
+
+### 3) A 装载与相位分解（test/70 TPR64，基线 ~600µs）
+- 消融：去 A≈15µs（2.5%）、去 B≈203µs、去 A+B≈217µs → 残差（MMA/epilogue/通信）
+  ≈386µs（64%）。
+- 相位（每 rank）：dispatch≈90、L1≈235、L2tail≈190、REDUCE(独立 kernel)≈51~105、
+  mega≈544。dispatch 的 90µs 主要是 A 的跨 rank pull（远读，平台 ~10GB/s 限制）。
+- 结论：B 已到峰值、A GEMM 装载被隐藏、A pull 受远读带宽限制、dispatch/REDUCE
+  是跨 rank 同步/straggler。**最大且明确的剩余杠杆是修复 `merge=1` 多波下的
+  wait-all/分片旗协议（约 200µs，见上一节"重要更正"）**。
+
+### 复现
+- 消融构建：`.agents/work/agent-blayout/tmp/build_bench.sh <out> [-D...]`
+- 运行：`docker exec [-e ENV] cl_test bash -lc "cd <out> && ./bench ..."`
+- 微基准：`test/75.fg_rwk_local_read/`
+
+## [261007] merge=1 多波协议：GEN 代际修复 + 复现/收益（agent/layout/a-rwk 分支）
+
+针对 perf.md「重要更正」记录的 merge=1 多波陈旧读，做了两项：
+1. **实现 GEN 代际旗**（`-DNO_GEN_FIX` 可回退）：
+   - `slice_flags` / `l1_prog` 旗值由 `epoch` 改为 `epoch + w/ring`
+     （`pool_slot=e*ring+w%ring` 绕回时的"第几代"），wait 端用本窗同一值等待
+     （compute_big.cuh `r19_pull_flags` / `r19_l1_pub_wait`）。与 l2_done 的
+     单调 target 同思路（槽携带轮次身份）。
+2. **env `MX_MERGE1=1`** 开通 merge=1（不粗化，多波）做 A/B。
+
+### 实测（容器 cl_test，R=32 tk / R=2 run_scene）
+- **merge=1 在 bench 上端到端正确**：
+  - R=32 tk 多个不均衡 launch（807500/805400/805700/806100，含 `--win-cap 32/16`
+    强制槽复用）：ck1/ck2 与 merge=0 一致（nogen 与 gen 均一致）。
+  - R=2 run_scene `--pattern 1(hot)/2(mixed) --win-cap 8 --compute 1`：
+    L1/L2/REDUCE-y 三行数值全 PASS、`[总体] PASS`（nogen 与 gen 均 PASS）。
+- **未能在 bench 复现 perf.md 的 harness 失败**（launch 807500 rel=0.229）：
+  bench 的 tk 复现 win_cap 被抬到 512 → 单窗无复用；压到 32/16 仍 PASS。
+  疑 harness 几何（全模型 tokens/nslice）或 combine 跨 rank 时序不同。
+- **收益巨大**（单 launch，nodes=10）：
+  | 口径 | merge=0 | merge=1 | 变化 |
+  |---|---:|---:|---:|
+  | 807500 (win_cap=512) | 1698 | 836 | −51% |
+  | 807500 win_cap=32 | 1491 | 882 | −41% |
+  | 807500 win_cap=16 | 2823 | 1337 | −53% |
+  | 805400 win_cap=32 | 1518 | 909 | −40% |
+  | 806100 win_cap=32 | 1507 | 874 | −42% |
+
+### 结论与风险
+- merge=1 是**远超 200µs 的大机会**（不均衡例 −40~53%），且 bench 全项正确。
+- 但 perf.md 记录过 harness 级失败；**合并前必须用 MXMOEMega harness
+  `--routing-fixed-cases 1`（R=32、真实 y 对拍 eager）复核**。GEN 修复作为安全网。
+- 复现脚本：`.agents/work/agent-blayout/tmp/{gen_repro2,gen_corr}.sh`
+
+## [261007] merge=1 多波协议修复：harness 验证通过（agent/layout/a-rwk 分支）
+
+GEN 代际旗修复（`compute_big.cuh`:`r19_pull_flags`/`r19_l1_pub_wait`）：
+`slice_flags`/`l1_prog` 旗值 `epoch` → `epoch + w/ring`（槽代际），wait 端同式。
+`torch/mxmegakernel/mega/__init__.py`：长尾分支 `merge_grid=0 → 0x3FFFFFFF`
+（不粗化，多波；`MXK_MERGE1=0` 回退）。
+
+### harness（MXMOEMega `run_mega_moe_all.sh --routing-fixed-cases N`，32 卡、
+CUDA graph 50-in-1、graph vs eager 对拍）
+| case | 内核 | graph-check rel_max_diff | mega_rankavg |
+|---|---|---:|---:|
+| 1 (807500) | 未修复(nogen) merge=1 | **3.000e-01（FAIL/报错）** | — |
+| 1 (807500) | gen merge=1 | **0.000e+00 PASS** | **0.8811 ms** |
+| 1 (807500) | gen merge=0（旧基线） | 0.000e+00 | 1.8164 ms |
+| 17 (829200) | gen merge=1 | **0.000e+00 PASS** | 0.7582 ms |
+
+- **bug 复现**：nogen+merge=1 rel=3.0e-1（perf.md 记 2.29e-1，同类）。
+- **修复有效**：gen+merge=1 rel=0。
+- **收益**：case1 **1.8164→0.8811ms（−51.5%）**；bench tk-first-50 **949.4→747.0µs（−21.3%）**，
+  单 launch 最高 −53%。
+
+### 其他本轮测过的方向（均负结果，见上节）
+A→RWK 无收益；B 已 HBM 峰值；跨 rank pull 本地≈远端（非瓶颈）；`__threadfence` 可去但零收益；
+fragment 必需（禁用 +38~62%）。
+
+### 合并建议
+- 需要合入：GEN 代际旗（compute_big.cuh）+ 长尾 `merge_grid=0x3FFFFFFF`
+  （torch/mxmegakernel/mega/__init__.py）+ bench 的 imbalanced merge 开关。
+- 实验脚手架（pool_ptr/A-RWK、PULL_*/NO_AFRAG/NO_GEN_FIX 诊断宏、MX_MERGE1 env）
+  建议清理后再合。

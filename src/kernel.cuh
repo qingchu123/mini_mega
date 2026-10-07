@@ -42,6 +42,7 @@ struct MegaArgs {
     int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
     int64_t slice_flags_idx, l1_prog_idx;
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
+    uint8_t* pool_ptr;   // [A-RWK] pool 独立缓冲基址（nullptr → self+pool_off）
     // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）
     // 已迁入 local_flags（lf->...），此处不再持有独立指针。
     int max_spins;
@@ -144,7 +145,8 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
     dispatch_pull_body<TaskTail, kSmallOnly, kFragCap, kCap>(
         a.self, a.peer_bases, a.R, a.rank, a.win_cap, a.pool_stride,
         a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off, a.src_off, a.x_off,
-        a.weights_off, a.pool_off, a.w_off, a.meta_off, a.lf->bar[cycle],
+        a.weights_off, a.pool_off, a.w_off, a.meta_off, a.pool_ptr,
+        a.lf->bar[cycle],
         a.task_counter_idx, a.l2_done_idx, a.task_ready_idx, a.slice_flags_idx,
         a.l1_prog_idx, a.lf->out_processed, a.lf->dbg, a.max_spins, a.w1,
         a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.lf->l1_chk, a.w2,

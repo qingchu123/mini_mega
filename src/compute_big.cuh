@@ -283,6 +283,7 @@ struct R19Sched {
     int R, rank;
     int win_cap, pool_stride, tbl_cap, k_in, topk, ring;
     int64_t src_off, x_off, weights_off, pool_off, w_off, meta_off;
+    uint8_t* pool_base;   // [A-RWK] pool 基址（nullptr → self+pool_off）
     uint32_t* bar_flags;
     int64_t l2_done_idx, task_ready_idx, slice_flags_idx, l1_prog_idx;
     int* dbg;
@@ -1083,10 +1084,18 @@ __device__ __forceinline__ void r19_pull_flags(
     const int lane = tid % 64;
     const int nwarps = (int)(blockDim.x / 64);
     const int s_row_off = w * S.win_cap;
+    // [GEN] 槽携带代际：pool_slot=e*ring+w%ring 会绕回复用；旗值改用单调代际
+    //   epoch + w/ring（= 该槽第几次被用），wait 端用本窗算出的同一值等待，
+    //   避免上一代窗口遗留的旗被误判就绪（多波 merge=1 陈旧读修复）。
+#ifdef NO_GEN_FIX
+    const unsigned gen = epoch;
+#else
+    const unsigned gen = epoch + (unsigned)(w / (S.ring > 0 ? S.ring : 1));
+#endif
     // [R35] 物理任务覆盖 merge 个连续逻辑 slice：K 片为连续 merge 段
     const int u4_slice = (S.k_in / 16) / S.nslice_eff;   // 本任务 uint4 数
     const int u4_off = slice * u4_slice;
-    uint8_t* pool = const_cast<uint8_t*>(S.self) + S.pool_off;
+    uint8_t* pool = S.pool_base;
     float* wt = reinterpret_cast<float*>(const_cast<uint8_t*>(S.self) + S.w_off);
     int* meta = reinterpret_cast<int*>(const_cast<uint8_t*>(S.self) + S.meta_off);
     const uint32_t* src_tbl =
@@ -1133,9 +1142,17 @@ __device__ __forceinline__ void r19_pull_flags(
         uint4* dstp = reinterpret_cast<uint4*>(
             pool + ((size_t)pool_slot * S.pool_stride + s2) * S.k_in);
         if (valid) {
+#ifdef PULL_LOCAL_DIAG
+            // [诊断] 远端读换成本 rank 本地读（同 volume/pattern），量化远端代价
+            const uint4* srcp = reinterpret_cast<const uint4*>(
+                                    S.self + S.x_off) +
+                                (size_t)(src_token % S.tbl_cap) *
+                                    (S.k_in / 16) + u4_off;
+#else
             const uint4* srcp = reinterpret_cast<const uint4*>(
                                     S.peer_bases[src] + S.x_off) +
                                 (size_t)src_token * (S.k_in / 16) + u4_off;
+#endif
             // [O2] 权重远端读先于整行搬运发出：与搬运 store 并行，
             // 避免原顺序（先搬运后读权重）把远端读延迟暴露在任务尾。
             float wv = 0.0f;
@@ -1194,19 +1211,25 @@ __device__ __forceinline__ void r19_pull_flags(
             }
         }
     }
+#ifndef PULL_FENCE_NONE
     __threadfence();
+#endif
     __syncthreads();
     // ---- 分片就绪旗（本 slice 的 K 片已落 pool；L1 消费）----
     if (tid == 0) {
+#ifndef PULL_FENCE_MIN
         __threadfence();
+#endif
         // 同设备分片旗：普通写 + fence（__stwt 在普通显存上不更新 L2）
         // [R36b] flag 粒度=物理 slice（nslice_eff）：粗化后 stride≤4，区容量
         //   EPR×ring×nslice_eff ≤ 256 恒成立（不再随 kNSlice 放大）；
         //   kNSlice=16 因此无需改布局常量即可用。
         *reinterpret_cast<volatile uint32_t*>(
             S.bar_flags + S.slice_flags_idx +
-            (size_t)pool_slot * S.nslice_eff + slice) = epoch;
+            (size_t)pool_slot * S.nslice_eff + slice) = gen;
+#ifndef PULL_FENCE_MIN
         __threadfence();
+#endif
     }
     __syncthreads();
     // 诊断：block0 首任务 DISPATCH 完成（分片旗已写）
@@ -1223,7 +1246,7 @@ __device__ __forceinline__ void r19_pull_flags(
             while (*(volatile const uint32_t*)(S.bar_flags + S.slice_flags_idx +
                                                (size_t)pool_slot *
                                                    S.nslice_eff +
-                                               s2) != epoch) {
+                                               s2) != gen) {
                 if (++spin > S.max_spins) {
                     if (S.dbg != nullptr) atomicAdd(S.dbg + 4, 1);
                     break;
@@ -1237,17 +1260,23 @@ __device__ __forceinline__ void r19_pull_flags(
 
 __device__ __forceinline__ void r19_l1_pub_wait(
         const R19Sched& S, int task, int count, int slice, unsigned epoch,
-        int pool_slot) {
+        int pool_slot, int w) {
     const int tid = threadIdx.x;
     const bool kTick = (S.pt != nullptr) && (blockIdx.x == 0) && (task == 0) &&
                        (tid == 0);
+    // [GEN] 与 slice_flags 同代际，避免 l1_prog 跨窗口复用陈旧读
+#ifdef NO_GEN_FIX
+    const unsigned gen = epoch;
+#else
+    const unsigned gen = epoch + (unsigned)(w / (S.ring > 0 ? S.ring : 1));
+#endif
     __syncthreads();
     // ---- l1_prog 发布 + L1→L2 依赖（本窗全部 NSLICE 个旗）----
     if (tid == 0) {
         __threadfence();
         // [R36b] 同 slice 旗：flag 粒度=物理 slice（stride=nslice_eff）
         l1_progress_publish(S.bar_flags, (int)S.l1_prog_idx, pool_slot, slice,
-                            epoch, (int)S.nslice_eff);
+                            gen, (int)S.nslice_eff);
         for (int s2 = 0; s2 < S.nslice_eff; ++s2) {
             if (s2 == slice) continue;
             long long spin = 0;
@@ -1256,7 +1285,7 @@ __device__ __forceinline__ void r19_l1_pub_wait(
             while (*(volatile const uint32_t*)(S.bar_flags + S.l1_prog_idx +
                                                (size_t)pool_slot *
                                                    S.nslice_eff +
-                                               s2) != epoch) {
+                                               s2) != gen) {
                 if (++spin > S.max_spins) {
                     if (S.dbg != nullptr) atomicAdd(S.dbg + 4, 1);
                     break;
@@ -1318,7 +1347,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     const unsigned long long t_l1s = (tid == 0) ? clock64() : 0ull;
 #endif
     // ---- L1：M 档位（kMT 个 16 行 tile 共享 B 一遍）----
-    const uint8_t* pool = const_cast<uint8_t*>(S.self) + S.pool_off;
+    const uint8_t* pool = S.pool_base;
     const uint8_t* pool_w = pool + (size_t)pool_slot * S.pool_stride * S.k_in;
     const int g_l1 = (S.l1_n_total / S.l1_block_n) / S.nslice_eff;
     const int g0_l1 = slice * g_l1;
@@ -1532,7 +1561,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
         atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8,
                   clock64() - t_l1s);
 #endif
-    r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot);
+    r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
 #if R24_DIAG_PHASE
     const unsigned long long t_l2s = (tid == 0) ? clock64() : 0ull;
 #endif
@@ -1718,7 +1747,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     (void)b_smem;
     r19_pull_flags(S, task, e, w, count, slice, epoch, pool_slot, pfx);
     // ---- L1：小 count 档位（与基线实例选择一致）----
-    const uint8_t* pool = const_cast<uint8_t*>(S.self) + S.pool_off;
+    const uint8_t* pool = S.pool_base;
     const uint8_t* pool_w = pool + (size_t)pool_slot * S.pool_stride * S.k_in;
     const int g_l1 = (S.l1_n_total / S.l1_block_n) / S.nslice_eff;
     const int g0_l1 = slice * g_l1;
@@ -1756,7 +1785,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
                 lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
                 out_col_base, S.l1_k_out, nullptr);
     }
-    r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot);
+    r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
     // ---- L2：小 count（与基线实例选择一致）----
     const int g_l2 = (S.l2_k_out / S.l1_block_n) / S.nslice_eff;
     const int g0_l2 = slice * g_l2;

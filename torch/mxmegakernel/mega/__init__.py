@@ -363,10 +363,11 @@ class SymmBuffer:
                 tgt = ((tgt + _KERNEL_M_TILE - 1) // _KERNEL_M_TILE) * _KERNEL_M_TILE
                 win = max(EXPERT_WINDOW_MIN,
                           min(int(self.win_phys), max(_KERNEL_M_TILE, tgt)))
-                # [BUGFIX 261007] merge_grid=0x3FFFFFFF（不粗化）会跨波，多波下
-                #   wait-all/旗子陈旧读 → 结果错误（harness case 1 rel=0.229）。
-                #   回退缺省单波粗化（0）保留 win_cap/frag 自适应。
-                cfg = (win, 0, True)
+                # [TEST] merge=1（不粗化，多波）验证 GEN 代际修复。
+                #   MXK_MERGE1=0 可回退单波粗化做 A/B。
+                merge_g = (0x3FFFFFFF
+                           if os.environ.get("MXK_MERGE1", "1") != "0" else 0)
+                cfg = (win, merge_g, True)
                 self._launch_cfg = cfg
                 return cfg
         except Exception:  # noqa: BLE001

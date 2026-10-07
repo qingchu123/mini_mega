@@ -902,3 +902,22 @@
 > 结论：merge_floor 对多数中等不均衡档是**净回退**（Agent2 当时的“改善”是并行抢卡的测量假象）；
 > 已回退该改动，863400 恢复 ~862µs。`maxexp>256` 桶两版代码逐字节相同、mean 仅差 0.3%，
 > 证明该对比不受会话漂移影响。
+
+## [261007] merge=0 vs merge=1（GEN 修复）全量 838 launch 对比
+
+- 口径：`./bench --tk-info <log> --tk-all --nodes 20 --replays 2`，R=32，同会话。
+- 数据：`tkfull_merge0.log` / `tkfull_merge1.log`（本目录，merge=1 用 `MX_MERGE1=1`）。
+- 图：`tk_full_compare.png` / `.svg`（上：us vs launch 序；中：直方图；下：us vs max_expert）。
+
+| 指标 | merge=0（粗化） | merge=1（GEN 修复） | 变化 |
+|---|---:|---:|---:|
+| mean | 1003.0 | 786.6 | **−21.6%** |
+| median | 889.9 | 683.1 | **−23.2%** |
+| p90 | 1736.4 | 935.7 | **−46.1%** |
+| p99 | 3001.3 | 3000.4 | ~0 |
+| min | 310.4 | 309.9 | ~0 |
+| max | 3035.9 | 3041.5 | ~0 |
+
+- merge=1 主要削掉 `max_expert > 380` 的长尾（us vs max_expert 图中合并前明显上扬、
+  合并后趋平），p90 腰斩；最慢的少数极端例（p99/max ~3000µs）不变。
+- 正确性见 perf.md：harness `--routing-fixed-cases 1/17` graph-vs-eager `rel=0.000e+00`。
