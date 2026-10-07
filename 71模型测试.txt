@@ -1,0 +1,32 @@
+本机已配置 lchen1@10.0.82.71免密
+
+#1. 性能测试+profiler 
+#起三个终端，进入lyx_test_new5_all容器
+docker exec -it lyx_test_new5_all bash
+#1终端 起服务
+bash /sw_home/m01182/test/c600ul/megamoe/decode_fake_test_megamoe_0927.sh
+#2终端 待服务起来
+bash bench_serving.sh decode 10.0.82.71 8400 
+#默认跑两轮bs 128 16k1k，第一轮作为warmup，到第二轮稳定再抓profiler
+#3终端 抓profiler
+bash profiler.sh 10.0.82.71 8400
+
+profiler路径设置 当前为默认值
+export SGLANG_TORCH_PROFILER_DIR=/sw_home/m01182/profiler/600ul/megamoe_skip_allgather #111行
+#log路径设置 当前为默认值
+target_dir="/sw_home/m01182/logger/decode/megamoe" #222行
+#查看各rank上每个专家的token分布 默认开启
+export DG_TK_INFO_EVERY=100
+
+
+
+
+#2. 精度测试（PD一体，无mock接受率）
+#起两个终端，进入lyx_test_new5_all容器
+docker exec -it lyx_test_new5_all bash
+#1终端 起服务
+bash /sw_home/m01182/test/c600ul/megamoe/decode_fake_test_megamoe_acc_0927.sh
+#2终端 单条语料测试：待服务起来
+bash client.sh 10.0.82.71 8400
+或 #2终端 数据集测试
+bash run_gsm8k.sh 10.0.82.71 8400

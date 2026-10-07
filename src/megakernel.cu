@@ -8,10 +8,38 @@
 
 #include "megakernel.h"
 
+#include <cstdlib>
+
 #include "common.cuh"
 #include "kernel.cuh"
 
 namespace fp8mega {
+
+// ============================================================================
+// [MEGA_DEBUG=4] 采集 kernel：在 mega_kernel **之前** 记录本 rank 的
+//   ct0 = local_flags::current_time[0][0]（本 launch 的 identity/序号）、
+//   ct1 = current_time[0][1]、topk_idx、graph_capture_bool、rank。
+// 用途：跑完模型后，从 stdout 日志（设备 printf）重建真实场景的
+//   per-rank/per-launch 路由与序号，供离线复现数据集。
+// 仅当 host 环境变量 MEGA_DEBUG=4 时由 launch_compute 发射；其余情况不产生任何
+//   代码/开销（走同一 stream，graph capture 时随图录制、replay 时执行）。
+// ============================================================================
+__global__ void mxk_dbg_capture_kernel(
+        const int64_t* __restrict__ topk_idx, int tokens, int topk,
+        const local_flags* __restrict__ lf, int rank, int capture,
+        unsigned long long* __restrict__ sink) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const long long ct0 =
+        (lf != nullptr) ? (long long)lf->current_time[0][0] : -1LL;
+    const long long ct1 =
+        (lf != nullptr) ? (long long)lf->current_time[0][1] : -1LL;
+    // 仅打印元信息（rank/序号/tokens/topk）；topk_idx 由 host 侧另取，
+    //   避免日志体积过大。
+    printf("[MXK_DBG] rank=%d cap=%d ct0=%lld ct1=%lld tokens=%d topk=%d\n",
+           rank, capture, ct0, ct1, tokens, topk);
+    if (topk_idx != nullptr && sink != nullptr)
+        sink[0] = (unsigned long long)topk_idx[0];   // 防 DCE
+}
 
 // 设备侧权重生成（16B/lane supertile 布局；替代 host 生成 + 大体积上传）。
 __global__ void __launch_bounds__(256) fill_w_lane_kernel(
@@ -96,6 +124,26 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     return m;
 }
 
+// [MEGA_DEBUG=4] 采集开关 + 当前 stream 是否处于 graph capture。
+bool dbg_capture_enabled() {
+    const char* s = std::getenv("MEGA_DEBUG");
+    return s != nullptr && std::atoi(s) == 4;
+}
+
+int stream_is_capturing(mcStream_t stream) {
+    mcStreamCaptureStatus st = mcStreamCaptureStatusNone;
+    if (mcStreamIsCapturing(stream, &st) != mcSuccess) return -1;
+    return (st == mcStreamCaptureStatusActive) ? 1 : 0;
+}
+
+// 在 mega_kernel 之前发射采集 kernel（同一 stream → 顺序/图录制天然正确）。
+void dbg_capture_launch(const MegaLaunchArgs& a, mcStream_t stream) {
+    if (!dbg_capture_enabled()) return;
+    mxk_dbg_capture_kernel<<<1, 1, 0, stream>>>(
+        a.topk_idx, a.tokens, a.topk, a.lf, a.rank,
+        stream_is_capturing(stream), nullptr);
+}
+
 }  // namespace
 
 void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream) {
@@ -104,6 +152,8 @@ void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream) {
 }
 
 void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
+    // [MEGA_DEBUG=4] 采集 kernel（mega 之前；默认关，零开销）
+    dbg_capture_launch(a, stream);
     // [OPT-TK-CAP] 仅当宿主提供了 fragment 专用缓冲（不均衡长尾/tk 场景）时，
     //   按 win_cap 选编译期 count 上界实例（kCap=48/64）：不可达的重档
     //   （MT8 异步 / MT4 大 GEMM 兜底）被 if constexpr 删除，缩任务体寄存器/栈。

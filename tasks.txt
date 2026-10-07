@@ -1,0 +1,24 @@
+1. 拆分bench.cu ， 里面只能调用 fp8的c++ 接口，而不是直接调用kernel。（如果没有接口层，则增加）。 c++ 层编译成 megakernel.so 供bench.cu进行调用。
+2. 构建新的功能测试：
+
+cl_test容器
+cd /home/lchen1/data/projs/MXMOEMega
+bash scripts/mx_scripts/run_mega_moe_all.sh --skip-baseline --routing-fixed-cases 0
+
+
+
+为什么用wheel包跑--routing-fixed-cases 0 （ launch 804900 ）是 1.7ms, 而用c++ 跑
+./bench --tk-info test/70.r32_tpr_perf/0928_tk_info.log --tk-launch 804900 
+性能要好很多？
+
+使用/mxmegakernel-0.0.0+mini.mega.202610071235-cp310-cp310-linux_x86_64.whl 跑一下--routing-fixed-cases 0 看看性能
+
+cl_test容器
+cd /home/lchen1/data/projs/MXMOEMega
+bash scripts/mx_scripts/run_mega_moe_all.sh --skip-baseline --routing-fixed-cases 0
+
+拿到数据后，停止71大模型测试
+
+
+
+帮我在megakernel前增加一个采集日志的kernel，采集本ranks的ct0值,topk_idx,graph_capture_bool,rank，方便我跑完模型后，根据日志在后面重建真实场景的数据和路由信息. 该kernel可以使用MEGA_DEBUG=4 使能是否运行。
