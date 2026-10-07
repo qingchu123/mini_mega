@@ -390,3 +390,21 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 7) timeout -k 3 15 ./bench \
   804300=666.6、853000=673.5（均优于基线）。
 - 正确性：R=2（TPR=16/256）、R=8（TPR=64）`[总体] PASS`；`MX_NO_REUSE` 与
   复用态 L1/L2 checksum（ck1/ck2）逐位相同（804300）。
+
+## [重要更正 261007] 不粗化（merge=1）路径结果错误，性能结论需重新基线
+
+- **根因**：长尾场景 `merge_grid=0x3fffffff` 令 kernel 内 `merge` 保持 1（不粗化），
+  物理任务数 `raw_tasks` 超过 grid 块数 → 跨波执行；多波下 wait-all/分片旗出现
+  陈旧读。见 `src/compute.cuh:941` 注释（merge 粗化本为消除跨波悬挂）。
+- **证据**：MXMOEMega harness `--routing-fixed-cases 1`（launch 807500）50-in-1
+  CUDA graph 与 eager 对拍 `rel_max_diff=2.287e-01`；`MXK_MERGE_MAX=0` 即
+  `rel=0`；`MXK_FRAG=0` 仍 2.291e-01 ⇒ 仅 merge 相关，与 frag 无关。
+- **修复**：`src/bench.cu` 与 `torch/mxmegakernel/mega/__init__.py` 的 long-tail
+  分支回退缺省单波粗化（merge_grid=0），保留 win_cap/frag 自适应（提交 be4f479）。
+  修复后 harness case 1 `rel=0.000e+00`（1.8133ms），bench R=2/R=32 PASS。
+- **重测**：`--tk-first 50` 由（错误的）744.5µs → **正确的 943.4µs**。
+- **影响**：此前基线 898.5µs、以及 eb8774b/cce2fdf/2b96a0c/c0020d8/bde6343 等
+  相对该基线的提升，均落在不粗化路径上，**性能结论不可比，需在正确路径上重新
+  建立基线与逐项评估**。
+- **后续**：若要夺回约 200µs，须修 kernel 在 merge=1 多波下的 wait-all/旗子协议
+  （而非简单开启不粗化）。
