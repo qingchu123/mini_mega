@@ -98,12 +98,16 @@
 // 仅清 per-launch 的 bar / xbar_barrier；combine_sums 用单调 epoch 判据
 // （part < epoch），旧槽值必小于本轮 epoch，无需预清。
 __device__ __forceinline__ void mx_preclear_ct2(local_flags* lf,
-                                                ranks_flags* rf) {
+                                                ranks_flags* rf,
+                                                bool skip_xbar = false) {
     const int c0 = (int)(lf->current_time[blockIdx.x][0] % M_CYCLE);
     const int ct2 = (c0 + 2) % M_CYCLE;
     for (int i = (int)threadIdx.x; i < kFp8BarFlagsNumInt32;
          i += (int)blockDim.x)
         lf->bar[ct2][i] = 0u;
+    // [R38] 复用前序节点跳过 xbar（该相位不执行），xbar_barrier 的旧值由 epoch
+    //   单调性保证安全（读侧判 *mine - epoch >= 0），无需清零。
+    if (skip_xbar) return;
     const int n = kGrid * kGrid;
     for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x)
         rf->xbar_barrier[ct2][i / kGrid][i % kGrid] = 0u;

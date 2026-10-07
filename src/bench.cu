@@ -2339,10 +2339,21 @@ static int run_aligned(RunOpts o) {
                     if (c.imbalanced) a.merge_grid = 0x3fffffff;  // [LONGTAIL] 不粗化
                     while (go.load(std::memory_order_acquire) == 0) {}
                     bool cap = false;
+                    // [R38] 跨 graph 节点前序复用：同 graph 内路由不变，仅首节点
+                    //   跑 ROUTE/PUBLISH/XBAR，其余节点跳过（flag 由 TASK_SETUP 重臂）。
+                    //   MX_NO_REUSE=1 可关闭做 A/B。
+                    const bool reuse_prologue =
+                        std::getenv("MX_NO_REUSE") == nullptr;
+                    int reuse_mode = 2;
+                    if (const char* rm = std::getenv("MX_REUSE_MODE"))
+                        reuse_mode = std::atoi(rm);
                     cal[rank] = chain_measure(
                         st, nodes, replays,
-                        [&](mcStream_t s, int) {
-                            fp8mega::launch_full(a, s);
+                        [&](mcStream_t s, int k) {
+                            fp8mega::MegaLaunchArgs b = a;
+                            b.skip_prologue =
+                                (reuse_prologue && k != 0) ? reuse_mode : 0;
+                            fp8mega::launch_full(b, s);
                         },
                         &per[rank], &cap);
                     caps[rank] = cap ? 1 : 0;

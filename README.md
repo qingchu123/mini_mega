@@ -72,14 +72,14 @@ bash test/71.r32_tk_imbalance/run.sh
 
 日志行 `[TK_INFO] rank=r launch=n : c0..c7`；`ci` = rank r 物理专家 i 收到的 pair
 数。`--tk-launch N` 指定 launch（缺省自动选「单专家最大收行」最大的全 rank
-launch）。实测单次全链：均衡 343.9µs → 不均衡 1.29/1.03/1.30ms（max 176/362/512，
-v5 窗口切分后；改前为 1.78/3.46/4.71ms），详见 `test/71.r32_tk_imbalance/results.md`。
+launch）。实测单次全链：均衡 334.9µs → 不均衡 0.656/0.670/0.682ms（max 176/362/512，
+v9 前序复用后；改前为 1.78/3.46/4.71ms），详见 `test/71.r32_tk_imbalance/results.md`。
 
 ## 基准（本机 202，C600UL 32 卡）
 
 | TPR | 16 | 64 | 256 |
 |---:|---:|---:|---:|
-| full (µs/kernel) | 343.5 | 651.0 | 1918.3 |
+| full (µs/kernel) | 321.8 | 603.0 | 1800.7 |
 
 详见 `test/70.r32_tpr_perf/results.md`。
 

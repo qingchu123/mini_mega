@@ -356,3 +356,37 @@ MACA_VISIBLE_DEVICES=$(seq -s, 0 7) timeout -k 3 15 ./bench \
 - 回归：test/70 TPR16/64/256 = 347~351 / 649 / 1932~1935（基线内）；
   test/71 均衡 349、804300=672、804400=724、853000=711（均优于 v8）。
 - 正确性：R=2 `[总体] PASS`（L1/L2/REDUCE 三行 PASS）。
+
+## v10：tk_first 前 50 launch：跨 graph 节点前序复用 + tk 专属 B 预取加深
+
+时间标签：`[261007_10_23]`（分支 agent/opt700/1）。
+
+- 口径：`./bench --tk-info test/70.r32_tpr_perf/0928_tk_info.log --tk-first 50`
+  （升序 804300..809200，n=50 平均）；基线 v9 = 776.8µs。
+- 根因（消融，同会话）：
+  - `CM_SKIP_GEMM`（纯通信）=201.8µs；进一步 `R19_DIAG_NOPULL` 只降 8µs →
+    纯通信几乎不含 A 拉取数据量，主要是「前序 + flag/同步 + 归约门」。
+  - `R30_DIAG_NOTPUSH`（任务尾 combine 数据推送置零）单测降 ~39µs，但推送为
+    协议必需；把推送融合进 L2（paired/小 r24 路径）实测更慢（B 带宽期内竞争），
+    故不动推送，改攻前序。
+  - 单任务相位计时显示小档（count<=16）每任务 pull~10/L1~75/L2~40µs，固定开销
+    占比小；主成本仍是 B（HBM 流量，近地板）。
+- 改动：
+  1. `kernel.cuh`/`prologue.cuh`/`megakernel.{h,cu}`：新增 `MegaArgs::skip_prologue`。
+     同一 graph 内节点路由不变（`run_aligned` 的 `nodes` 个同构节点）→ 仅首节点跑
+     ROUTE_BUILD/PUBLISH_COUNTS/XBAR，其余节点跳过（数据持久、node0 的 xbar 已建立
+     跨 rank 可见性），改由 `task_setup_light_body` 仅重臂每节点 flag
+     （task_counter/l2_done/task_ready + 推进 cycle 计数）。`MX_NO_REUSE=1` 关闭。
+  2. `bench.cu`：`run_aligned` 的 graph 捕获按节点号设 `skip_prologue`（node0=0，
+     其余=2：连 xbar 一并跳过）。
+  3. `compute_big.cuh`：`r24_l1_big`/`r24_l2_big` 增加 `kBPF` 模板参；tk/长尾实例
+     （`kCap>0`）用 `kBPF=4`（B 预取环加深一倍），均衡大档（`kCap=0`）保持 2，
+     避免 TPR=256 回退。
+  4. `flags.cuh`/`kernel.cuh`：复用节点的 `mx_preclear_ct2` 跳过 xbar_barrier
+     清零（该相位不执行；旧值由 epoch 单调性保证读侧安全）。
+- 前 50 平均 **776.8 → 742.3~746.8µs（-4.4%，多次；含 skip-xbar 后 742.8）**。
+- 回归：test/70 TPR16/64/256 = 320.7~322.9 / 599.9~606.0 / 1797.5~1804.0（基线
+  348~353 / 651 / 1933，全面改善 −6~−8%）；test/71 均衡 327.4、804400=673.5、
+  804300=666.6、853000=673.5（均优于基线）。
+- 正确性：R=2（TPR=16/256）、R=8（TPR=64）`[总体] PASS`；`MX_NO_REUSE` 与
+  复用态 L1/L2 checksum（ck1/ck2）逐位相同（804300）。

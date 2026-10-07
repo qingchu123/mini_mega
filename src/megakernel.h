@@ -73,6 +73,7 @@ struct MegaLaunchArgs {
     unsigned publish_epoch = 0;
     int recv_stride = 0;
     int merge_grid = 0;   // 0=gridDim.x（单波粗化）；很大=不粗化（长尾专项）
+    int skip_prologue = 0;  // [R38] >0=复用前序（同 graph 非首节点；见 kernel.cuh）
     int* prefix_ptr = nullptr;
     // ---- 计算链 ----
     const uint8_t* w1 = nullptr;

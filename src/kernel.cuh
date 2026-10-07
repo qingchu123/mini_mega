@@ -50,6 +50,10 @@ struct MegaArgs {
     // [LONGTAIL] 任务粗化 merge 的网格上限：0=用 gridDim.x（缺省，单波）；
     // >0 且很大时 merge 恒为 1（不粗化）——不均衡长尾场景把大专家切成更多小任务。
     int merge_grid;
+    // [R38] 跨 graph 节点前序复用：同一 graph 内节点路由不变时，除首节点外
+    //   跳过 ROUTE_BUILD/PUBLISH/XBAR（数据持久、node0 已建立跨 rank 可见性），
+    //   仅推进 cycle 计数并重跑 TASK_SETUP（重臂 flag）。0=完整前序，1=复用。
+    int skip_prologue;
     int* prefix_ptr;          // 可选独立前缀表缓冲（nullptr = self+prefix_off）    // ---- 计算链 ----
     const uint8_t* w1;        // [EPR][2I][H] lane 序 packed tile（gate/up 配对布局）
     int l1_n_total, l1_block_n, l1_k_out;
@@ -186,29 +190,48 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     if (kTick) a.lf->pre_ticks[6] = clock64();
     // 0) [M_CYCLE] 预清 ct2=(c+2)%M_CYCLE 槽（本轮 copy c 尚未定，用 current_time
     //   [b][0] 派生；入口全 block 同为 L ⇒ c 一致）。ct1 留给下一轮，本轮不碰。
-    mx_preclear_ct2(a.lf, a.rf);
+    mx_preclear_ct2(a.lf, a.rf, /*skip_xbar=*/a.skip_prologue >= 2);
     __syncthreads();
-    // 1) PROLOGUE：ROUTE_BUILD + PUBLISH_COUNTS（仅 block0）
-    if (blockIdx.x == 0) {
-        route_build_body(a.topk_idx, a.peer_bases, a.R, a.rank, a.tokens,
-                         a.tbl_cap, a.src_off, a.rsc_off, 0, 0, ctr);
-        if (kTick) a.lf->pre_ticks[0] = clock64();
-        publish_counts_body(a.self, a.peer_bases, a.R, a.rank, a.rsc_off,
-                            a.recv_off, a.publish_epoch, a.recv_stride, 0, ctr);
-        if (kTick) a.lf->pre_ticks[1] = clock64();
+    if (!a.skip_prologue) {
+        // 1) PROLOGUE：ROUTE_BUILD + PUBLISH_COUNTS（仅 block0）
+        if (blockIdx.x == 0) {
+            route_build_body(a.topk_idx, a.peer_bases, a.R, a.rank, a.tokens,
+                             a.tbl_cap, a.src_off, a.rsc_off, 0, 0, ctr);
+            if (kTick) a.lf->pre_ticks[0] = clock64();
+            publish_counts_body(a.self, a.peer_bases, a.R, a.rank, a.rsc_off,
+                                a.recv_off, a.publish_epoch, a.recv_stride, 0, ctr);
+            if (kTick) a.lf->pre_ticks[1] = clock64();
+        }
+    } else {
+        // [R38] 复用前序：路由/计数持久，跳过 ROUTE/PUBLISH（数据与 node0 相同）。
+        if (kTick) a.lf->pre_ticks[0] = a.lf->pre_ticks[1] = clock64();
     }
-    // 2) XBAR_ROUTE_READY（全 grid，mode3：转置 + warp 并行发布）
-    xbar_route_ready_body(a.rf, a.rf_peers, a.lf, a.R, a.rank,
-                          a.xrelease_idx, a.lf->dbg, a.max_spins, 0, ctr);
+    // 2) XBAR_ROUTE_READY（全 grid，mode3：转置 + warp 并行发布）：每节点保留，
+    //    既是 route/publish 可见性门，也是跨 rank 的每节点对齐（防漂移）。
+    if (a.skip_prologue >= 2) {
+        // 诊断模式：连 xbar 也跳过，仅推进 xbar 相位计数
+        if (threadIdx.x == 0) a.lf->current_time[blockIdx.x][0] += 1;
+        __syncthreads();
+    } else {
+        xbar_route_ready_body(a.rf, a.rf_peers, a.lf, a.R, a.rank,
+                              a.xrelease_idx, a.lf->dbg, a.max_spins, 0, ctr);
+    }
     if (kTick) a.lf->pre_ticks[2] = clock64();
     // 3) TASK_SETUP（block0 leader：checksum -> prefix -> 窗口表 -> task_ready）
-    task_setup_body(a.self, a.R, a.rank, a.slot_capacity, a.recv_off,
-                    a.prefix_off, a.lf, a.task_ready_idx,
-                    a.task_counter_idx, a.l2_done_idx,
-                    a.lf->out_total, a.lf->dbg, a.max_spins,
-                    a.recv_stride, /*reset_ring=*/true, /*tid_base=*/0,
-                    /*sb_cnt=*/nullptr, /*smem_off=*/0, a.prefix_ptr,
-                    a.lf->ck_dbg, ctr);
+    if (a.skip_prologue) {
+        // [R38] 复用前序：prefix/路由/计数持久，仅轻量重臂 flag（省 checksum
+        //   轮询与 prefix 重建）。
+        task_setup_light_body(a.lf, a.task_ready_idx, a.task_counter_idx,
+                              a.l2_done_idx, a.max_spins, a.lf->dbg);
+    } else {
+        task_setup_body(a.self, a.R, a.rank, a.slot_capacity, a.recv_off,
+                        a.prefix_off, a.lf, a.task_ready_idx,
+                        a.task_counter_idx, a.l2_done_idx,
+                        a.lf->out_total, a.lf->dbg, a.max_spins,
+                        a.recv_stride, /*reset_ring=*/true, /*tid_base=*/0,
+                        /*sb_cnt=*/nullptr, /*smem_off=*/0, a.prefix_ptr,
+                        a.lf->ck_dbg, ctr);
+    }
     if (kTick) a.lf->pre_ticks[3] = clock64();
     // 4) 任务循环（DISPATCH -> L1 -> L2 -> tail(COMBINE)）
     if (kWithCompute) {
