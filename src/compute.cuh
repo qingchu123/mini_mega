@@ -892,6 +892,7 @@ __device__ __forceinline__ void dispatch_pull_body(
         int win_cap, int pool_stride, int tbl_cap, int k_in, int topk, int ring,
         int64_t prefix_off, int64_t src_off, int64_t x_off, int64_t weights_off,
         int64_t pool_off, int64_t w_off, int64_t meta_off,
+        uint8_t* pool_ptr,
         uint32_t* bar_flags, int64_t task_counter_idx, int64_t l2_done_idx,
         int64_t task_ready_idx, int64_t slice_flags_idx, int64_t l1_prog_idx,
         int* out_processed, int* dbg, int max_spins,
@@ -976,6 +977,10 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.x_off = x_off;
     S.weights_off = weights_off;
     S.pool_off = pool_off;
+    // [A-RWK] pool 基址：显式传入（普通显存）或回退对称区 self+pool_off
+    S.pool_base = (pool_ptr != nullptr)
+                      ? pool_ptr
+                      : const_cast<uint8_t*>(self) + pool_off;
     S.w_off = w_off;
     S.meta_off = meta_off;
     S.bar_flags = bar_flags;
@@ -1033,9 +1038,12 @@ __device__ __forceinline__ void dispatch_pull_body(
     const bool one_window_per_expert = (s_cum[kEPR] == kEPR);
     S.afrag_ok = (ffn_hidden != nullptr) && (total_tasks <= (int)gridDim.x) &&
                  one_window_per_expert && afrag_fit;
+#ifdef NO_AFRAG
+    S.afrag_ok = false;   // [诊断] 关闭 ffn_hidden 槽 A-fragment（L1 回行主序）
+#endif
     // [OPT-AFRAG] 多窗口 fragment：afrag_ok 不成立但 host 提供专用缓冲时启用，
     //   使 A/f2 装载走 4-line fragment 布局（替换多窗口的行主序散射装载）。
-#ifdef CM_NO_FRAGALL
+#if defined(CM_NO_FRAGALL) || defined(NO_AFRAG)
     S.frag_all = false;
 #else
     S.frag_all = kFragCap && (frag_a != nullptr) && (frag2 != nullptr) &&

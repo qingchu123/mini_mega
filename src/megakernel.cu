@@ -71,6 +71,7 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.x_off = a.x_off;
     m.weights_off = a.weights_off;
     m.pool_off = a.pool_off;
+    m.pool_ptr = a.pool_ptr;
     m.w_off = a.w_off;
     m.meta_off = a.meta_off;
     m.max_spins = a.max_spins;
