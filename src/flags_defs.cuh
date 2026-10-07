@@ -39,7 +39,7 @@ constexpr int MX_FLAGS_NO_CACHE = 64;
 //   绝不能碰；ct2 是 M_CYCLE-2 轮前用过、早已结束的那一份，清它天然安全）。
 //   唯一正确性前提（host 契约）：所有 rank 的 launch 次数必须相同，使各 block /
 //   各 rank 的 c 同步前进。M_CYCLE>=3 是「预清 ct2 + 不碰 ct1」成立的前提。
-constexpr int M_CYCLE = 4;
+constexpr int M_CYCLE = 8;
 
 // 旧扁平 bar_flags 布局容量（与生产布局头同源）：
 //   kBarFlagsNumInt32=1024（普通旗区）、kFp8BarFlagsNumInt32=1032（+epoch/done 保留槽）
