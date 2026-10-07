@@ -147,13 +147,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("num_ranks"), py::arg("num_experts"),
         py::arg("num_max_tokens_per_rank"), py::arg("num_topk"),
         py::arg("hidden"), py::arg("intermediate_hidden"),
-        py::arg("expert_window"), py::arg("device") = -1,
-        py::return_value_policy::take_ownership);
+        py::arg("win_alloc"), py::arg("device") = -1,
+        // 所有权归 Python 侧显式管理：SymmBuffer.destroy() 调
+        // destroy_symm_buffer；若这里用 take_ownership，pybind 会在 _impl
+        // 包装对象被回收时再 delete 一次，导致 double free。
+        py::return_value_policy::reference);
   m.def("destroy_symm_buffer", &mxk::destroy_symm_buffer);
 
   m.def("fp8_mega_moe",
         [](torch::Tensor y_fp32, torch::Tensor l1, torch::Tensor l2,
-           mxk::SymmBuffer* buf, int64_t num_tokens, double activation_clamp) {
+           mxk::SymmBuffer* buf, int64_t num_tokens, double activation_clamp,
+           int64_t win_cap, int64_t merge_grid, bool use_frag,
+           int64_t skip_prologue) {
           TORCH_CHECK(y_fp32.is_cuda() &&
                           y_fp32.scalar_type() == torch::kFloat32,
                       "y_fp32 must be a CUDA float32 tensor");
@@ -166,11 +171,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           (void)activation_clamp;
           mxk::launch_fp8_mega_moe(buf, y_fp32.data_ptr<float>(),
                                    l1.data_ptr<uint8_t>(), l2.data_ptr<uint8_t>(),
-                                   num_tokens, current_stream());
+                                   num_tokens, current_stream(), win_cap,
+                                   merge_grid, use_frag, skip_prologue);
         },
         py::arg("y_fp32"), py::arg("l1_weights"), py::arg("l2_weights"),
         py::arg("sym_buffer"), py::arg("num_tokens"),
-        py::arg("activation_clamp") = 1e30);
+        py::arg("activation_clamp") = 1e30, py::arg("win_cap") = 0,
+        py::arg("merge_grid") = 0, py::arg("use_frag") = false,
+        py::arg("skip_prologue") = 0);
 
   // ---------------- mini_mega kernel 探针 ----------------
   m.def("mega_launch_empty",

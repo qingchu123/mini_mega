@@ -37,6 +37,22 @@ _SUPPORTED_MMA_TYPES = ("fp8xfp8",)
 # L1 gate/up 配对粒度 = kernel 的 l1_block_n（见 make_mega_args）。
 _L1_BLOCK_N = 256
 
+# kernel 常量（与 src/common.cuh 对齐）
+_KERNEL_RING = 8        # kRing：每专家窗口槽数
+_KERNEL_M_TILE = 16     # kM：M tile 行数（win_cap 对齐粒度）
+_KERNEL_GRID = 32       # kGrid：grid 块数（缺省 merge 上限）
+
+# 物理窗口容量缺省：与调用方逻辑窗口解耦，按最大值分配（AUTO 表最大 80、
+# 长尾自适应最大 64）；可用 MXK_WIN_PHYS 覆盖（不超过 EXPERT_WINDOW_MAX）。
+_WIN_PHYS_DEFAULT = min(EXPERT_WINDOW_MAX, max(
+    EXPERT_WINDOW_MIN,
+    int(os.environ.get("MXK_WIN_PHYS", EXPERT_WINDOW_MAX) or EXPERT_WINDOW_MAX)))
+
+
+def _resolve_win_phys(expert_window: int) -> int:
+    """逻辑窗口 → 物理容量：至少 _WIN_PHYS_DEFAULT，且不小于逻辑值。"""
+    return max(int(expert_window), _WIN_PHYS_DEFAULT)
+
 
 # ------------------------------------------------------------- 窗口选型（AUTO）
 _FP8_AUTO_WINDOW_TABLE_FP8XFP8 = (
@@ -94,9 +110,11 @@ def get_symm_buffer_size_for_mega_moe(
     win = expert_window or select_fp8_mega_moe_window(
         num_tokens or num_max_tokens_per_rank, num_topk, num_ranks, num_experts,
         mma_type)
+    # 与 SymmBuffer 的实际分配一致：按物理容量计算
     return int(_C.get_symm_buffer_size_for_mega_moe(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden,
-        intermediate_hidden, num_shared_experts, mma_type, num_tokens, win))
+        intermediate_hidden, num_shared_experts, mma_type, num_tokens,
+        _resolve_win_phys(win)))
 
 
 def _align(x: int, a: int) -> int:
@@ -166,14 +184,24 @@ class SymmBuffer:
         self.activation = activation
         self.world_size = world_size
         self.rank = rank
-        self.expert_window = int(expert_window)
+        self.expert_window = int(expert_window)   # 逻辑窗口（调用方/AUTO）
+        # 物理容量与逻辑窗口解耦：按最大窗口分配，逐 launch 可在
+        # [8, win_phys] 内自适应（长尾不均衡时用更大的 win_cap）。
+        self.win_phys = _resolve_win_phys(self.expert_window)
         self.grid_num_tokens = int(grid_num_tokens if grid_num_tokens is not None
                                    else num_max_tokens_per_rank)
         self.launch_count = 0
+        # 逐 launch 配置缓存 (win_cap, merge_grid, use_frag)：eager 阶段按真实
+        # 路由计算，capture 阶段复用（graph 内无法做 host 同步）。
+        self._launch_cfg = None
+        self._capture_node = 0
+        self._adapt_tick = 0
+        # [R38] 前序复用 opt-in：仅当调用方保证 graph 内各节点路由不变时开启。
+        self.prologue_reuse = False
 
         info = _C.get_symm_layout_for_mega_moe(
             world_size, num_experts, cap, num_topk, hidden, intermediate_hidden,
-            num_shared_experts, mma_type, self.expert_window)
+            num_shared_experts, mma_type, self.win_phys)
         (self.view_bytes, self.scratch_offset, self.scratch_bytes, self.sym_bytes,
          total_bytes, x_off, x_sf_off, topk_idx_off, topk_weights_off,
          route_slot_counts_off, src_index_table_off, expert_recv_counts_off,
@@ -225,7 +253,7 @@ class SymmBuffer:
         self._impl = _C.create_symm_buffer(
             self._sym_ptr, self._lf_ptr, self._rf_ptr, base_ptrs, rf_ptrs, rank,
             world_size, num_experts, cap, num_topk, hidden, intermediate_hidden,
-            self.expert_window, device)
+            self.win_phys, device)
 
         # ---- 输入视图 ----
         self.x = _view(self.buffer, torch.float8_e4m3fn, (cap, hidden), x_off)
@@ -235,9 +263,9 @@ class SymmBuffer:
         self.topk_weights = _view(self.buffer, torch.float32, (cap, num_topk),
                                   topk_weights_off)
         self.l1_acts = _view(self.buffer, torch.float8_e4m3fn,
-                             (self.expert_window, hidden), expert_tokens_off)
+                             (self.win_phys, hidden), expert_tokens_off)
         self.l2_acts = _view(self.buffer, torch.float8_e4m3fn,
-                             (self.expert_window, intermediate_hidden),
+                             (self.win_phys, intermediate_hidden),
                              token_route_weights_off)
         self.shared_l1_acts = self.x
         self.shared_l1_acts_sf = None
@@ -283,11 +311,78 @@ class SymmBuffer:
         self.topk_idx[:T].copy_(idx)
         self.topk_weights[:T].fill_(1.0 / max(1, self.num_topk))
         for _ in range(2):
+            # 建档预热不参与自适应：用逻辑窗口 + 缺省 merge + 无 frag，
+            # 避免合成均衡路由污染 _launch_cfg。
             _C.fp8_mega_moe(self._y_fp32, tl1.view(torch.uint8),
-                            tl2.view(torch.uint8), self._impl, T, 1e30)
+                            tl2.view(torch.uint8), self._impl, T, 1e30,
+                            int(self.expert_window), _KERNEL_GRID, False, 0)
             torch.cuda.synchronize()
         del l1, l2, tl1, tl2
         torch.cuda.empty_cache()
+
+    # ---------------------------------------------------------- 自适应发射配置
+    def _select_adaptive_cfg(self, num_tokens: int):
+        """按真实路由选择本次 launch 的 (win_cap, merge_grid, use_frag)。
+
+        与 C++ bench 的 tk 长尾判据逐式一致：
+          imbalanced = max_expert >= 3 * max(1, median(nonzero counts))
+          imbalanced: med>=32 → win=ceil(max/RING) else min(48, max)，
+                      再按 M tile 对齐；merge 不粗化；启用 A/f2 fragment。
+          否则：保持 AUTO 逻辑窗口 + 缺省粗化 + 不用 frag。
+        只在非 capture 路径做 host 同步；capture 用缓存值（无则回退缺省）。
+        """
+        base = (int(self.expert_window), _KERNEL_GRID, False)
+        if num_tokens <= 0 or self.group is None or self.world_size <= 1:
+            return base
+        if os.environ.get("MXK_ADAPTIVE", "1") == "0":
+            return base
+        every = max(1, int(os.environ.get("MXK_ADAPT_EVERY_N", "1") or 1))
+        self._adapt_tick += 1
+        if every > 1 and (self._adapt_tick - 1) % every != 0 and self._launch_cfg is not None:
+            return self._launch_cfg
+        counts = None
+        try:
+            e = int(self.num_experts)
+            idx = self.topk_idx[:num_tokens].reshape(-1)
+            idx = idx[(idx >= 0) & (idx < e)]   # 过滤 padding/-1 等非法 id
+            if hasattr(torch, "bincount"):
+                counts = torch.bincount(idx, minlength=e).to(torch.int64)[:e]
+            else:  # 兜底：bincount 不可用时 scatter_add
+                counts = torch.zeros(e, dtype=torch.int64, device=idx.device)
+                counts.scatter_add_(0, idx,
+                                    torch.ones_like(idx, dtype=torch.int64))
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=self.group)
+            max_expert = int(counts.max().item())
+            nz = counts[counts > 0]
+            med = int(nz.median().item()) if nz.numel() > 0 else 1
+            if max_expert >= 3 * max(1, med):
+                if med >= 32:
+                    tgt = (max_expert + _KERNEL_RING - 1) // _KERNEL_RING
+                else:
+                    tgt = min(48, max_expert)
+                tgt = ((tgt + _KERNEL_M_TILE - 1) // _KERNEL_M_TILE) * _KERNEL_M_TILE
+                win = max(EXPERT_WINDOW_MIN,
+                          min(int(self.win_phys), max(_KERNEL_M_TILE, tgt)))
+                cfg = (win, 0x3FFFFFFF, True)
+                self._launch_cfg = cfg
+                return cfg
+        except Exception:  # noqa: BLE001
+            return base
+        self._launch_cfg = base
+        return base
+
+    def launch_config(self, num_tokens: int):
+        """当前应使用的 (win_cap, merge_grid, use_frag, skip_prologue)。"""
+        capturing = _is_stream_capturing()
+        if capturing:
+            cfg = self._launch_cfg or (int(self.expert_window), _KERNEL_GRID,
+                                       False)
+            skip = 2 if (self.prologue_reuse and self._capture_node > 0) else 0
+            self._capture_node += 1
+            return cfg[0], cfg[1], cfg[2], skip
+        self._capture_node = 0
+        cfg = self._select_adaptive_cfg(int(num_tokens))
+        return cfg[0], cfg[1], cfg[2], 0
 
     def destroy(self):
         try:
@@ -444,6 +539,16 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
             f"num_tokens={num_tokens} exceeds capacity "
             f"{sym_buffer.num_max_tokens_per_rank}")
     clamp = 1e30 if activation_clamp is None else float(activation_clamp)
+    # 调用方显式 expert_window 作为逻辑窗口兜底（自适应/缓存优先级更高，
+    # 目的是调用方零改动也能走长尾快路径；可用 MXK_ADAPTIVE=0 关自适应）。
+    if expert_window is not None:
+        ew = int(expert_window)
+        if ew < EXPERT_WINDOW_MIN or ew > sym_buffer.win_phys:
+            raise ValueError(
+                f"expert_window={ew} 超出 [8, {sym_buffer.win_phys}]")
+        sym_buffer.expert_window = ew
+    # 逐 launch 配置：eager 按路由自适应，capture 复用缓存。
+    win_cap, merge_grid, use_frag, skip = sym_buffer.launch_config(num_tokens)
     # 首次 launch 兜底预热（建档预热失败时）：捕获中禁止，避免捕获流阻塞。
     if not getattr(sym_buffer, "_mega_moe_warmed", False):
         sym_buffer._mega_moe_warmed = True
@@ -452,11 +557,11 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
                 _C.fp8_mega_moe(
                     sym_buffer._y_fp32, l1_weights.view(torch.uint8),
                     l2_weights.view(torch.uint8), sym_buffer._impl, num_tokens,
-                    clamp)
+                    clamp, int(sym_buffer.expert_window), _KERNEL_GRID, False, 0)
                 torch.cuda.synchronize()
     _C.fp8_mega_moe(sym_buffer._y_fp32, l1_weights.view(torch.uint8),
                     l2_weights.view(torch.uint8), sym_buffer._impl, num_tokens,
-                    clamp)
+                    clamp, win_cap, merge_grid, use_frag, skip)
     sym_buffer.launch_count += 1
     if num_tokens > 0:
         y.copy_(sym_buffer._y_fp32[:num_tokens].to(torch.bfloat16))

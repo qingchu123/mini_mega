@@ -68,3 +68,12 @@ agent/opt-3/async
 - 主分支 `main` 仅由协调者或人类合并。
 
 - 每个 Agent 在自己的分支上频繁提交，提交信息需包含 `agent-id`。
+
+
+## 3. 临时文件和临时测试
+- 所有的临时文件和临时测试都应该放在 `.agents/work/<agent-id>/tmp/` 目录下，并且不应该提交到 git。
+- 不要在/tmp 或者 ~/tmp 目录写任何临时文件。可以放入.agents/work/<agent-id>/tmp/
+
+
+## 4. 临界资源的使用
+- 如果有多个agent使用临界资源 如 GPU，需要在本项目中持有.agents/work/lock/lock_gpu锁，避免争抢导致死锁。
