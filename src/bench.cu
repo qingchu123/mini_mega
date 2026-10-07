@@ -2336,7 +2336,10 @@ static int run_aligned(RunOpts o) {
                     const int wc_case = std::min(win_cap, c.win_cap);
                     fp8mega::MegaLaunchArgs a = make_mega_args(
                         o, L, r, wc_case, combine_f32_off);
-                    if (c.imbalanced) a.merge_grid = 0x3fffffff;  // [LONGTAIL] 不粗化
+                    // [BUGFIX 261007] 不粗化(merge=1)会跨波执行，多波下
+                    //   wait-all/分片旗存在陈旧读 → 结果错误（harness case 1
+                    //   rel_max_diff=0.229）。暂回退缺省单波粗化以恢复正确性。
+                    // if (c.imbalanced) a.merge_grid = 0x3fffffff;
                     while (go.load(std::memory_order_acquire) == 0) {}
                     bool cap = false;
                     // [R38] 跨 graph 节点前序复用：同 graph 内路由不变，仅首节点
