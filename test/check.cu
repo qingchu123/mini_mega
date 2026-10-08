@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <thread>
 #include <vector>
 
@@ -169,8 +170,78 @@ void run_eager(Env& e, const Spec& s, const mt::Routes& routes, std::vector<floa
     CHECK(mcMemcpy(y->data(), e.d.y, y->size() * sizeof(float), mcMemcpyDeviceToHost));
 }
 
+// L1 诊断（MT_L1_DIAG=1）：把「设备 pool 行」「本次用例真实输入行」「设备 ffn」三者分开核对。
+// 结论用途：判断 FAIL 来自 pool 内容（peer 写可见性/残留）还是 kernel 的 L1 计算。
+void l1_diag(Env& e, const Spec& s, const mt::Routes& routes, int ex, int rows,
+             const std::vector<uint8_t>& xd, const std::vector<uint8_t>& ffn_d) {
+    std::vector<std::pair<int, int>> pairs;   // 路由到专家 ex 的 (src, token)
+    for (int r = 0; r < e.R; ++r)
+        for (int t = 0; t < s.tokens; ++t)
+            for (int k = 0; k < kTopk; ++k)
+                if (routes[r][(size_t)t * kTopk + k] == ex) pairs.push_back({r, t});
+    auto hash_of = [](const uint8_t* p, size_t n) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < n; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ull;
+        }
+        return h;
+    };
+    auto xrow = [](int src, int t, uint8_t* out) {
+        for (int c = 0; c < kHidden; ++c)
+            out[c] = (uint8_t)((src * 37 + t * 7 + c * 3) & 0x3f);
+    };
+    std::unordered_map<uint64_t, std::vector<std::pair<int, int>>> exp_map;
+    for (const auto& pr : pairs) {
+        std::vector<uint8_t> row(kHidden);
+        xrow(pr.first, pr.second, row.data());
+        exp_map[hash_of(row.data(), row.size())].push_back(pr);
+    }
+    int hit = 0;
+    std::vector<std::pair<int, int>> pool_of((size_t)rows, {-1, -1});
+    for (int i = 0; i < rows; ++i) {
+        auto it = exp_map.find(hash_of(xd.data() + (size_t)i * kHidden, kHidden));
+        if (it != exp_map.end() && !it->second.empty()) {
+            ++hit;
+            pool_of[i] = it->second.back();
+            it->second.pop_back();
+        }
+    }
+    std::printf("    [L1diag] launch=%s expert=%d pairs=%d 核验=%d | pool 行命中本次真实输入=%d\n",
+                s.label.c_str(), ex, (int)pairs.size(), rows, hit);
+    // 用「真实输入行」重算 L1 参考，与设备 ffn 比较：若通过则 kernel 正确、问题在 pool 读出
+    std::vector<uint8_t> xd_true((size_t)rows * kHidden);
+    for (int i = 0; i < rows; ++i)
+        if (pool_of[i].first >= 0)
+            xrow(pool_of[i].first, pool_of[i].second, xd_true.data() + (size_t)i * kHidden);
+    std::vector<float> ref((size_t)rows * kIntermediate);
+    parallel_rows(rows, [&](int i) {
+        ref_l1(xd_true.data() + (size_t)i * kHidden, e.w1h.data(), 0, 1, kHidden,
+               kIntermediate, ref.data() + (size_t)i * kIntermediate);
+    });
+    std::vector<uint8_t> rq(ref.size());
+    ref_quantize_fp8(ref.data(), (long long)ref.size(), rq.data());
+    std::vector<float> rf(ref.size());
+    for (size_t i = 0; i < ref.size(); ++i) rf[i] = fp8_e4m3_decode(rq[i]);
+    print_check_stats("L1diag ffn(对真实输入行)", compare_fp8(ffn_d.data(), rf.data(),
+                                                            (int)rf.size(), 7e-2, 2e-3));
+    // 扫描 ffn 缓冲的全部 (expert, ring) 槽：找出哪一槽真的装着该参考输出
+    const int nslot = kEPR * kRing;
+    std::vector<uint8_t> all((size_t)nslot * s.win * kIntermediate);
+    CHECK(mcMemcpy(all.data(), e.d.ffn, all.size(), mcMemcpyDeviceToHost));
+    const size_t slot_b = (size_t)s.win * kIntermediate;
+    for (int sl = 0; sl < nslot; ++sl) {
+        const uint8_t* p = all.data() + (size_t)sl * slot_b;
+        const CheckStats st = compare_fp8(p, rf.data(), (int)rf.size(), 7e-2, 2e-3);
+        if (st.bad == 0)
+            std::printf("    [L1diag] ffn 匹配槽: slot=%d (expert=%d, ring=%d) "
+                        "我读的槽=%d (expert=%d, ring=%d)\n",
+                        sl, sl / kRing, sl % kRing, ex * kRing, ex, 0);
+    }
+}
+
 // --------------------------------------------- L1 / L2（expert0，rank0） --
-bool check_l1l2(Env& e, const Spec& s) {
+bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
     if (e.rank != 0) return true;
     const int win = s.win;
     // 选择 rank0 本地专家中收行最多者（专家 e 的 pool 槽 = e*kRing）
@@ -222,9 +293,11 @@ bool check_l1l2(Env& e, const Spec& s) {
     ref_quantize_fp8(ffn_exp.data(), (long long)ffn_exp.size(), ffn_q.data());
     std::vector<float> ffn_exp_f(ffn_exp.size());
     for (size_t i = 0; i < ffn_exp.size(); ++i) ffn_exp_f[i] = fp8_e4m3_decode(ffn_q[i]);
-    const CheckStats s1 = compare_fp8(ffn_d.data(), ffn_exp_f.data(),
+    const CheckStats s1 = compare_fp8(ffn_d.data(), ffn_exp_f.size() > 0 ? ffn_exp_f.data()
+                                                                        : nullptr,
                                       (int)ffn_exp_f.size(), 7e-2, 2e-3);
     print_check_stats("L1 ffn_hidden(expert0)", s1);
+    if (std::getenv("MT_L1_DIAG") != nullptr) l1_diag(e, s, routes, ex, rows, xd, ffn_d);
 
     // L2：CPU 参考（以设备 ffn 字节为输入）vs 各 block 的 l2_out 槽。
     // 每个 block 只写自己负责的 N-slice 列；对每个 slice 查找「存在一个 block 与参考一致」。
@@ -394,7 +467,7 @@ bool run_spec(Env& e, const Spec& s, const Flags& f) {
     if (f.eager || f.graph > 0) {
         run_eager(e, s, routes, &y);
         if (f.eager) {
-            r.l12 = agree(check_l1l2(e, s));
+            r.l12 = agree(check_l1l2(e, s, routes));
             const CheckStats red = check_reduce(e, s, routes, y);
             r.red = agree(red.pass());
             r.red_max_abs = agree_max(red.max_abs);

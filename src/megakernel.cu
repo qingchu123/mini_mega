@@ -73,9 +73,8 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     // REDUCE rel_max ≈ 1/8）。这里直接响亮失败，不再静默产出坏数据。
     if (a.slot_capacity != a.win_cap) {
         std::fprintf(stderr,
-            "[megakernel] slot_capacity=%d 与 win_cap=%d 不一致：此组合无效。\n"
-            "  前序 task_setup 与分派的窗口表对不上，结果不可信。请保持二者相等，\n"
-            "  或等待内核统一窗口口径后再用 win<slot 的配置。\n",
+            "[megakernel] slot_capacity=%d 与 win_cap=%d 不一致：当前组合会产生错误结果。\n"
+            "  请令 win_cap == slot_capacity（适配窗 win<slot 已知数值错误，见 test/mega_common.cuh 注释）。\n",
             a.slot_capacity, a.win_cap);
         std::exit(2);
     }
