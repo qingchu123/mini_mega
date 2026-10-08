@@ -45,6 +45,11 @@ setarch $(uname -m) -R bash scripts/build.sh   # -> ./megakernel.so + ./bench
 （位于 `/opt/maca/include`）。无需 torch / 容器。运行 `./bench` 时经 rpath
 `$ORIGIN` 自动加载同目录的 `./megakernel.so`。
 
+> 运行前必须 `export LD_LIBRARY_PATH=${MACA_PATH}/lib:${MACA_PATH}/ompi/lib:$LD_LIBRARY_PATH`：
+> 系统 `ld.so.cache` 中含 `/opt/maca-3.8.4/lib`，否则会与 `/opt/maca` 混版，
+> 报 `libmcpti.so: undefined symbol: TRACER_RECORD_NUM`。`scripts/build.sh`
+> 已内置该导出；`test/*/run.sh` 亦已内置。
+
 ## 测试（R=32 TPR=16/64/256）
 
 ```bash
