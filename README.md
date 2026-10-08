@@ -38,11 +38,25 @@ mini_mega/
 ## 构建
 
 ```bash
-setarch $(uname -m) -R bash scripts/build.sh   # -> ./megakernel.so + ./bench
+setarch $(uname -m) -R bash scripts/build.sh all   # -> ./megakernel.so + ./bench + ./mybench + torch/dist/*.whl
 ```
 
+`scripts/build.sh`（亦可 `./scripts/build`）支持目标参数，可多选：
+
+| 目标 | 产物 | 说明 |
+|---|---|---|
+| `so` | `megakernel.so` | host C++ 接口层 + kernel |
+| `bench` | `bench` | benchmark，只调接口，链接 megakernel.so |
+| `mybench` | `mybench` | 每进程一张卡的 MPI 基准 |
+| `whl` | `torch/dist/*.whl` | torch 层 wheel（需 python+torch，可用 `PYTHON=` 指定） |
+| `all` | 以上全部 | 等价 `so bench mybench whl` |
+| `-h` | 帮助 | 打印用法 |
+
+不带目标时等价 `all`；`bench`/`mybench`/`whl` 会自动先编 `so`。
+
 依赖：MACA（`MACA_PATH=/opt/maca`）、`cucc`、`mcr` 运行时、系统头 `cute`
-（位于 `/opt/maca/include`）。无需 torch / 容器。运行 `./bench` 时经 rpath
+（位于 `/opt/maca/include`）。`so`/`bench`/`mybench` 无需 torch / 容器，
+`whl` 目标需 python+torch。运行 `./bench` 时经 rpath
 `$ORIGIN` 自动加载同目录的 `./megakernel.so`。
 
 > 运行前必须 `export LD_LIBRARY_PATH=${MACA_PATH}/lib:${MACA_PATH}/ompi/lib:$LD_LIBRARY_PATH`：
