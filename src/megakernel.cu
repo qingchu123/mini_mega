@@ -68,6 +68,17 @@ namespace {
 
 // 公共 POD -> 设备入参（逐字段显式拷贝，避免依赖两份结构体布局一致）。
 MegaArgs to_mega_args(const MegaLaunchArgs& a) {
+    // [窗口口径守卫] task_setup 每专家窗口表按 slot_capacity 计算，dispatch 按 win_cap 计算；
+    // 两者不等会导致任务计数/窗口序号不一致——结果是错的（实测 imbalanced TK 下
+    // REDUCE rel_max ≈ 1/8）。这里直接响亮失败，不再静默产出坏数据。
+    if (a.slot_capacity != a.win_cap) {
+        std::fprintf(stderr,
+            "[megakernel] slot_capacity=%d 与 win_cap=%d 不一致：此组合无效。\n"
+            "  前序 task_setup 与分派的窗口表对不上，结果不可信。请保持二者相等，\n"
+            "  或等待内核统一窗口口径后再用 win<slot 的配置。\n",
+            a.slot_capacity, a.win_cap);
+        std::exit(2);
+    }
     MegaArgs m{};
     m.topk_idx = a.topk_idx;
     m.self = a.self;
