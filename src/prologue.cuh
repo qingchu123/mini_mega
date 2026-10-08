@@ -103,10 +103,10 @@
 // ---------------------------------------------------------------- ROUTE_BUILD --
 // 骨架 bench:190-224 逐条移植（仅 block0 调用；tid_base/smem_off 供 WS 子集）。
 __device__ __forceinline__ void route_build_body(
-        const int64_t* __restrict__ topk_idx, uint8_t* const* peer_bases, int R,
-        int rank, int tokens, int slot_capacity, int64_t src_off,
-        int64_t rsc_off, int tid_base = 0, int smem_off = 0,
-        unsigned long long* ctr = nullptr) {
+        const int64_t* __restrict__ topk_idx, const uint8_t* self,
+        int64_t rsc_off, ranks_data* const* remote_peers, int cycle, int R,
+        int rank, int tokens, int slot_capacity, int tid_base = 0,
+        int smem_off = 0, unsigned long long* ctr = nullptr) {
     extern __shared__ __align__(16) uint8_t smem_raw[];
     int* slots = reinterpret_cast<int*>(smem_raw + smem_off);
     const int E = R * kEPR;
@@ -153,10 +153,9 @@ __device__ __forceinline__ void route_build_body(
                 }
                 const int dst = e / kEPR;
                 const int le = e % kEPR;
-                uint32_t* dstpt = reinterpret_cast<uint32_t*>(
-                    peer_bases[dst] + src_off);
-                __stwt(dstpt + (size_t)(le * R + rank) * slot_capacity + slot,
-                       (uint32_t)idx);
+                uint32_t* dstpt =
+                    &remote_peers[dst]->src_index_table[cycle][le][rank][0];
+                __stwt(dstpt + slot, (uint32_t)idx);
             }
             __threadfence_system();
         } else if (tid < 64) {
@@ -174,10 +173,9 @@ __device__ __forceinline__ void route_build_body(
                 }
                 const int dst = e / kEPR;
                 const int le = e % kEPR;
-                uint32_t* dstpt = reinterpret_cast<uint32_t*>(
-                    peer_bases[dst] + src_off);
-                __stwt(dstpt + (size_t)(le * R + rank) * slot_capacity + slot,
-                       (uint32_t)idx);
+                uint32_t* dstpt =
+                    &remote_peers[dst]->src_index_table[cycle][le][rank][0];
+                __stwt(dstpt + slot, (uint32_t)idx);
             }
         }
     } else {
@@ -189,15 +187,14 @@ __device__ __forceinline__ void route_build_body(
             if (slot >= slot_capacity) continue;   // 超容量丢弃
             const int dst = e / kEPR;
             const int le = e % kEPR;
-            uint32_t* dstpt = reinterpret_cast<uint32_t*>(
-                peer_bases[dst] + src_off);
-            __stwt(dstpt + (size_t)(le * R + rank) * slot_capacity + slot,
-                   (uint32_t)idx);
+            uint32_t* dstpt =
+                &remote_peers[dst]->src_index_table[cycle][le][rank][0];
+            __stwt(dstpt + slot, (uint32_t)idx);
         }
         __threadfence_system();
     }
     __syncthreads();
-    int* rsc = reinterpret_cast<int*>(peer_bases[rank] + rsc_off);
+    int* rsc = reinterpret_cast<int*>(const_cast<uint8_t*>(self) + rsc_off);
     for (int e = tid; e < E; e += nthr) {
         const int c = slots[e];
         rsc[e] = c > slot_capacity ? slot_capacity : c;
@@ -208,8 +205,8 @@ __device__ __forceinline__ void route_build_body(
 // ------------------------------------------------------------ PUBLISH_COUNTS --
 // 骨架 bench:229-255 逐条移植（仅 block0 调用；行宽 recv_stride 由调用方保证）。
 __device__ __forceinline__ void publish_counts_body(
-        const uint8_t* self, uint8_t* const* peer_bases, int R, int rank,
-        int64_t rsc_off, int64_t recv_off, unsigned epoch,
+        const uint8_t* self, int64_t rsc_off, ranks_data* const* remote_peers,
+        int cycle, int R, int rank, unsigned epoch,
         int recv_stride = (int)((kEPR + 1 + 3) & ~3), int tid_base = 0,
         unsigned long long* ctr = nullptr) {
     const int E = R * kEPR;
@@ -221,17 +218,17 @@ __device__ __forceinline__ void publish_counts_body(
     for (int e = tid; e < E; e += nthr) {
         const int dst = e / kEPR;
         const int le = e % kEPR;
-        uint32_t* dstp = reinterpret_cast<uint32_t*>(peer_bases[dst] + recv_off);
+        uint32_t* dstp = &remote_peers[dst]->expert_recv_counts[cycle][rank][0];
         // 跨 rank 写：__stwt（write-through）；peer 可见性由骨架 peer_visibility 验证
-        __stwt(dstp + (size_t)rank * recv_stride + le, (uint32_t)rsc[e]);
+        __stwt(dstp + le, (uint32_t)rsc[e]);
     }
     for (int d = tid; d < R; d += nthr) {
         uint32_t csum = 0;
         for (int le = 0; le < kEPR; ++le)
             csum += (uint32_t)rsc[d * kEPR + le];
-        uint32_t* dstp = reinterpret_cast<uint32_t*>(peer_bases[d] + recv_off);
+        uint32_t* dstp = &remote_peers[d]->expert_recv_counts[cycle][rank][0];
         // 行尾校验槽：读者以 Σ+epoch==~csum 闭合远端写可见性
-        __stwt(dstp + (size_t)rank * recv_stride + kEPR, ~(csum + epoch));
+        __stwt(dstp + kEPR, ~(csum + epoch));
     }
 }
 
@@ -247,8 +244,8 @@ __device__ __forceinline__ uint32_t warp_sum_u32_64(uint32_t value, int lane) {
 // leader=block0（bench:443-588）：checksum → prefix_tbl → count/cum 窗口表 →
 // task_counter/l2_done 重置 → task_ready=epoch；非 leader 等 task_ready 后重建窗口表。
 __device__ __forceinline__ int task_setup_body(
-        const uint8_t* self, int R, int rank, int slot_capacity,
-        int64_t recv_off, int64_t prefix_off, local_flags* lf,
+        const uint8_t* self, const ranks_data* remote, int R, int rank,
+        int slot_capacity, int64_t prefix_off, local_flags* lf,
         int64_t task_ready_idx, int64_t task_counter_idx, int64_t l2_done_idx,
         int* out_total, int* dbg,
         int max_spins, int recv_stride = (int)((kEPR + 1 + 3) & ~3),
@@ -279,8 +276,7 @@ __device__ __forceinline__ int task_setup_body(
         MX_CTR_ADD(ctr, kCtrPhaseTaskSetup, 1);
         if (leader) MX_CTR_ADD(ctr, kCtrTaskSetupLeader, 1);
     }
-    volatile const uint32_t* recv =
-        reinterpret_cast<volatile const uint32_t*>(self + recv_off);
+    volatile const uint32_t* recv = remote->expert_recv_counts[cyc][0];
     int* prefix = prefix_ptr != nullptr
                       ? prefix_ptr
                       : reinterpret_cast<int*>(const_cast<uint8_t*>(self) +

@@ -26,6 +26,8 @@
 // 直接 include "flags_defs.cuh"。
 struct local_flags;
 struct ranks_flags;
+struct local_data;
+struct ranks_data;
 
 // 设备侧权重生成的值函数（host 参考与 device 生成必须逐字节一致，故同头共享）。
 // -DWPROBE=1 切到「非周期 + 小值」诊断模式（见 bench.cu 注释）。
@@ -64,6 +66,10 @@ struct MegaLaunchArgs {
     local_flags* lf = nullptr;             // 本 rank 私有旗区（普通显存）
     ranks_flags* rf = nullptr;             // 跨 rank 旗区（FG 显存）
     ranks_flags* const* rf_peers = nullptr;  // 各 rank ranks_flags 基址表
+    local_data* local = nullptr;             // 本 rank 非共享数据
+    local_data* const* local_peers = nullptr; // 各 rank local_data（self = local[rank]）
+    ranks_data* remote = nullptr;             // 本 rank 远端数据表
+    ranks_data* const* remote_peers = nullptr;  // 各 rank ranks_data 基址表
     int64_t xrelease_idx = 0, task_ready_idx = 0, task_counter_idx = 0,
             l2_done_idx = 0, slice_flags_idx = 0, l1_prog_idx = 0;
     int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;

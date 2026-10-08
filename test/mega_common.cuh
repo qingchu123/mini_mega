@@ -100,6 +100,8 @@ struct Dev {
     uint8_t* sym = nullptr;          // 对称区（FG）
     local_flags* lf = nullptr;       // 私有旗区
     ranks_flags* rf = nullptr;       // 跨 rank 旗区（FG）
+    ranks_data* rd = nullptr;        // 远端字段（FG）
+    ranks_data** d_rd = nullptr;     // 各 rank ranks_data 基址表（设备数组）
     uint8_t* w1 = nullptr;           // [EPR][2I][H] lane 序（设备生成）
     uint8_t* w2 = nullptr;           // [EPR][H][I] lane 序
     uint8_t* ffn = nullptr;          // [EPR][ring][win][I] FP8
@@ -108,7 +110,7 @@ struct Dev {
     std::vector<float*> ynode;       // graph 逐节点输出（同形状）
     uint8_t** d_base = nullptr;
     ranks_flags** d_rf = nullptr;
-    mcIpcMemHandle_t h{}, rh{};
+    mcIpcMemHandle_t h{}, rh{}, rdh{};
     mcStream_t st = nullptr;
     mcGraphExec_t exec = nullptr;
 };
@@ -154,6 +156,14 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     d.rf = static_cast<ranks_flags*>(rfp);
     CHECK(mcMemset(d.rf, 0, sizeof(ranks_flags)));
 
+    void* rdp = nullptr;
+    if (mcExtMallocWithFlags(&rdp, sizeof(ranks_data),
+                             mcDeviceMallocFinegrained) != mcSuccess ||
+        !rdp)
+        CHECK(mcMalloc(&rdp, sizeof(ranks_data)));
+    d.rd = static_cast<ranks_data*>(rdp);
+    CHECK(mcMemset(d.rd, 0, sizeof(ranks_data)));
+
     CHECK(mcMalloc((void**)&d.w1, (size_t)kEPR * 2 * kIntermediate * kHidden));
     CHECK(mcMalloc((void**)&d.w2, (size_t)kEPR * kHidden * kIntermediate));
     fp8mega::fill_weights_lane(d.w1, kEPR * 2 * kIntermediate, kHidden, 17u, 0);
@@ -176,23 +186,28 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     CHECK(mcStreamCreate(&d.st));
     CHECK(mcIpcGetMemHandle(&d.h, d.sym));
     CHECK(mcIpcGetMemHandle(&d.rh, d.rf));
+    CHECK(mcIpcGetMemHandle(&d.rdh, d.rd));
 }
 
 // MPI 交换 IPC 句柄，打开 peer，构造 d_base / d_rf 设备指针表。
 // 必须在所有 rank 的 alloc_dev 之后调用（内部含 MPI 集合通信）。
 inline void exchange_ipc(Dev& d, int R) {
-    std::vector<mcIpcMemHandle_t> all_h(R), all_rh(R);
+    std::vector<mcIpcMemHandle_t> all_h(R), all_rh(R), all_rdh(R);
     MPI_Allgather(&d.h, (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, all_h.data(),
                   (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, MPI_COMM_WORLD);
     MPI_Allgather(&d.rh, (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, all_rh.data(),
                   (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, MPI_COMM_WORLD);
+    MPI_Allgather(&d.rdh, (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, all_rdh.data(),
+                  (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, MPI_COMM_WORLD);
     CHECK(mcSetDevice(d.rank));
     std::vector<uint8_t*> bp(R);
     std::vector<ranks_flags*> rp(R);
+    std::vector<ranks_data*> rdp(R);
     for (int s = 0; s < R; ++s) {
         if (s == d.rank) {
             bp[s] = d.sym;
             rp[s] = d.rf;
+            rdp[s] = d.rd;
             continue;
         }
         void* q = nullptr;
@@ -201,6 +216,9 @@ inline void exchange_ipc(Dev& d, int R) {
         void* qr = nullptr;
         CHECK(mcIpcOpenMemHandle(&qr, all_rh[s], mcIpcMemLazyEnablePeerAccess));
         rp[s] = static_cast<ranks_flags*>(qr);
+        void* qd = nullptr;
+        CHECK(mcIpcOpenMemHandle(&qd, all_rdh[s], mcIpcMemLazyEnablePeerAccess));
+        rdp[s] = static_cast<ranks_data*>(qd);
     }
     for (int s = 0; s < R; ++s) {
         if (s == d.rank) continue;
@@ -212,6 +230,8 @@ inline void exchange_ipc(Dev& d, int R) {
     CHECK(mcMemcpy(d.d_base, bp.data(), R * sizeof(uint8_t*), mcMemcpyHostToDevice));
     CHECK(mcMalloc((void**)&d.d_rf, R * sizeof(ranks_flags*)));
     CHECK(mcMemcpy(d.d_rf, rp.data(), R * sizeof(ranks_flags*), mcMemcpyHostToDevice));
+    CHECK(mcMalloc((void**)&d.d_rd, R * sizeof(ranks_data*)));
+    CHECK(mcMemcpy(d.d_rd, rdp.data(), R * sizeof(ranks_data*), mcMemcpyHostToDevice));
 }
 
 // 上传本 rank 的路由并清零一次 launch 所需的全部状态（不清 ynode/y）。
@@ -221,15 +241,12 @@ inline void reset_dev(const Geo& g, const Dev& d, const Routes& routes, int toke
     CHECK(mcSetDevice(d.rank));
     CHECK(mcMemcpy(d.sym + L.topk_idx_off, route.data(), route.size() * sizeof(int64_t),
                    mcMemcpyHostToDevice));
-    CHECK(mcMemset(d.sym + L.src_index_table_off, 0, (size_t)L.src_index_table_bytes));
     CHECK(mcMemset(d.sym + L.route_slot_counts_off, 0, (size_t)g.R * kEPR * sizeof(int)));
-    CHECK(mcMemset(d.sym + L.expert_recv_counts_off, 0,
-                   (size_t)g.R * L.recv_stride * 4));
     CHECK(mcMemset(d.sym + L.prefix_tbl_off, 0, (size_t)L.prefix_tbl_bytes));
     CHECK(mcMemset(d.sym + L.barrier_slots_off, 0, (size_t)g.R * g.R * 4));
     CHECK(mcMemset(d.lf, 0, sizeof(local_flags)));
     CHECK(mcMemset(d.rf, 0, sizeof(ranks_flags)));
-    CHECK(mcMemset(d.sym + g.combine_off, 0, (size_t)kTopk * g.max_tokens * kHidden * 2));
+    CHECK(mcMemset(d.rd, 0, sizeof(ranks_data)));
     CHECK(mcMemset(d.ffn, 0, ffn_bytes(g)));
     CHECK(mcMemset(d.l2, 0, l2_bytes(g)));
     (void)tokens;
@@ -262,6 +279,8 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.lf = d.lf;
     a.rf = d.rf;
     a.rf_peers = d.d_rf;
+    a.remote = d.rd;
+    a.remote_peers = d.d_rd;
     a.xrelease_idx = kXreleaseIdx;
     a.task_ready_idx = kTaskReadyIdx;
     a.task_counter_idx = kTaskCounterIdx;

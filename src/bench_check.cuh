@@ -71,14 +71,19 @@ static std::vector<int64_t> make_routes(RoutePattern pat, int rank, int R,
 // ROUTE 校验：src_index_table 各 (le,src) 行 + 本地 route_slot_counts
 static bool validate_route(const ProdLayout& L, int R, int tokens, int rank,
                            const std::vector<std::vector<int64_t>>& routes,
-                           const uint8_t* sym, std::string* detail) {
+                           const uint8_t* sym, std::string* detail,
+                           const ranks_data* rd = nullptr) {
     const int E = R * kEPR;
-    const int cap = (int)L.slot_capacity;
+    const int cap = rd != nullptr ? kMaxTPR : (int)L.slot_capacity;
     std::vector<uint32_t> tbl((size_t)kEPR * R * cap, 0);
     std::vector<int> rsc(E, -1);
     CHECK(mcSetDevice(rank));
-    CHECK(mcMemcpy(tbl.data(), sym + L.src_index_table_off,
-                   tbl.size() * sizeof(uint32_t), mcMemcpyDeviceToHost));
+    if (rd != nullptr)
+        CHECK(mcMemcpy(tbl.data(), &rd->src_index_table[0][0][0][0],
+                       tbl.size() * sizeof(uint32_t), mcMemcpyDeviceToHost));
+    else
+        CHECK(mcMemcpy(tbl.data(), sym + L.src_index_table_off,
+                       tbl.size() * sizeof(uint32_t), mcMemcpyDeviceToHost));
     CHECK(mcMemcpy(rsc.data(), sym + L.route_slot_counts_off,
                    rsc.size() * sizeof(int), mcMemcpyDeviceToHost));
     std::vector<int> sent(E, 0);
@@ -143,14 +148,18 @@ static bool validate_publish(const ProdLayout& L, int R, int tokens, int rank,
                              const std::vector<std::vector<int64_t>>& routes,
                              const uint8_t* sym, unsigned epoch,
                              std::string* detail, int recv_stride,
-                             long long recv_off) {
+                             long long recv_off, const ranks_data* rd = nullptr) {
     const int E = R * kEPR;
     const int cap = (int)L.slot_capacity;
     if (recv_off < 0) recv_off = L.expert_recv_counts_off;
     std::vector<uint32_t> recv((size_t)R * recv_stride, 0);
     CHECK(mcSetDevice(rank));
-    CHECK(mcMemcpy(recv.data(), sym + recv_off,
-                   recv.size() * sizeof(uint32_t), mcMemcpyDeviceToHost));
+    if (rd != nullptr)
+        CHECK(mcMemcpy(recv.data(), &rd->expert_recv_counts[0][0][0],
+                       recv.size() * sizeof(uint32_t), mcMemcpyDeviceToHost));
+    else
+        CHECK(mcMemcpy(recv.data(), sym + recv_off,
+                       recv.size() * sizeof(uint32_t), mcMemcpyDeviceToHost));
     for (int src = 0; src < R; ++src) {
         std::vector<int> sent(E, 0);
         for (int64_t v : routes[src])

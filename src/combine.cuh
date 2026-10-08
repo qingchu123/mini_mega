@@ -111,6 +111,22 @@
 #define R30_DIAG_NOREAD 0
 #endif
 
+// combine_rows 指针（M_CYCLE 片）。数组→元素指针需要 reinterpret_cast。
+__device__ __forceinline__ uint16_t* cmb_rows(ranks_data* rd, int cycle) {
+    return reinterpret_cast<uint16_t*>(rd->combine_rows[cycle]);
+}
+__device__ __forceinline__ const uint16_t* cmb_rows(const ranks_data* rd,
+                                                    int cycle) {
+    return reinterpret_cast<const uint16_t*>(rd->combine_rows[cycle]);
+}
+// 兼容旧调用点（未提供 ranks_data 时回退到 sym + rows_off）。
+__device__ __forceinline__ uint16_t* cmb_rows_compat(
+        ranks_data* const* rp, uint8_t* const* pb, long long off, int src,
+        int cycle) {
+    if (rp != nullptr) return cmb_rows(rp[src], cycle);
+    return reinterpret_cast<uint16_t*>(const_cast<uint8_t*>(pb[src]) + off);
+}
+
 // ---------------------------------------------------------------------------
 // COMBINE 上下文（对应骨架 CombineCtx bench:1002-1013）
 //   meta/weights 指向本 block 的 staging 区（DISPATCH lane0 写入）：
@@ -126,6 +142,7 @@ struct CombineCtx {
     const int* meta = nullptr;          // staging 元数据视图（见上）
     const float* weights = nullptr;     // staging 权重视图（无效行 = 0）
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址（含 self）
+    ranks_data* const* remote_peers = nullptr;  // 各 rank ranks_data（含 self）
     long long rows_off = -1;            // 目标 rank combine_rows 区偏移（BF16）
     // 各 rank 的 ranks_flags（含 self）：combine_sums 完成标记区（FG 显存）
     ranks_flags* const* rf_peers = nullptr;
@@ -163,6 +180,8 @@ struct CombineFuseCtx {
     const int* meta = nullptr;       // staging 元数据视图
     const float* weights = nullptr;  // staging 权重视图（无效行 = 0）
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址（含 self）
+    ranks_data* const* remote_peers = nullptr;  // 各 rank ranks_data（含 self）
+    int cycle = 0;                   // [M_CYCLE] combine_rows 片
     long long rows_off = -1;         // 目标 rank combine_rows 区偏移（BF16）
     int combine_cap = 0;             // combine_rows 行容量（= max_tokens）
     int staging_cap = 0;             // staging 行容量（= win_capacity）
@@ -186,10 +205,8 @@ __device__ __forceinline__ void combine_push_one_row(
     const int stok = m[1];
     const int kk = m[2];
     const uint16_t* srow = out_h + stag * kHidden + col_lo;
-    uint16_t* drow_h = reinterpret_cast<uint16_t*>(
-                           const_cast<uint8_t*>(f.peer_bases[src]) +
-                           f.rows_off) +
-                       ((size_t)kk * f.combine_cap + stok) * kHidden + col_lo;
+    uint16_t* drow_h = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src, f.cycle) +
+        ((size_t)kk * kMaxTPR + stok) * kHidden + col_lo;
     for (int i = lane; i < nu4; i += 64) {
 #if R30_DIAG_NOREAD
         const uint4 v = make_uint4((unsigned)col_lo, (unsigned)s2,
@@ -258,22 +275,14 @@ __device__ __forceinline__ void combine_push_chunk_rows(
         const int src1 = m1[0], stok1 = m1[1], kk1 = m1[2];
         const int src2 = m2[0], stok2 = m2[1], kk2 = m2[2];
         const int src3 = m3[0], stok3 = m3[1], kk3 = m3[2];
-        uint16_t* d0 = reinterpret_cast<uint16_t*>(
-                           const_cast<uint8_t*>(f.peer_bases[src0]) +
-                           f.rows_off) +
-                       ((size_t)kk0 * f.combine_cap + stok0) * kHidden + col_lo;
-        uint16_t* d1 = reinterpret_cast<uint16_t*>(
-                           const_cast<uint8_t*>(f.peer_bases[src1]) +
-                           f.rows_off) +
-                       ((size_t)kk1 * f.combine_cap + stok1) * kHidden + col_lo;
-        uint16_t* d2 = reinterpret_cast<uint16_t*>(
-                           const_cast<uint8_t*>(f.peer_bases[src2]) +
-                           f.rows_off) +
-                       ((size_t)kk2 * f.combine_cap + stok2) * kHidden + col_lo;
-        uint16_t* d3 = reinterpret_cast<uint16_t*>(
-                           const_cast<uint8_t*>(f.peer_bases[src3]) +
-                           f.rows_off) +
-                       ((size_t)kk3 * f.combine_cap + stok3) * kHidden + col_lo;
+        uint16_t* d0 = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src0, f.cycle) +
+            ((size_t)kk0 * kMaxTPR + stok0) * kHidden + col_lo;
+        uint16_t* d1 = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src1, f.cycle) +
+            ((size_t)kk1 * kMaxTPR + stok1) * kHidden + col_lo;
+        uint16_t* d2 = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src2, f.cycle) +
+            ((size_t)kk2 * kMaxTPR + stok2) * kHidden + col_lo;
+        uint16_t* d3 = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src3, f.cycle) +
+            ((size_t)kk3 * kMaxTPR + stok3) * kHidden + col_lo;
         const uint16_t* s0 = out_h + stag * kHidden + col_lo;
 #if R30_PUSHSTRIDE
         const uint16_t* s1 = out_h + st1 * kHidden + col_lo;
@@ -358,10 +367,8 @@ __device__ __forceinline__ void combine_push_warp_cols(
         if (f.weights[stag] == 0.0f) continue;
         const int* m = f.meta + stag * 3;
         const uint16_t* srow = out_h + stag * kHidden;
-        uint16_t* drow = reinterpret_cast<uint16_t*>(
-                             const_cast<uint8_t*>(f.peer_bases[m[0]]) +
-                             f.rows_off) +
-                         ((size_t)m[2] * f.combine_cap + m[1]) * kHidden;
+        uint16_t* drow = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, m[0], f.cycle) +
+            ((size_t)m[2] * kMaxTPR + m[1]) * kHidden;
         for (int q = 0; q < nb; ++q) {
             const int col = (g0 + q) * block_n + warp * n_per_warp + j * 8;
             const uint4 v = *reinterpret_cast<const uint4*>(srow + col);
@@ -441,10 +448,8 @@ __device__ __forceinline__ void combine_push_pair(
         const int stok = m[1];   // 源 token
         const int kk = m[2];     // topk 槽
         const uint16_t* srow = out_h + stag * kHidden;
-        uint16_t* drow_h = reinterpret_cast<uint16_t*>(
-                               const_cast<uint8_t*>(c.peer_bases[src]) +
-                               c.rows_off) +
-                           ((size_t)kk * c.combine_cap + stok) * kHidden;
+        uint16_t* drow_h = cmb_rows_compat(c.remote_peers, c.peer_bases, c.rows_off, src, c.cycle) +
+            ((size_t)kk * kMaxTPR + stok) * kHidden;
         for (int i = lane; i < n8s; i += 64) {   // 每 lane 3 个 uint4（1536 列）
             const int col = c0s + i * 8;
             const uint4 v = *reinterpret_cast<const uint4*>(srow + col);
@@ -473,8 +478,8 @@ __device__ __forceinline__ void combine_push_pair(
 //   等待放行判据：sums 标记 >= epoch（单调）；无效 k 不等待、不累加。
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void reduce_body(
-        const uint8_t* self, float* y, int R, int tokens, int combine_cap,
-        long long combine_rows_off,
+        const uint8_t* self, const ranks_data* remote, float* y, int R,
+        int tokens, int combine_cap, long long combine_rows_off,
         long long topk_idx_off, long long weights_off,
         local_flags* lf, ranks_flags* rf, long long task_ready_idx,
         int max_spins, int sums_stride, unsigned long long* ctr = nullptr) {
@@ -495,8 +500,9 @@ __device__ __forceinline__ void reduce_body(
     const int64_t* topk_idx =
         reinterpret_cast<const int64_t*>(self + topk_idx_off);
     const float* weights = reinterpret_cast<const float*>(self + weights_off);
-    const uint16_t* rows_h =
-        reinterpret_cast<const uint16_t*>(self + combine_rows_off);
+    const uint16_t* rows_h = remote != nullptr
+        ? cmb_rows(remote, cyc)
+        : reinterpret_cast<const uint16_t*>(self + combine_rows_off);
     const int tid = (int)threadIdx.x;
     // 每 token 2 个 block（列分半），grid=kGrid=32 覆盖 TPR=16 的 32 个半区
     const int token = (int)blockIdx.x / 2;
@@ -554,7 +560,7 @@ __device__ __forceinline__ void reduce_body(
             const uint16_t* ptrs[kTopk];
             #pragma unroll
             for (int k = 0; k < kTopk; ++k)
-                ptrs[k] = rows_h + ((size_t)(ok8[k] ? k : 0) * combine_cap +
+                ptrs[k] = rows_h + ((size_t)(ok8[k] ? k : 0) * kMaxTPR +
                                     token) * kHidden + c;
             uint4 raw[kTopk];
             #pragma unroll

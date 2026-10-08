@@ -279,6 +279,8 @@ __device__ __forceinline__ R19Frag r19_load_a2_frag(
 // 避免大参数表经 ABI 展开（也便于两个任务体共享）。
 struct R19Sched {
     const uint8_t* self;
+    const ranks_data* remote;   // 本 rank ranks_data（src_index_table 等）
+    int cycle;                  // [M_CYCLE] 本轮远端片
     uint8_t* const* peer_bases;
     int R, rank;
     int win_cap, pool_stride, tbl_cap, k_in, topk, ring;
@@ -1099,7 +1101,7 @@ __device__ __forceinline__ void r19_pull_flags(
     float* wt = reinterpret_cast<float*>(const_cast<uint8_t*>(S.self) + S.w_off);
     int* meta = reinterpret_cast<int*>(const_cast<uint8_t*>(S.self) + S.meta_off);
     const uint32_t* src_tbl =
-        reinterpret_cast<const uint32_t*>(S.self + S.src_off);
+        &S.remote->src_index_table[S.cycle][0][0][0];
     const bool kTick = (S.pt != nullptr) && (blockIdx.x == 0) && (task == 0) &&
                        (tid == 0);
     // ---- 行均分 K 片 pull：半 warp 一行（8 warp × 2 行并行），staging 写 weights/meta
@@ -1136,7 +1138,7 @@ __device__ __forceinline__ void r19_pull_flags(
         while (src + 1 < S.R && pfx[src + 1] <= global_row) ++src;
         const int slot_in_rank = global_row - pfx[src];
         const uint32_t encoded =
-            src_tbl[(size_t)(e * S.R + src) * S.tbl_cap + slot_in_rank];
+            src_tbl[(size_t)(e * S.R + src) * kMaxTPR + slot_in_rank];
         const int src_token = (int)(encoded / (uint32_t)S.topk);
         const bool valid = src_token >= 0 && src_token < S.tbl_cap;
         uint4* dstp = reinterpret_cast<uint4*>(

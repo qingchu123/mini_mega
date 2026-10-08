@@ -68,13 +68,13 @@ namespace {
 
 // 公共 POD -> 设备入参（逐字段显式拷贝，避免依赖两份结构体布局一致）。
 MegaArgs to_mega_args(const MegaLaunchArgs& a) {
-    // [窗口口径守卫] task_setup 每专家窗口表按 slot_capacity 计算，dispatch 按 win_cap 计算；
-    // 两者不等会导致任务计数/窗口序号不一致——结果是错的（实测 imbalanced TK 下
-    // REDUCE rel_max ≈ 1/8）。这里直接响亮失败，不再静默产出坏数据。
+    // [窗口口径守卫] 当前 win_cap < slot_capacity 时 REDUCE/combine 协议仍不正确
+    // （实测 804900 win=48 slot=512 时 eager REDUCE/graph 失败）。先响亮失败，
+    // 避免静默产出坏数据；待窗口化 combine_rows 协议修好后再放开。
     if (a.slot_capacity != a.win_cap) {
         std::fprintf(stderr,
             "[megakernel] slot_capacity=%d 与 win_cap=%d 不一致：当前组合会产生错误结果。\n"
-            "  请令 win_cap == slot_capacity（适配窗 win<slot 已知数值错误，见 test/mega_common.cuh 注释）。\n",
+            "  请令 win_cap == slot_capacity（适配窗 win<slot 已知数值错误）。\n",
             a.slot_capacity, a.win_cap);
         std::exit(2);
     }
@@ -100,6 +100,10 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.lf = a.lf;
     m.rf = a.rf;
     m.rf_peers = a.rf_peers;
+    m.local = a.local;
+    m.local_peers = a.local_peers;
+    m.remote = a.remote;
+    m.remote_peers = a.remote_peers;
     m.xrelease_idx = a.xrelease_idx;
     m.task_ready_idx = a.task_ready_idx;
     m.task_counter_idx = a.task_counter_idx;
@@ -189,8 +193,8 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
 
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
     mega_reduce_kernel<<<2 * a.tokens, 256, 0, stream>>>(
-        a.self, a.y, a.R, a.tokens, a.combine_cap, a.combine_rows_off,
-        a.topk_idx_off, a.weights_off, a.lf, a.rf,
+        a.self, a.remote, a.y, a.R, a.tokens, a.combine_cap,
+        a.combine_rows_off, a.topk_idx_off, a.weights_off, a.lf, a.rf,
         a.task_ready_idx, a.max_spins, a.sums_stride);
 }
 

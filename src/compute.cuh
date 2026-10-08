@@ -888,7 +888,8 @@ struct NoTaskTail {
 template <typename TaskTail = NoTaskTail, bool kSmallOnly = false,
           bool kFragCap = false, int kCap = 0>
 __device__ __forceinline__ void dispatch_pull_body(
-        const uint8_t* self, uint8_t* const* peer_bases, int R, int rank,
+        const uint8_t* self, const ranks_data* remote, int cycle,
+        uint8_t* const* peer_bases, int R, int rank,
         int win_cap, int pool_stride, int tbl_cap, int k_in, int topk, int ring,
         int64_t prefix_off, int64_t src_off, int64_t x_off, int64_t weights_off,
         int64_t pool_off, int64_t w_off, int64_t meta_off,
@@ -964,6 +965,8 @@ __device__ __forceinline__ void dispatch_pull_body(
     // 任务体调度参数（循环不变量打包，按 const& 传给两个 noinline 任务体）
     R19Sched S;
     S.self = self;
+    S.remote = remote;
+    S.cycle = cycle;
     S.peer_bases = peer_bases;
     S.R = R;
     S.rank = rank;

@@ -143,10 +143,12 @@ bool run_l0(Env& e, const Spec& s, const mt::Routes& routes) {
     ProdLayout Lc = e.geo.L;
     Lc.win_capacity = e.geo.max_tokens;
     std::string msg;
-    bool ok = validate_route(Lc, e.R, s.tokens, e.rank, routes, e.d.sym, &msg);
+    bool ok = validate_route(Lc, e.R, s.tokens, e.rank, routes, e.d.sym, &msg,
+                             e.d.rd);
     if (ok)
         ok = validate_publish(Lc, e.R, s.tokens, e.rank, routes, e.d.sym, kPublishEpoch,
-                              &msg, (int)Lc.recv_stride, Lc.expert_recv_counts_off);
+                              &msg, (int)Lc.recv_stride, Lc.expert_recv_counts_off,
+                              e.d.rd);
     if (ok) {
         std::vector<int> ts(kGrid, 0);
         CHECK(mcSetDevice(e.rank));
@@ -341,12 +343,15 @@ CheckStats check_reduce(Env& e, const Spec& s, const mt::Routes& routes,
     const int T = s.tokens;
     const int E = e.R * kEPR;
     CHECK(mcSetDevice(e.rank));
-    // combine_rows 为 [topk][max_tokens][H]；紧凑为 [topk][T][H] 供 ref_reduce
+    // combine_rows 为 [topk][kMaxTPR][H]；紧凑为 [topk][T][H] 供 ref_reduce。
+    // eager 单 launch：reset 后 current_time[0][1]=1，REDUCE 片 = 0。
+    const int cyc_rows = 0;
     std::vector<uint8_t> rows_h((size_t)kTopk * T * kHidden * 2);
+    const uint8_t* rows_dev =
+        reinterpret_cast<const uint8_t*>(e.d.rd->combine_rows[cyc_rows]);
     for (int k = 0; k < kTopk; ++k)
         CHECK(mcMemcpy(rows_h.data() + (size_t)k * T * kHidden * 2,
-                       e.d.sym + e.geo.combine_off +
-                           (size_t)k * e.geo.max_tokens * kHidden * 2,
+                       rows_dev + (size_t)k * kMaxTPR * kHidden * 2,
                        (size_t)T * kHidden * 2, mcMemcpyDeviceToHost));
     std::vector<float> w_h((size_t)T * kTopk);
     CHECK(mcMemcpy(w_h.data(), e.d.sym + L.topk_weights_off, w_h.size() * sizeof(float),
@@ -659,7 +664,8 @@ int main(int argc, char** argv) {
     // 冷启动预热（不计入结果）
     const auto t_warm0 = std::chrono::steady_clock::now();
     {
-        const Spec warm = mt::balanced_spec(R, 16);
+        Spec warm = mt::balanced_spec(R, 16);
+        warm.win = mt::choose_win_cap_counts(warm.per_expert, e.geo.max_tokens);
         mt::Routes wr = mt::balanced_routes(R, 16);
         std::vector<float> y;
         run_eager(e, warm, wr, &y);

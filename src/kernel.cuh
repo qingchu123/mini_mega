@@ -39,6 +39,10 @@ struct MegaArgs {
     local_flags* lf;               // flag 区（本 rank 私有，普通显存）
     ranks_flags* rf;               // 跨 rank flag 区（FG 显存）
     ranks_flags* const* rf_peers;  // 各 rank ranks_flags 基址表（设备数组，含 self）
+    local_data* local;             // 本 rank 非共享数据
+    local_data* const* local_peers; // 各 rank local_data（self = local[rank]）
+    ranks_data* remote;             // 本 rank 远端数据表
+    ranks_data* const* remote_peers;  // 各 rank ranks_data 基址表
     int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
     int64_t slice_flags_idx, l1_prog_idx;
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
@@ -143,10 +147,10 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
                                                    uint8_t* frag2 = nullptr,
                                                    unsigned long long* ctr = nullptr) {
     dispatch_pull_body<TaskTail, kSmallOnly, kFragCap, kCap>(
-        a.self, a.peer_bases, a.R, a.rank, a.win_cap, a.pool_stride,
-        a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off, a.src_off, a.x_off,
-        a.weights_off, a.pool_off, a.w_off, a.meta_off, a.pool_ptr,
-        a.lf->bar[cycle],
+        a.self, a.remote, cycle, a.peer_bases, a.R, a.rank, a.win_cap,
+        a.pool_stride, a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off,
+        a.src_off, a.x_off, a.weights_off, a.pool_off, a.w_off, a.meta_off,
+        a.pool_ptr, a.lf->bar[cycle],
         a.task_counter_idx, a.l2_done_idx, a.task_ready_idx, a.slice_flags_idx,
         a.l1_prog_idx, a.lf->out_processed, a.lf->dbg, a.max_spins, a.w1,
         a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.lf->l1_chk, a.w2,
@@ -197,11 +201,15 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     if (!a.skip_prologue) {
         // 1) PROLOGUE：ROUTE_BUILD + PUBLISH_COUNTS（仅 block0）
         if (blockIdx.x == 0) {
-            route_build_body(a.topk_idx, a.peer_bases, a.R, a.rank, a.tokens,
-                             a.tbl_cap, a.src_off, a.rsc_off, 0, 0, ctr);
+            const int route_cycle =
+                (int)(a.lf->current_time[0][0] % M_CYCLE);
+            route_build_body(a.topk_idx, a.self, a.rsc_off, a.remote_peers,
+                             route_cycle, a.R, a.rank, a.tokens,
+                             a.slot_capacity, 0, 0, ctr);
             if (kTick) a.lf->pre_ticks[0] = clock64();
-            publish_counts_body(a.self, a.peer_bases, a.R, a.rank, a.rsc_off,
-                                a.recv_off, a.publish_epoch, a.recv_stride, 0, ctr);
+            publish_counts_body(a.self, a.rsc_off, a.remote_peers, route_cycle,
+                                a.R, a.rank, a.publish_epoch, a.recv_stride, 0,
+                                ctr);
             if (kTick) a.lf->pre_ticks[1] = clock64();
         }
     } else {
@@ -226,7 +234,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
         task_setup_light_body(a.lf, a.task_ready_idx, a.task_counter_idx,
                               a.l2_done_idx, a.max_spins, a.lf->dbg);
     } else {
-        task_setup_body(a.self, a.R, a.rank, a.slot_capacity, a.recv_off,
+        task_setup_body(a.self, a.remote, a.R, a.rank, a.slot_capacity,
                         a.prefix_off, a.lf, a.task_ready_idx,
                         a.task_counter_idx, a.l2_done_idx,
                         a.lf->out_total, a.lf->dbg, a.max_spins,
@@ -254,6 +262,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.weights =
                     reinterpret_cast<const float*>(a.self + a.w_off);
                 tail.ctx.peer_bases = a.peer_bases;
+                tail.ctx.remote_peers = a.remote_peers;
                 tail.ctx.rf_peers = a.rf_peers;
                 tail.ctx.rows_off = a.combine_rows_off;
                 tail.ctx.staging_cap = a.win_cap;
@@ -269,6 +278,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.fuse.meta = tail.ctx.meta;
                 tail.fuse.weights = tail.ctx.weights;
                 tail.fuse.peer_bases = tail.ctx.peer_bases;
+                tail.fuse.remote_peers = a.remote_peers;
+                tail.fuse.cycle = cyc;
                 tail.fuse.rows_off = tail.ctx.rows_off;
                 tail.fuse.combine_cap = tail.ctx.combine_cap;
                 tail.fuse.staging_cap = tail.ctx.staging_cap;
@@ -303,7 +314,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
 // [集71] 末尾两个参数为带默认值的可选项：老调用点（bench.cu）不传即 nullptr，
 //        编译期 MX_DBG_COUNT=0 时统计代码整体消除。
 __global__ void __launch_bounds__(256) mega_reduce_kernel(
-                                   const uint8_t* self, float* y, int R,
+                                   const uint8_t* self, const ranks_data* remote,
+                                   float* y, int R,
                                    int tokens, int combine_cap,
                                    int64_t rows_off,
                                    int64_t topk_idx_off, int64_t weights_off,
@@ -316,7 +328,7 @@ __global__ void __launch_bounds__(256) mega_reduce_kernel(
                                    int dbg_count = 0
 #endif
 ) {
-    reduce_body(self, y, R, tokens, combine_cap, rows_off,
+    reduce_body(self, remote, y, R, tokens, combine_cap, rows_off,
                 topk_idx_off, weights_off, lf, rf, task_ready_idx,
                 max_spins, sums_stride
 #if MX_DBG_COUNT
