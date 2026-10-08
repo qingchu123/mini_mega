@@ -106,7 +106,7 @@ struct CombineTail {
         if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrCombineExec, 1);
         CombineCtx c = ctx;
         c.slice = d.slice;
-        c.epoch = d.epoch;
+        // epoch 已在 ctx 里按 64 位 current_time 设定
         c.nslice_eff = d.nslice_eff;   // [R35] 粗化几何
         c.merge = d.merge;
         const int lane = (int)(threadIdx.x % 64);
@@ -270,6 +270,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.combine_cap = a.combine_cap;
                 tail.ctx.block_idx = (int)blockIdx.x;
                 tail.ctx.cycle = cyc;   // [M_CYCLE] combine_sums 片
+                tail.ctx.epoch = (uint64_t)a.lf->current_time[0][1];
                 tail.out_base = reinterpret_cast<const uint8_t*>(a.l2_out);
                 tail.nwarps = 8;
                 tail.sums_stride = a.sums_stride;
@@ -293,6 +294,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.combine_cap = a.combine_cap;
                 tail.ctx.block_idx = (int)blockIdx.x;
                 tail.ctx.cycle = cyc;   // [M_CYCLE]（combine 关闭，仅占位）
+                tail.ctx.epoch = (uint64_t)a.lf->current_time[0][1];
                 tail.out_base = nullptr;
                 tail.nwarps = 8;
                 tail.sums_stride = a.sums_stride;

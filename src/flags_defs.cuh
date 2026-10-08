@@ -85,7 +85,7 @@ struct alignas(256) ranks_flags {
     // 取代原 sym::combine_sums（uint32 区）；行 stride = kMaxCombineRows。
     // combine_rows（BF16 数据）仍留在 sym，不在此。
     // [M_CYCLE] 旋转维：本轮只用 copy c（±2MB/rank，可接受）。
-    alignas(256) uint32_t
+    alignas(256) uint64_t
         combine_sums[M_CYCLE][kTopk][kMaxCombineRows][kCombineSlicesMax];
 };
 

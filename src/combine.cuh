@@ -146,7 +146,7 @@ struct CombineCtx {
     long long rows_off = -1;            // 目标 rank combine_rows 区偏移（BF16）
     // 各 rank 的 ranks_flags（含 self）：combine_sums 完成标记区（FG 显存）
     ranks_flags* const* rf_peers = nullptr;
-    uint32_t epoch = 0;                 // 本窗 epoch（= bar_flags[task_ready]）
+    uint64_t epoch = 0;                 // 本窗 64 位 epoch（= current_time）
     int slice = 0;                      // 本 block 任务切片号 [0, kNSlice)
     int block_idx = 0;                  // staging 块号（= blockIdx.x）
     int staging_cap = 0;                // staging 行容量（= win_capacity）
@@ -408,7 +408,7 @@ __device__ __forceinline__ void combine_mark_rows(
             // nslice_eff 等待时会漏槽超时（win_cap<max_tokens 时各 rank 的
             // nslice_eff 不一致的核心根因）。物理 slice 覆盖逻辑
             // [c.slice*c.merge, c.slice*c.merge + c.merge)。
-            uint32_t* base = &c.rf_peers[src]
+            uint64_t* base = &c.rf_peers[src]
                                   ->combine_sums[c.cycle][kk][stok]
                                   [c.slice * c.merge];
             for (int mi = 0; mi < c.merge; ++mi) __stwt(base + mi, c.epoch);
@@ -459,7 +459,7 @@ __device__ __forceinline__ void combine_push_pair(
         // [FIX-NSE] 写满本物理任务覆盖的全部逻辑 slice（merge 个），与
         // combine_mark_rows 同因：保证任意源 rank 按其 nslice_eff 等待都不漏槽。
         if (lane == 0) {
-            uint32_t* base = &c.rf_peers[src]
+            uint64_t* base = &c.rf_peers[src]
                                   ->combine_sums[c.cycle][kk][stok]
                                   [c.slice * c.merge];
             for (int mi = 0; mi < c.merge; ++mi) __stwt(base + mi, c.epoch);
@@ -495,8 +495,8 @@ __device__ __forceinline__ void reduce_body(
         if (blockIdx.x == 0) MX_CTR_ADD(ctr, kCtrReduceLaunch, 1);
         MX_CTR_ADD(ctr, kCtrReduceBlock, 1);
     }
-    const uint32_t epoch =
-        *reinterpret_cast<volatile const uint32_t*>(bar_flags + task_ready_idx);
+    // 64 位 epoch：mega 的 task_setup 已把 current_time[0][1] 增至本轮值。
+    const uint64_t epoch = (uint64_t)lf->current_time[0][1];
     const int64_t* topk_idx =
         reinterpret_cast<const int64_t*>(self + topk_idx_off);
     const float* weights = reinterpret_cast<const float*>(self + weights_off);
@@ -533,7 +533,7 @@ __device__ __forceinline__ void reduce_body(
             const int k = tid / ns_eff;
             const int s2 = tid % ns_eff;
             if (ok8[k]) {
-                const volatile uint32_t* part =
+                const volatile uint64_t* part =
                     &rf->combine_sums[cyc][k][token][0];
                 long long spin = 0;
                 // [集71] REDUCE 等待轮次（每 (k,slice) 标记一次）
