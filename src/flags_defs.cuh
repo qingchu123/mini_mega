@@ -88,3 +88,52 @@ struct alignas(256) ranks_flags {
     alignas(256) uint32_t
         combine_sums[M_CYCLE][kTopk][kMaxCombineRows][kCombineSlicesMax];
 };
+
+// ---- 本 rank 私有（普通显存）----
+struct alignas(256) local_data {
+    // 输入复用
+    alignas(256) uint8_t x[kMaxTPR][kHidden];
+    alignas(256) int64_t topk_idx[kMaxTPR][kTopk];
+    alignas(256) uint8_t topk_weights[kMaxTPR][kTopk];
+
+    // 内部使用
+    alignas(256) int32_t route_slot_counts[kRanks * kEPR];
+    alignas(256) int32_t prefix_tbl[kEPR][kRanks + 1];
+    alignas(256) int8_t expert_tokens[kEPR* kRing][kMaxWin][kHidden];
+    alignas(256) float token_route_weights[kEPR + kGrid][kMaxWin];
+    alignas(256) int token_src_meta[kEPR + kGrid][kMaxWin][3];
+
+
+    alignas(256) uint8_t w1[kEPR][2*kIntermediate][kHidden];
+    alignas(256) uint8_t w2[kEPR][kHidden][kIntermediate];
+    alignas(256) uint8_t ffn_hidden[kEPR * kRing][2*kMaxWin][kIntermediate];
+    alignas(256) uint16_t l2_out[kGrid][2*kMaxWin][kHidden];
+    alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden/32) * ((kMaxWin + 15) / 16) * 512];
+    alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate/32) * ((kMaxWin + 15) / 16) * 512];
+    alignas(256) uint8_t y[kMaxTPR][kHidden];
+    alignas(256) uint8_t ynode[kMaxTPR][kHidden]; //for debug
+};
+
+// ---- 本 rank 私有（普通显存）----
+struct alignas(256) rwk_data {
+    local_flags lf;
+    local_data ld;
+};
+
+
+// ---- 跨 rank（FG 显存，peer 可写）----
+struct alignas(256) ranks_data {
+
+    alignas(256) uint32_t src_index_table[M_CYCLE][kEPR][kRanks][kMaxTPR];
+    alignas(256) uint32_t expert_recv_counts[M_CYCLE][kRanks][(((kEPR + 1) + 3) / 4) * 4];
+    alignas(256) uint16_t combine_rows[M_CYCLE][kTopk][kMaxTPR][kHidden];
+
+};
+
+
+
+// ---- 本 rank 私有（普通显存）----
+struct alignas(256) unk_data {
+    ranks_flags rf;
+    ranks_data rd;
+};

@@ -22,3 +22,42 @@ bash scripts/mx_scripts/run_mega_moe_all.sh --skip-baseline --routing-fixed-case
 
 
 帮我在megakernel前增加一个采集日志的kernel，采集本ranks的ct0值,topk_idx,graph_capture_bool,rank，方便我跑完模型后，根据日志在后面重建真实场景的数据和路由信息. 该kernel可以使用MEGA_DEBUG=4 使能是否运行。
+
+我希望达到的目标
+
+代码
+test/mybench.cu
+test/check.cu
+
+构建
+time ./scripts/build.sh mybench
+time ./scripts/build.sh check
+time ./scripts/build.sh so
+time ./scripts/build.sh all
+
+二进制
+test/mybench
+test/check
+test/megakernel.so
+
+#性能测试
+## 均衡场景
+time ./scripts/run.sh  mybench -R 32 -s 1 -tprs 1,4,16,32,33,64,128,256,512  (默认)
+
+## tk场景
+time ./scripts/run.sh  mybench -R 32 -s 2 -top 50  (前50个)
+time ./scripts/run.sh  mybench -R 32 -s 2 -cases 804900,807500  (指定case)
+
+#功能测试
+time ./scripts/run.sh  check --smoke (冒烟测试)
+time ./scripts/run.sh  check --all  (全量测试，不受10s约束)
+
+
+
+
+最小复现已经存在，命令如下（单 launch、win=48、slot=512）：
+MT_FORCE_WIN=48 ./scripts/run.sh check --all --only 804900 --graph-nodes 2
+结果（当前工作区，--only 保留 TPR=512 用例用于把 max_tokens 钉在 512）：
+
+
+分析一下mega kernel里面有哪些缓冲区，缓冲区如何使用，如何复用。会不会存在不同轮次，不同rank间的竞争风险。
