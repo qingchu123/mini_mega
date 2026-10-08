@@ -284,7 +284,7 @@ struct R19Sched {
     uint8_t* const* peer_bases;
     int R, rank;
     int win_cap, pool_stride, tbl_cap, k_in, topk, ring;
-    int64_t src_off, x_off, weights_off, pool_off, w_off, meta_off;
+    int64_t x_off, weights_off, pool_off, w_off, meta_off;
     uint8_t* pool_base;   // [A-RWK] pool 基址（nullptr → self+pool_off）
     uint32_t* bar_flags;
     int64_t l2_done_idx, task_ready_idx, slice_flags_idx, l1_prog_idx;

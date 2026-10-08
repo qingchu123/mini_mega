@@ -891,7 +891,7 @@ __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* self, const ranks_data* remote, int cycle,
         uint8_t* const* peer_bases, int R, int rank,
         int win_cap, int pool_stride, int tbl_cap, int k_in, int topk, int ring,
-        int64_t prefix_off, int64_t src_off, int64_t x_off, int64_t weights_off,
+        int64_t prefix_off, int64_t x_off, int64_t weights_off,
         int64_t pool_off, int64_t w_off, int64_t meta_off,
         uint8_t* pool_ptr,
         uint32_t* bar_flags, int64_t task_counter_idx, int64_t l2_done_idx,
@@ -976,7 +976,6 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.k_in = k_in;
     S.topk = topk;
     S.ring = ring;
-    S.src_off = src_off;
     S.x_off = x_off;
     S.weights_off = weights_off;
     S.pool_off = pool_off;

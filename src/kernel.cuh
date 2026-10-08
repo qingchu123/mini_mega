@@ -35,12 +35,10 @@ struct MegaArgs {
     int pool_stride;    // pool 槽地址 stride（= win_cap + win_pad）
     int tbl_cap;        // src_index_table 行容量（= max_tokens）
     int k_in, topk, ring;
-    int64_t src_off, rsc_off, recv_off, prefix_off, barrier_off;
+    int64_t rsc_off, prefix_off;
     local_flags* lf;               // flag 区（本 rank 私有，普通显存）
     ranks_flags* rf;               // 跨 rank flag 区（FG 显存）
     ranks_flags* const* rf_peers;  // 各 rank ranks_flags 基址表（设备数组，含 self）
-    local_data* local;             // 本 rank 非共享数据
-    local_data* const* local_peers; // 各 rank local_data（self = local[rank]）
     ranks_data* remote;             // 本 rank 远端数据表
     ranks_data* const* remote_peers;  // 各 rank ranks_data 基址表
     int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
@@ -71,8 +69,6 @@ struct MegaArgs {
     int l2_k_out;
     // ---- 收尾 ----
     int64_t combine_rows_off;  // 目标 rank 的 combine_rows 区偏移（BF16，留在 sym）
-    int combine_cap;   // combine_rows 行容量（= max_tokens）
-    int sums_stride;   // combine_sums 每行槽数（= 32）
     // ---- [集71] 内部执行次数统计（编译期默认关：MX_DBG_COUNT=0）----
     // 整块条件编译：关闭态 MegaArgs 的布局/大小与改造前**逐字节一致**
     // （已用 .mc_fatbin md5 对比验证，见 test/71.kernel_exec_count/results.md）。
@@ -88,7 +84,6 @@ struct CombineTail {
     CombineCtx ctx;
     const uint8_t* out_base;  // ffn_out staging 全区基址（BF16）
     int nwarps;
-    int sums_stride;
     CombineFuseCtx fuse;      // [R29] 融合推送上下文（capable 由 kernel 置位）
     // [集71] 内部执行次数统计（编译期默认关；运行期 nullptr 关闭）
     //   条件编译：CombineTail 是 mega_kernel 的**按值模板实参**（进 kernel 参数
@@ -113,10 +108,9 @@ struct CombineTail {
         const int warp = (int)(threadIdx.x / 64);
         if (fuse.on) {
             // [R29] 数据已在 L2 各列块推完，任务尾只写完成标记
-            combine_mark_rows(c, d.count, lane, warp, nwarps, sums_stride);
+            combine_mark_rows(c, d.count, lane, warp, nwarps);
         } else {
-            combine_push_pair(c, out_base, d.count, lane, warp, nwarps,
-                              sums_stride);
+            combine_push_pair(c, out_base, d.count, lane, warp, nwarps);
         }
     }
 };
@@ -150,7 +144,7 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
     dispatch_pull_body<TaskTail, kSmallOnly, kFragCap, kCap>(
         a.self, a.remote, cycle, a.peer_bases, a.R, a.rank, a.win_cap,
         a.pool_stride, a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off,
-        a.src_off, a.x_off, a.weights_off, a.pool_off, a.w_off, a.meta_off,
+        a.x_off, a.weights_off, a.pool_off, a.w_off, a.meta_off,
         a.pool_ptr, a.lf->bar[cycle],
         a.task_counter_idx, a.l2_done_idx, a.task_ready_idx, a.slice_flags_idx,
         a.l1_prog_idx, a.lf->out_processed, a.lf->dbg, a.max_spins, a.w1,
@@ -267,13 +261,11 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.rf_peers = a.rf_peers;
                 tail.ctx.rows_off = a.combine_rows_off;
                 tail.ctx.staging_cap = a.win_cap;
-                tail.ctx.combine_cap = a.combine_cap;
                 tail.ctx.block_idx = (int)blockIdx.x;
                 tail.ctx.cycle = cyc;   // [M_CYCLE] combine_sums 片
                 tail.ctx.epoch = (uint64_t)a.lf->current_time[0][1];
                 tail.out_base = reinterpret_cast<const uint8_t*>(a.l2_out);
                 tail.nwarps = 8;
-                tail.sums_stride = a.sums_stride;
                 // [R29] 融合推送能力 + 上下文（on 由任务体在 r24 L2 路径激活）
                 tail.fuse.capable = true;
                 tail.fuse.out_base = tail.out_base;
@@ -283,21 +275,17 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.fuse.remote_peers = a.remote_peers;
                 tail.fuse.cycle = cyc;
                 tail.fuse.rows_off = tail.ctx.rows_off;
-                tail.fuse.combine_cap = tail.ctx.combine_cap;
                 tail.fuse.staging_cap = tail.ctx.staging_cap;
                 tail.fuse.block_idx = tail.ctx.block_idx;
-                tail.fuse.sums_stride = a.sums_stride;
             } else {
                 // [集33] combine 关闭：同一 tail 实例走空操作（rows_off<0）
                 tail.ctx.rows_off = a.combine_rows_off;
                 tail.ctx.staging_cap = a.win_cap;
-                tail.ctx.combine_cap = a.combine_cap;
                 tail.ctx.block_idx = (int)blockIdx.x;
                 tail.ctx.cycle = cyc;   // [M_CYCLE]（combine 关闭，仅占位）
                 tail.ctx.epoch = (uint64_t)a.lf->current_time[0][1];
                 tail.out_base = nullptr;
                 tail.nwarps = 8;
-                tail.sums_stride = a.sums_stride;
                 tail.fuse.capable = false;
             }
             // [集71] 计数缓冲下传（CombineTail 统计 COMBINE 执行/跳过次数）
@@ -319,21 +307,21 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
 __global__ void __launch_bounds__(256) mega_reduce_kernel(
                                    const uint8_t* self, const ranks_data* remote,
                                    float* y, int R,
-                                   int tokens, int combine_cap,
+                                   int tokens,
                                    int64_t rows_off,
                                    int64_t topk_idx_off, int64_t weights_off,
                                    local_flags* lf, ranks_flags* rf,
                                    int64_t task_ready_idx,
-                                   int max_spins, int sums_stride
+                                   int max_spins
 #if MX_DBG_COUNT
                                    ,
                                    unsigned long long* exec_ctr = nullptr,
                                    int dbg_count = 0
 #endif
 ) {
-    reduce_body(self, remote, y, R, tokens, combine_cap, rows_off,
+    reduce_body(self, remote, y, R, tokens, rows_off,
                 topk_idx_off, weights_off, lf, rf, task_ready_idx,
-                max_spins, sums_stride
+                max_spins
 #if MX_DBG_COUNT
                 , mx_ctr_open(dbg_count, exec_ctr)
 #endif

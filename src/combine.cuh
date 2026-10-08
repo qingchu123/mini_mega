@@ -36,7 +36,7 @@
 //     （combine_mark_rows）。标记语义/可见性顺序与 combine_push_pair 完全相同
 //     （数据推送 → __threadfence → __syncthreads → lane0 标记）。
 //   3) __device__ void reduce_body(const uint8_t* self, float* y, int R,
-//          int tokens, int combine_cap, long long combine_rows_off,
+//          int tokens, long long combine_rows_off,
 //          long long topk_idx_off, long long weights_off,
 //          local_flags* lf, ranks_flags* rf, long long task_ready_idx,
 //          int max_spins, int sums_stride)
@@ -150,7 +150,6 @@ struct CombineCtx {
     int slice = 0;                      // 本 block 任务切片号 [0, kNSlice)
     int block_idx = 0;                  // staging 块号（= blockIdx.x）
     int staging_cap = 0;                // staging 行容量（= win_capacity）
-    int combine_cap = 0;                // combine_rows 行容量（= max_tokens）
     // [R35] 波量化粗化：本物理任务覆盖 merge 个逻辑 slice，几何用 nslice_eff；
 //        标记槽按逻辑 slice（slice*merge + i）写满 kNSlice。完成标记写目标
 //        rank 的 ranks_flags::combine_sums[k][token][slice]（FG 显存）。
@@ -183,10 +182,8 @@ struct CombineFuseCtx {
     ranks_data* const* remote_peers = nullptr;  // 各 rank ranks_data（含 self）
     int cycle = 0;                   // [M_CYCLE] combine_rows 片
     long long rows_off = -1;         // 目标 rank combine_rows 区偏移（BF16）
-    int combine_cap = 0;             // combine_rows 行容量（= max_tokens）
     int staging_cap = 0;             // staging 行容量（= win_capacity）
     int block_idx = 0;               // staging 块号（= blockIdx.x）
-    int sums_stride = 0;             // combine_sums 每行槽数（= 32）
 };
 
 // 融合推送：把 f.out_base（staging 全区基址）的行 [row_lo,row_hi)、列
@@ -216,7 +213,7 @@ __device__ __forceinline__ void combine_push_one_row(
 #endif
 #if R30_DIAG_NOSTORE
         // 诊断：保留读与地址计算，不落远端（用不可判条件防 DCE）
-        if (f.sums_stride == -12345)
+        if (false)
             __stwt(reinterpret_cast<uint4*>(drow_h + i * 8), v);
 #else
         __stwt(reinterpret_cast<uint4*>(drow_h + i * 8), v);
@@ -304,7 +301,7 @@ __device__ __forceinline__ void combine_push_chunk_rows(
             const uint4 v3 = *reinterpret_cast<const uint4*>(s3 + i * 8);
 #endif
 #if R30_DIAG_NOSTORE
-            if (f.sums_stride == -12345) {
+            if (false) {
                 __stwt(reinterpret_cast<uint4*>(d0 + i * 8), v0);
                 __stwt(reinterpret_cast<uint4*>(d1 + i * 8), v1);
                 __stwt(reinterpret_cast<uint4*>(d2 + i * 8), v2);
@@ -389,9 +386,7 @@ __device__ __forceinline__ void combine_push_chunk(
 //   发布序：__threadfence（各 lane 的数据推送）→ __syncthreads（全块汇合，
 //   保证所有 warp 已推送）→ lane0 写标记。REDUCE 侧 epoch 协议不变。
 __device__ __forceinline__ void combine_mark_rows(
-        const CombineCtx& c, int count, int lane, int warp, int nwarps,
-        int sums_stride) {
-    (void)sums_stride;   // 槽 stride 固定 = kCombineSlicesMax（结构体维度）
+        const CombineCtx& c, int count, int lane, int warp, int nwarps) {
     __threadfence();
     __syncthreads();
     for (int s2 = warp; s2 < count; s2 += nwarps) {
@@ -428,8 +423,7 @@ __device__ __forceinline__ void combine_mark_rows(
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void combine_push_pair(
         const CombineCtx& c, const uint8_t* out_base, int count, int lane,
-        int warp, int nwarps, int sums_stride) {
-    (void)sums_stride;   // 槽 stride 固定 = kCombineSlicesMax（结构体维度）
+        int warp, int nwarps) {
     // 本物理 slice 的列范围（BF16 元素；c0s 起、cols_per_slice 列）
     // [R35] 粗化后每个物理任务覆盖合并后的列段（kHidden/nslice_eff）
     const int cols_per_slice = kHidden / c.nslice_eff;
@@ -479,11 +473,10 @@ __device__ __forceinline__ void combine_push_pair(
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void reduce_body(
         const uint8_t* self, const ranks_data* remote, float* y, int R,
-        int tokens, int combine_cap, long long combine_rows_off,
+        int tokens, long long combine_rows_off,
         long long topk_idx_off, long long weights_off,
         local_flags* lf, ranks_flags* rf, long long task_ready_idx,
-        int max_spins, int sums_stride, unsigned long long* ctr = nullptr) {
-    (void)sums_stride;   // 槽 stride 固定 = kCombineSlicesMax（结构体维度）
+        int max_spins, unsigned long long* ctr = nullptr) {   // 槽 stride 固定 = kCombineSlicesMax（结构体维度）
     // [M_CYCLE] REDUCE 是独立 kernel：mega 末尾已把 current_time[0][1] 自增到 L+1
     // （block0 为 leader，每 launch 恰自增一次），故 (ct-1)%M_CYCLE = L%M_CYCLE，
     // 与本轮 mega 的 bar / combine_sums 片一致。用 device 计数派生，graph 安全。

@@ -93,16 +93,11 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.k_in = a.k_in;
     m.topk = a.topk;
     m.ring = a.ring;
-    m.src_off = a.src_off;
     m.rsc_off = a.rsc_off;
-    m.recv_off = a.recv_off;
     m.prefix_off = a.prefix_off;
-    m.barrier_off = a.barrier_off;
     m.lf = a.lf;
     m.rf = a.rf;
     m.rf_peers = a.rf_peers;
-    m.local = a.local;
-    m.local_peers = a.local_peers;
     m.remote = a.remote;
     m.remote_peers = a.remote_peers;
     m.xrelease_idx = a.xrelease_idx;
@@ -134,8 +129,6 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.l2_out = a.l2_out;
     m.l2_k_out = a.l2_k_out;
     m.combine_rows_off = a.combine_rows_off;
-    m.combine_cap = a.combine_cap;
-    m.sums_stride = a.sums_stride;
     return m;
 }
 
@@ -194,9 +187,9 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
 
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
     mega_reduce_kernel<<<2 * a.tokens, 256, 0, stream>>>(
-        a.self, a.remote, a.y, a.R, a.tokens, a.combine_cap,
+        a.self, a.remote, a.y, a.R, a.tokens,
         a.combine_rows_off, a.topk_idx_off, a.weights_off, a.lf, a.rf,
-        a.task_ready_idx, a.max_spins, a.sums_stride);
+        a.task_ready_idx, a.max_spins);
 }
 
 void launch_full(const MegaLaunchArgs& a, mcStream_t stream) {

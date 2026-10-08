@@ -92,9 +92,9 @@ struct alignas(256) ranks_flags {
 // ---- 本 rank 私有（普通显存）----
 struct alignas(256) local_data {
     // 输入复用
-    alignas(256) uint8_t x[kMaxTPR][kHidden];
+    // alignas(256) uint8_t x[kMaxTPR][kHidden];
+    // alignas(256) float topk_weights[kMaxTPR][kTopk];
     alignas(256) int64_t topk_idx[kMaxTPR][kTopk];
-    alignas(256) float topk_weights[kMaxTPR][kTopk];
 
     // 内部使用
     alignas(256) int32_t route_slot_counts[kRanks * kEPR];
