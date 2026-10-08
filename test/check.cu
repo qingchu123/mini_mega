@@ -1,0 +1,595 @@
+// ============================================================================
+// test/check.cu — fp8xfp8 mega kernel 正确性测试（mpirun -np 32，每进程一卡）
+//
+// 启动（经 scripts/run.sh）：
+//   scripts/run.sh check --smoke     # 冒烟：单次 <10s 目标
+//   scripts/run.sh check --all       # 全量：均衡 TPR 表 + 全部 TK 实录 launch，不限时
+//
+// 每个用例（均衡 TPR 或 TK 实录 launch）可执行的检查：
+//   L0      前序：route / publish / task_setup 与 host 模型逐项一致（launch_prelude）
+//   L1/L2   expert0 窗口0 的 ffn_hidden（FP8）与 l2_out（BF16）vs CPU 参考（rank0）
+//   REDUCE  每 rank 的 y（FP32）vs CPU 参考（ref_reduce，全部 token）
+//   graph   图内 N 节点（N=--graph-nodes，默认 50）每个节点的 y 与 eager 的 y 逐元素比较：
+//           rel_max = max|a-b| / max|ref| <= 1e-3 且 finite 位置一致（抓陈旧旗子）
+//
+// 冷启动：首个 launch 的跨 rank 同步在冷状态下不可靠（见 测试流程.md），
+//   因此所有检查前先做一次不计入结果的 eager 预热。
+// 退出码：0 = 全部 PASS；1 = 有 FAIL；2 = 参数/环境错误
+// ============================================================================
+
+#include <mcr/mc_runtime.h>
+#include <mpi.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "mega_common.cuh"
+
+namespace {
+
+using mt::Spec;
+
+constexpr int kCase0 = 804900;               // 实录 launch（= MXMOEMega FIXED_CASES['804900']）
+const std::vector<int> kBalancedTprs = {1, 4, 16, 32, 33, 64, 128, 256, 512};
+
+struct Flags {
+    bool l0 = false;      // 前序检查
+    bool eager = false;   // eager 全链 + L1/L2 + REDUCE
+    int graph = 0;        // >0：graph 图内节点数（与 eager 逐节点比较）
+};
+
+// 与设备 fill_weights_lane 同字节布局的 host 参考：生成「整张量中第 row_base 行起的
+// n_rows 行」，即某个专家的切片（设备按整张量的全局行号取值，专家 e 的行基址 = e*n_rows）。
+void fill_lane_host_w(std::vector<uint8_t>& buf, int n_rows, int k_cols, uint32_t seed,
+                      int row_base) {
+    buf.assign((size_t)n_rows * k_cols, 0);
+    const int k_iters = k_cols / 32;
+    const int npairs = n_rows / 32;
+    for (int np = 0; np < npairs; ++np)
+        for (int kt = 0; kt < k_iters; ++kt) {
+            uint8_t* tile = buf.data() + ((size_t)np * k_iters + kt) * 1024;
+            for (int L = 0; L < 64; ++L) {
+                const int row0 = row_base + np * 32 + (L % 16);
+                const int row1 = row0 + 16;
+                const int k0 = kt * 32 + (L / 16) * 8;
+                for (int b = 0; b < 8; ++b) {
+                    tile[L * 16 + b] = WPROBE_VAL(seed, row0, k0 + b);
+                    tile[L * 16 + 8 + b] = WPROBE_VAL(seed, row1, k0 + b);
+                }
+            }
+        }
+}
+
+struct Env {
+    int R = 0;
+    int rank = 0;
+    int check_rows = 16;
+    mt::Geo geo;
+    mt::Dev d;
+    std::vector<uint8_t> w1h, w2h;   // host 参考权重：当前 w_expert 的切片（仅 rank0 使用）
+    int w_expert = -1;
+    std::vector<std::vector<uint8_t>> w1_cache, w2_cache;   // 按本地专家缓存（rank0）
+};
+
+struct Result {
+    std::string label;
+    bool l0 = true, l12 = true, red = true, graph = true;
+    double red_max_abs = 0.0;
+    double graph_rel = 0.0;
+    long long graph_pattern = 0;
+    double ms = 0.0;
+};
+
+// ----------------------------------------------------------- 汇总 --
+bool agree(bool local) {
+    int v = local ? 1 : 0, g = 0;
+    MPI_Allreduce(&v, &g, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    return g == 1;
+}
+double agree_max(double v) {
+    double g = 0.0;
+    MPI_Allreduce(&v, &g, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    return g;
+}
+long long agree_sum(long long v) {
+    long long g = 0;
+    MPI_Allreduce(&v, &g, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    return g;
+}
+
+// 每 rank 打印前 2 条失败细节，避免 32 份输出刷屏
+int g_detail_budget = 2;
+void detail(const Env& e, const char* what, const std::string& msg) {
+    if (g_detail_budget <= 0) return;
+    --g_detail_budget;
+    std::printf("    [detail] rank%d %s: %s\n", e.rank, what, msg.c_str());
+    std::fflush(stdout);
+}
+
+// 行级并行执行 f(i)，i in [0, n)（host 参考计算用；n 很小时开销可忽略）
+template <class F>
+void parallel_rows(int n, F&& f) {
+    const int nt = std::max(1, std::min(16, n));
+    std::vector<std::thread> th;
+    th.reserve(nt);
+    for (int t = 0; t < nt; ++t)
+        th.emplace_back([&, t]() {
+            for (int i = t; i < n; i += nt) f(i);
+        });
+    for (auto& x : th) x.join();
+}
+
+// ------------------------------------------------- L0 前序（launch_prelude） --
+bool run_l0(Env& e, const Spec& s, const mt::Routes& routes) {
+    mt::reset_dev(e.geo, e.d, routes, s.tokens);
+    MPI_Barrier(MPI_COMM_WORLD);
+    fp8mega::MegaLaunchArgs a = mt::make_args(e.geo, e.d, s.tokens, s.win, e.d.y);
+    fp8mega::launch_prelude(a, e.d.st);
+    CHECK(mcStreamSynchronize(e.d.st));
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // validate_task_setup 的 cap = L.win_capacity。内核的窗口切分与路由截断均用
+    // slot_capacity（= max_tokens，见 prologue.cuh 的 task_setup_body / publish），
+    // 而非按 launch 的 win_cap；故模型也按 slot_capacity 建模。
+    ProdLayout Lc = e.geo.L;
+    Lc.win_capacity = e.geo.max_tokens;
+    std::string msg;
+    bool ok = validate_route(Lc, e.R, s.tokens, e.rank, routes, e.d.sym, &msg);
+    if (ok)
+        ok = validate_publish(Lc, e.R, s.tokens, e.rank, routes, e.d.sym, kPublishEpoch,
+                              &msg, (int)Lc.recv_stride, Lc.expert_recv_counts_off);
+    if (ok) {
+        std::vector<int> ts(kGrid, 0);
+        CHECK(mcSetDevice(e.rank));
+        CHECK(mcMemcpy(ts.data(), e.d.lf->out_total, kGrid * sizeof(int),
+                       mcMemcpyDeviceToHost));
+        ok = validate_task_setup(Lc, e.R, e.rank, routes, e.d.sym, nullptr, ts.data(), &msg);
+    }
+    if (!ok) detail(e, "L0", msg);
+    return ok;
+}
+
+// ------------------------------------------------------- eager 全链 --
+void run_eager(Env& e, const Spec& s, const mt::Routes& routes, std::vector<float>* y) {
+    mt::reset_dev(e.geo, e.d, routes, s.tokens);
+    MPI_Barrier(MPI_COMM_WORLD);
+    fp8mega::MegaLaunchArgs a = mt::make_args(e.geo, e.d, s.tokens, s.win, e.d.y);
+    fp8mega::launch_full(a, e.d.st);
+    CHECK(mcStreamSynchronize(e.d.st));
+    MPI_Barrier(MPI_COMM_WORLD);
+    y->assign((size_t)s.tokens * kHidden, 0.0f);
+    CHECK(mcMemcpy(y->data(), e.d.y, y->size() * sizeof(float), mcMemcpyDeviceToHost));
+}
+
+// --------------------------------------------- L1 / L2（expert0，rank0） --
+bool check_l1l2(Env& e, const Spec& s) {
+    if (e.rank != 0) return true;
+    const int win = s.win;
+    // 选择 rank0 本地专家中收行最多者（专家 e 的 pool 槽 = e*kRing）
+    int ex = -1, best = 0;
+    for (int i = 0; i < kEPR; ++i)
+        if (s.per_expert[i] > best) {
+            best = s.per_expert[i];
+            ex = i;
+        }
+    if (ex < 0) {
+        std::printf("    [L1/L2] rank0 本地专家均无 pair，跳过\n");
+        return true;
+    }
+    if (e.w_expert != ex) {
+        if (e.w1_cache.empty()) {
+            e.w1_cache.resize(kEPR);
+            e.w2_cache.resize(kEPR);
+        }
+        if (e.w1_cache[ex].empty()) {
+            fill_lane_host_w(e.w1_cache[ex], 2 * kIntermediate, kHidden, 17u,
+                             ex * 2 * kIntermediate);
+            fill_lane_host_w(e.w2_cache[ex], kHidden, kIntermediate, 91u, ex * kHidden);
+        }
+        e.w1h = e.w1_cache[ex];   // 拷贝（每切片 25MB，rank0 一次性）
+        e.w2h = e.w2_cache[ex];
+        e.w_expert = ex;
+    }
+    const int rows = std::max(1, std::min(std::min(best, win), e.check_rows));
+    const ProdLayout& L = e.geo.L;
+    const int pool_slot = ex * kRing;   // 专家 ex，窗口 w0
+    std::printf("    [L1/L2] expert=%d (rank0 本地) pairs=%d 核验行数=%d\n", ex, best, rows);
+
+    CHECK(mcSetDevice(0));
+    std::vector<uint8_t> xd((size_t)rows * kHidden);
+    CHECK(mcMemcpy(xd.data(),
+                   e.d.sym + L.expert_tokens_off + (size_t)pool_slot * win * kHidden,
+                   xd.size(), mcMemcpyDeviceToHost));
+    std::vector<uint8_t> ffn_d((size_t)rows * kIntermediate);
+    CHECK(mcMemcpy(ffn_d.data(), e.d.ffn + (size_t)pool_slot * win * kIntermediate,
+                   ffn_d.size(), mcMemcpyDeviceToHost));
+
+    // L1：CPU 参考 -> E4M3 量化 -> 解码后与设备字节比较
+    std::vector<float> ffn_exp((size_t)rows * kIntermediate);
+    parallel_rows(rows, [&](int i) {
+        ref_l1(xd.data() + (size_t)i * kHidden, e.w1h.data(), 0, 1, kHidden, kIntermediate,
+               ffn_exp.data() + (size_t)i * kIntermediate);
+    });
+    std::vector<uint8_t> ffn_q(ffn_exp.size());
+    ref_quantize_fp8(ffn_exp.data(), (long long)ffn_exp.size(), ffn_q.data());
+    std::vector<float> ffn_exp_f(ffn_exp.size());
+    for (size_t i = 0; i < ffn_exp.size(); ++i) ffn_exp_f[i] = fp8_e4m3_decode(ffn_q[i]);
+    const CheckStats s1 = compare_fp8(ffn_d.data(), ffn_exp_f.data(),
+                                      (int)ffn_exp_f.size(), 7e-2, 2e-3);
+    print_check_stats("L1 ffn_hidden(expert0)", s1);
+
+    // L2：CPU 参考（以设备 ffn 字节为输入）vs 各 block 的 l2_out 槽。
+    // 每个 block 只写自己负责的 N-slice 列；对每个 slice 查找「存在一个 block 与参考一致」。
+    std::vector<float> out_exp((size_t)rows * kHidden);
+    parallel_rows(rows, [&](int i) {
+        ref_l2(ffn_d.data() + (size_t)i * kIntermediate, e.w2h.data(), 0, 1,
+               kIntermediate, kHidden, out_exp.data() + (size_t)i * kHidden);
+    });
+    std::vector<uint16_t> l2_all((size_t)kGrid * rows * kHidden);
+    for (int b = 0; b < kGrid; ++b)
+        CHECK(mcMemcpy(l2_all.data() + (size_t)b * rows * kHidden,
+                       e.d.l2 + (size_t)b * win * kHidden,
+                       (size_t)rows * kHidden * 2, mcMemcpyDeviceToHost));
+    const int cs = kHidden / kNSlice;
+    bool l2_ok = true;
+    for (int sl = 0; sl < kNSlice; ++sl) {
+        CheckStats best;
+        int best_block = -1;
+        for (int b = 0; b < kGrid; ++b) {
+            const CheckStats st = compare_bf16_rows(
+                l2_all.data() + (size_t)b * rows * kHidden, out_exp.data(), rows, kHidden,
+                kHidden, sl * cs, (sl + 1) * cs, 1e-2, 1e-3);
+            if (best_block < 0 || st.bad < best.bad) {
+                best = st;
+                best_block = b;
+            }
+            if (st.pass()) break;
+        }
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "L2 out slice%d(block%d)", sl, best_block);
+        print_check_stats(tag, best);
+        l2_ok = l2_ok && best.pass();
+    }
+    return s1.pass() && l2_ok;
+}
+
+// ----------------------------------------------------- REDUCE（每 rank） --
+CheckStats check_reduce(Env& e, const Spec& s, const mt::Routes& routes,
+                        const std::vector<float>& y) {
+    const ProdLayout& L = e.geo.L;
+    const int T = s.tokens;
+    const int E = e.R * kEPR;
+    CHECK(mcSetDevice(e.rank));
+    // combine_rows 为 [topk][max_tokens][H]；紧凑为 [topk][T][H] 供 ref_reduce
+    std::vector<uint8_t> rows_h((size_t)kTopk * T * kHidden * 2);
+    for (int k = 0; k < kTopk; ++k)
+        CHECK(mcMemcpy(rows_h.data() + (size_t)k * T * kHidden * 2,
+                       e.d.sym + e.geo.combine_off +
+                           (size_t)k * e.geo.max_tokens * kHidden * 2,
+                       (size_t)T * kHidden * 2, mcMemcpyDeviceToHost));
+    std::vector<float> w_h((size_t)T * kTopk);
+    CHECK(mcMemcpy(w_h.data(), e.d.sym + L.topk_weights_off, w_h.size() * sizeof(float),
+                   mcMemcpyDeviceToHost));
+    std::vector<float> y_ref((size_t)T * kHidden);
+    for (int t = 0; t < T; ++t)
+        ref_reduce(rows_h.data(), routes[e.rank].data(), w_h.data(), t, kTopk, E, T,
+                   kHidden, y_ref.data() + (size_t)t * kHidden);
+    const CheckStats st = compare_f32(y.data(), y_ref.data(), (int)y_ref.size(), 1e-5, 1e-6);
+    if (!st.pass()) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "bad=%lld max_abs=%.3e worst_got=%.6g want=%.6g",
+                      st.bad, st.max_abs, (double)st.worst_got, (double)st.worst_want);
+        detail(e, "REDUCE", msg);
+    }
+    return st;
+}
+
+// ------------------------------------------------------ graph vs eager --
+struct RelStat {
+    double rel_max = 0.0;
+    long long pattern = 0;
+};
+RelStat rel_compare(const std::vector<float>& got, const std::vector<float>& want) {
+    RelStat s;
+    double scale = 0.0, maxd = 0.0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const bool gf = std::isfinite(got[i]), wf = std::isfinite(want[i]);
+        if (gf != wf) {
+            ++s.pattern;
+            continue;
+        }
+        if (!wf) continue;
+        scale = std::max(scale, (double)std::fabs(want[i]));
+        maxd = std::max(maxd, (double)std::fabs(got[i] - want[i]));
+    }
+    s.rel_max = maxd / std::max(scale, 1e-30);
+    return s;
+}
+
+// 图内 nodes 个 launch_full 节点，各写独立 ynode[n]；整图只 replay 一次，
+// 节点之间不清零（测试旗子跨节点复用）。
+bool run_graph(Env& e, const Spec& s, const mt::Routes& routes,
+               const std::vector<float>& y_ref, int nodes, Result* out) {
+    const int T = s.tokens;
+    CHECK(mcSetDevice(e.rank));
+    CHECK(mcStreamBeginCapture(e.d.st, mcStreamCaptureModeThreadLocal));
+    for (int n = 0; n < nodes; ++n) {
+        fp8mega::MegaLaunchArgs a = mt::make_args(e.geo, e.d, T, s.win, e.d.ynode[n]);
+        fp8mega::launch_full(a, e.d.st);
+    }
+    mcGraph_t g = nullptr;
+    CHECK(mcStreamEndCapture(e.d.st, &g));
+    CHECK(mcGraphInstantiate(&e.d.exec, g, nullptr, nullptr, 0));
+    mcGraphDestroy(g);
+
+    mt::reset_dev(e.geo, e.d, routes, T);
+    for (int n = 0; n < nodes; ++n)
+        CHECK(mcMemset(e.d.ynode[n], 0, (size_t)T * kHidden * sizeof(float)));
+    MPI_Barrier(MPI_COMM_WORLD);
+    CHECK(mcGraphLaunch(e.d.exec, e.d.st));
+    CHECK(mcStreamSynchronize(e.d.st));
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    bool pass = true;
+    std::vector<float> got((size_t)T * kHidden);
+    for (int n = 0; n < nodes; ++n) {
+        CHECK(mcMemcpy(got.data(), e.d.ynode[n], got.size() * sizeof(float),
+                       mcMemcpyDeviceToHost));
+        const RelStat rs = rel_compare(got, y_ref);
+        out->graph_rel = std::max(out->graph_rel, rs.rel_max);
+        out->graph_pattern += rs.pattern;
+        if (rs.rel_max > 1e-3 || rs.pattern > 0) {
+            if (pass) {
+                char msg[160];
+                std::snprintf(msg, sizeof(msg), "node%d rel_max=%.3e pattern=%lld", n,
+                              rs.rel_max, rs.pattern);
+                detail(e, "graph", msg);
+            }
+            pass = false;
+        }
+    }
+    mcGraphExecDestroy(e.d.exec);
+    e.d.exec = nullptr;
+    return pass;
+}
+
+// --------------------------------------------------------- 单用例 --
+void print_row(const Result& r, const Flags& f) {
+    auto tag = [](bool ok) { return ok ? "PASS" : "FAIL"; };
+    std::printf("[%s] L0=%s", r.label.c_str(), f.l0 ? tag(r.l0) : "-");
+    std::printf(" L1L2=%s",
+                f.eager ? tag(r.l12) : "-");
+    std::printf(" REDUCE=%s", f.eager ? tag(r.red) : "-");
+    if (f.eager) std::printf("(max_abs=%.2e)", r.red_max_abs);
+    if (f.graph > 0)
+        std::printf(" graph×%d=%s(rel=%.2e,pat=%lld)", f.graph, tag(r.graph), r.graph_rel,
+                    r.graph_pattern);
+    std::printf("  %.0f ms\n", r.ms);
+    std::fflush(stdout);
+}
+
+bool run_spec(Env& e, const Spec& s, const Flags& f) {
+    Result r;
+    r.label = s.label;
+    const auto t0 = std::chrono::steady_clock::now();
+    mt::Routes routes;
+    std::string err;
+    if (!mt::spec_routes(s, e.R, kTopk, &routes, &err)) {
+        if (e.rank == 0) std::fprintf(stderr, "[check] %s\n", err.c_str());
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
+    if (f.l0) {
+        const bool ok = run_l0(e, s, routes);
+        r.l0 = agree(ok);
+    }
+    std::vector<float> y;
+    if (f.eager || f.graph > 0) {
+        run_eager(e, s, routes, &y);
+        if (f.eager) {
+            r.l12 = agree(check_l1l2(e, s));
+            const CheckStats red = check_reduce(e, s, routes, y);
+            r.red = agree(red.pass());
+            r.red_max_abs = agree_max(red.max_abs);
+        }
+    }
+    if (f.graph > 0) {
+        Result gr;
+        const bool ok = run_graph(e, s, routes, y, f.graph, &gr);
+        r.graph = agree(ok);
+        r.graph_rel = agree_max(gr.graph_rel);
+        r.graph_pattern = agree_sum(gr.graph_pattern);
+    }
+    r.ms = std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+    if (e.rank == 0) print_row(r, f);
+    const bool pass = (!f.l0 || r.l0) && (!f.eager || (r.l12 && r.red)) &&
+                      (f.graph == 0 || r.graph);
+    return pass;
+}
+
+void usage(const char* p) {
+    std::printf(
+        "用法: %s --smoke | --all  [选项]（经 scripts/run.sh check 启动，R=32）\n"
+        "  --smoke           冒烟：均衡 16 + TK launch %d（前序/eager/graph×1/graph×N）\n"
+        "  --all             全量：均衡 TPR 表 + 全部 TK 合法 launch（每个含前序/eager/graph×N）\n"
+        "  --tk-info F       TK_INFO 日志（缺省 %s）\n"
+        "  --graph-nodes N   graph 图内节点数（缺省 50）\n"
+        "  --check-rows N    L1/L2 核验行数（缺省 16）\n",
+        p, kCase0, mt::kDefaultTkLog);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank = 0, R = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &R);
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);   // 超时被杀时保留已输出的阶段日志
+
+    bool smoke = false, all = false;
+    std::vector<int> only;             // --only：只跑指定 TK launch（调试用）
+    std::string tk_path = mt::kDefaultTkLog;
+    int graph_nodes = 50, check_rows = 16;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto val = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
+        if (a == "--smoke") smoke = true;
+        else if (a == "--all") all = true;
+        else if (a == "--tk-info") tk_path = val();
+        else if (a == "--only") only = mt::parse_csv_ints(val());
+        else if (a == "--graph-nodes") graph_nodes = std::atoi(val().c_str());
+        else if (a == "--check-rows") check_rows = std::atoi(val().c_str());
+        else if (a == "-h" || a == "--help") {
+            if (rank == 0) usage(argv[0]);
+            MPI_Finalize();
+            return 0;
+        } else {
+            if (rank == 0) std::fprintf(stderr, "未知参数: %s\n", a.c_str());
+            MPI_Finalize();
+            return 2;
+        }
+    }
+    if (smoke == all) {
+        if (rank == 0) {
+            std::fprintf(stderr, "请指定且只指定一个: --smoke 或 --all\n");
+            usage(argv[0]);
+        }
+        MPI_Finalize();
+        return 2;
+    }
+    if (graph_nodes < 1 || check_rows < 1) {
+        if (rank == 0) std::fprintf(stderr, "--graph-nodes / --check-rows 须 >= 1\n");
+        MPI_Finalize();
+        return 2;
+    }
+
+    // ---- 用例列表（每进程独立解析，一致） ----
+    std::string err;
+    std::vector<std::pair<Spec, Flags>> plan;
+    std::vector<mt::TkLaunch> tk;
+    if (smoke) {
+        plan.push_back({mt::balanced_spec(R, 16), Flags{true, true, 0}});
+        plan.push_back({mt::balanced_spec(R, 16), Flags{false, false, 1}});
+    }
+    if (smoke || all) {
+        if (!mt::load_tk_launches(tk_path, R, kTopk, &tk, &err)) {
+            if (rank == 0) std::fprintf(stderr, "[check] %s\n", err.c_str());
+            MPI_Finalize();
+            return 2;
+        }
+    }
+    if (smoke) {
+        const mt::TkLaunch* c0 = nullptr;
+        for (const auto& t : tk)
+            if (t.id == kCase0) c0 = &t;
+        if (!c0) {
+            if (rank == 0)
+                std::fprintf(stderr, "[check] TK_INFO 中无 launch=%d（R=%d）\n", kCase0, R);
+            MPI_Finalize();
+            return 2;
+        }
+        plan.push_back({mt::tk_spec(*c0), Flags{true, true, 1}});
+        plan.push_back({mt::tk_spec(*c0), Flags{false, true, graph_nodes}});
+        plan.push_back({mt::balanced_spec(R, 16), Flags{false, true, graph_nodes}});
+    }
+    if (all) {
+        for (int t : kBalancedTprs)
+            plan.push_back({mt::balanced_spec(R, t), Flags{true, true, graph_nodes}});
+        for (const auto& t : tk)
+            plan.push_back({mt::tk_spec(t), Flags{true, true, graph_nodes}});
+    }
+    if (!only.empty()) {
+        std::vector<std::pair<Spec, Flags>> keep;
+        for (const auto& p : plan) {
+            const bool pick = p.first.kind == 1 &&
+                              std::find(only.begin(), only.end(), p.first.launch_id) != only.end();
+            // 保留 TPR=512 均衡用例：它决定 max_tokens=512 的全局布局（复现 --all 的布局）
+            const bool pin = p.first.kind == 0 && p.first.tokens == 512;
+            if (pick || pin) keep.push_back(p);
+        }
+        plan.swap(keep);
+    }
+    if (plan.empty()) {
+        if (rank == 0) std::fprintf(stderr, "[check] 无用例\n");
+        MPI_Finalize();
+        return 2;
+    }
+
+    // ---- 全局布局 ----
+    int max_tokens = 16;
+    for (const auto& p : plan) max_tokens = std::max(max_tokens, p.first.tokens);
+    int win_global = 0;
+    for (auto& p : plan) {
+        p.first.win = mt::choose_win_cap_counts(p.first.per_expert, max_tokens);
+        win_global = std::max(win_global, p.first.win);
+    }
+    Env e;
+    e.R = R;
+    e.rank = rank;
+    e.check_rows = check_rows;
+    e.geo = mt::make_geo(R, max_tokens, win_global);
+    if (e.geo.smem > 227 * 1024) {
+        if (rank == 0) std::fprintf(stderr, "[check] smem=%lld > 227KB\n", (long long)e.geo.smem);
+        MPI_Finalize();
+        return 2;
+    }
+
+    const auto t_start = std::chrono::steady_clock::now();
+    CHECK(mcSetDevice(rank));
+    mt::alloc_dev(e.d, e.geo, rank, max_tokens, graph_nodes);
+    const auto t_alloc = std::chrono::steady_clock::now();
+    mt::exchange_ipc(e.d, R);
+    MPI_Barrier(MPI_COMM_WORLD);
+    const auto t_ipc = std::chrono::steady_clock::now();
+    if (rank == 0)
+        std::printf("check R=%d mode=%s cases=%zu max_tokens=%d win_global=%d graph_nodes=%d\n",
+                    R, smoke ? "smoke" : "all", plan.size(), max_tokens, win_global,
+                    graph_nodes);
+
+    // 冷启动预热（不计入结果）
+    const auto t_warm0 = std::chrono::steady_clock::now();
+    {
+        const Spec warm = mt::balanced_spec(R, 16);
+        mt::Routes wr = mt::balanced_routes(R, 16);
+        std::vector<float> y;
+        run_eager(e, warm, wr, &y);
+    }
+    if (rank == 0) {
+        auto ms = [](std::chrono::steady_clock::time_point a,
+                     std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::printf("[timing] alloc=%.0f ms ipc=%.0f ms warm=%.0f ms\n",
+                    ms(t_start, t_alloc), ms(t_alloc, t_ipc), ms(t_warm0,
+                    std::chrono::steady_clock::now()));
+    }
+
+    bool all_pass = true;
+    int failed = 0;
+    for (const auto& p : plan) {
+        const bool ok = run_spec(e, p.first, p.second);
+        if (!ok) {
+            ++failed;
+            all_pass = false;
+        }
+        if (smoke && !all_pass) break;   // 冒烟：首个失败即停止（便于定位）
+        g_detail_budget = 2;
+    }
+    const double wall = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_start).count();
+    if (rank == 0)
+        std::printf("[总体] %s  用例=%zu 失败=%d  耗时=%.2f s（含 setup+预热）\n",
+                    all_pass ? "PASS" : "FAIL", plan.size(), failed, wall);
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Finalize();
+    return all_pass ? 0 : 1;
+}

@@ -1,55 +1,93 @@
 #!/usr/bin/env bash
 # ============================================================================
-# scripts/run.sh — 统一基准启动脚本（mpirun，每进程一张卡）
+# scripts/run.sh — 统一启动脚本（mpirun，每进程一张卡）
 #
 # 用法：
-#   scripts/run.sh -R 32 [mybench 选项...]     # 默认跑 ./mybench（每进程一 rank/一卡）
-#   BENCH=./bench scripts/run.sh --tprs 1,4    # 跑 ./bench（单进程多 rank，建议 NP=1）
+#   scripts/run.sh [程序] [-R N] [程序参数...]
+#     程序：mybench（默认）| check | bench
 #
-#   -R N   进程数/rank 数（默认 32）= mpirun -np N；对 ./mybench 即 R 个 rank。
-#   -NP N  仅 mpirun 进程数（不改 R）；默认 = -R 的值。
-#   其余参数透传给 $BENCH，例如 mybench：
-#     scripts/run.sh -R 32 --s 0 --tprs 1,4,16,32,64,128 --nodes 20 --replays 2
+# 示例：
+#   scripts/run.sh mybench -R 32 -s 1 -tprs 1,4,16,32,33,64,128,256,512   # 均衡
+#   scripts/run.sh mybench -R 32 -s 2 -top 50                              # TK 前 50
+#   scripts/run.sh mybench -R 32 -s 2 -cases 804900,807500                 # 指定 case
+#   scripts/run.sh check --smoke                                           # 冒烟（<10s）
+#   scripts/run.sh check --all                                             # 全量（不限时）
 #
-# 环境变量：BENCH（默认 ./mybench）、DEV（默认 0..R-1）、TIMEOUT（默认 600）、
-#          NP、MPIRUN、MACA_PATH（默认 /opt/maca）、WAIT_FREE=1（等外部占卡清空）、
-#          MPI_MCA（默认见下文，设为空则用 OpenMPI 默认传输）。
+# 说明：
+#   -R N    进程数 = rank 数（默认 32）；mpirun -np N。
+#   -NP N   仅覆盖 mpirun 进程数（默认 = R）。bench 为单进程多卡，默认 NP=1。
+#   其余参数原样透传给程序。
+#
+# 环境变量：
+#   BENCH       覆盖二进制路径（默认 test/<程序>）
+#   MPIRUN      mpirun 路径（默认 $MACA_PATH/ompi/bin/mpirun）
+#   MACA_PATH   默认 /opt/maca
+#   DEV         MACA_VISIBLE_DEVICES（默认 0..R-1）
+#   TIMEOUT     超时秒数（默认 600；check --all 默认 3600）
+#   MPI_MCA     OpenMPI 传输参数（默认 "--mca pml ob1 --mca btl self,vader --mca osc ^ucx"，
+#               单机快速启动；多机请设为空以使用 OpenMPI 默认）
+#   GPU_LOCK    1（默认）= 持有 .agents/work/lock/lock_gpu 再运行，避免多 Agent 争抢 GPU
+#   GPU_LOCK_WAIT  等待锁的秒数（默认 3600）
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+# ---- 程序选择（第一个非横杠参数；缺省 mybench） ----
+PROG=mybench
+if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+    PROG=$1
+    shift
+fi
+case "$PROG" in
+    mybench|check|bench) ;;
+    *) echo "[run.sh] 未知程序: $PROG（可选 mybench|check|bench）" >&2; exit 2 ;;
+esac
+
+# ---- GPU 临界区（AGENTS.md §4）：可重入保护，GPU_LOCK=0 关闭 ----
+LOCKFILE=.agents/work/lock/lock_gpu
+if [ "${GPU_LOCK:-1}" = "1" ] && [ "${_RUN_SH_LOCKED:-0}" != "1" ] && command -v flock >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$LOCKFILE")"
+    export _RUN_SH_LOCKED=1
+    exec flock -w "${GPU_LOCK_WAIT:-3600}" "$LOCKFILE" "$0" "$PROG" "$@"
+fi
 
 export MACA_PATH=${MACA_PATH:-/opt/maca}
 export PATH="$MACA_PATH/ompi/bin:$MACA_PATH/bin:$MACA_PATH/mxgpu_llvm/bin:$PATH"
 export LD_LIBRARY_PATH="$MACA_PATH/ompi/lib:$MACA_PATH/lib:$MACA_PATH/tools/cu-bridge/lib:$MACA_PATH/mxgpu_llvm/lib:${LD_LIBRARY_PATH:-}"
 
+# ---- 解析 -R / -NP，其余透传 ----
 R=${R:-32}
 NPROC=${NP:-}
+NP_SET=0
 PASSTHRU=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -R) R="$2"; shift 2 ;;
         -R*) R="${1#-R}"; shift ;;
-        -NP) NPROC="$2"; shift 2 ;;
-        -NP*) NPROC="${1#-NP}"; shift ;;
+        -NP) NPROC="$2"; NP_SET=1; shift 2 ;;
+        -NP*) NPROC="${1#-NP}"; NP_SET=1; shift ;;
         *) PASSTHRU+=("$1"); shift ;;
     esac
 done
 
-[ -z "$NPROC" ] && NPROC="$R"
+if [ -z "$NPROC" ]; then
+    if [ "$PROG" = bench ]; then NPROC=1; else NPROC="$R"; fi
+fi
 
-DEV=${DEV:-$(seq -s, 0 $((R - 1)))}
-BENCH=${BENCH:-./mybench}
+BENCH=${BENCH:-test/$PROG}
 MPIRUN=${MPIRUN:-$MACA_PATH/ompi/bin/mpirun}
-TIMEOUT=${TIMEOUT:-600}
-# MPI 传输（单机）：默认 pml=ob1 + btl=self,vader + osc 去 ucx。
-# OpenMPI 默认 pml/ucx 选择在本机 R=32 下 MPI_Init 约 6s、MPI_Finalize 约 4s；
-# 此组合约 0.2s。mybench 只用 80B handle 的 Allgather/Barrier，无跨机需求。
-# 多机运行请设 MPI_MCA="" 恢复 OpenMPI 默认。
+DEFAULT_TIMEOUT=600
+if [ "$PROG" = check ] && [[ " ${PASSTHRU[*]:-} " == *" --all "* ]]; then
+    DEFAULT_TIMEOUT=3600
+fi
+TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
 MPI_MCA=${MPI_MCA-"--mca pml ob1 --mca btl self,vader --mca osc ^ucx"}
 read -ra MCA_ARGS <<< "$MPI_MCA"
 
+DEV=${DEV:-$(seq -s, 0 $((R - 1)))}
+
 if [ ! -x "$BENCH" ]; then
-    echo "[run.sh] $BENCH 不存在，先构建：bash scripts/build.sh" >&2
+    echo "[run.sh] $BENCH 不存在，先构建：scripts/build.sh $PROG" >&2
     exit 2
 fi
 
@@ -68,8 +106,11 @@ fi
 
 export MACA_VISIBLE_DEVICES="$DEV"
 echo "[run.sh] $MPIRUN -np $NPROC $BENCH ${PASSTHRU[*]:-<default>}  (R=$R, MACA_VISIBLE_DEVICES=$DEV)"
+START=$(date +%s.%N)
 timeout -k 5 "$TIMEOUT" "$MPIRUN" --allow-run-as-root --oversubscribe \
     "${MCA_ARGS[@]}" -np "$NPROC" "$BENCH" "${PASSTHRU[@]}"
 rc=$?
+END=$(date +%s.%N)
+printf '[run.sh] wall=%.2fs\n' "$(echo "$END - $START" | bc 2>/dev/null || echo 0)"
 echo "[run.sh] rc=$rc"
 exit $rc

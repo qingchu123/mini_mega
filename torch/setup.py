@@ -61,7 +61,7 @@ build_include_dirs = [
 ]
 
 # 打包并链接 mini_mega 的已构建 kernel 接口层。
-kernel_so_src = os.path.join(mini_root, "megakernel.so")
+kernel_so_src = os.path.join(mini_root, "test", "megakernel.so")
 kernel_so_dst = os.path.join(current_dir, "mxmegakernel", "megakernel.so")
 if os.path.exists(kernel_so_src):
     shutil.copy2(kernel_so_src, kernel_so_dst)

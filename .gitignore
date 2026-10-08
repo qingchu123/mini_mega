@@ -1,6 +1,12 @@
 /bench
 /megakernel.so
 /mybench
+
+# test/ 下的构建产物
+/test/bench
+/test/check
+/test/mybench
+/test/megakernel.so
 .opencode/
 .deep-copilot/
 

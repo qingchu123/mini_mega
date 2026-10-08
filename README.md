@@ -14,7 +14,11 @@ mini_mega/
 │   ├── bench.cu                # benchmark：只调接口，不直接发射 kernel
 │   └── *.cuh                   # kernel 实现（kernel/prologue/compute/combine/flags/...）
 ├── include/deep_gemm/          # 最小外部头（mega_moe.cuh + common/{math,exception}.cuh）
-├── scripts/build.sh            # 先编 megakernel.so，再链接 bench
+├── scripts/build.sh            # 产物输出到 test/（so / bench / mybench / check / whl）
+├── scripts/run.sh              # 统一启动（mpirun，每进程一张卡；默认持 GPU 锁）
+├── test/mybench.cu             # MPI 性能基准（-s 1 均衡 / -s 2 TK 实录）
+├── test/check.cu               # MPI 正确性测试（--smoke / --all）
+├── test/mega_common.cuh        # 两者共用的设备资源 / 布局 / 路由构造
 ├── docs/02_测试流程与性能标准.md
 ├── perf.md                     # R=32 性能基准口径与基线
 ├── test/70.r32_tpr_perf/       # 均衡 TPR 基准
@@ -37,32 +41,57 @@ mini_mega/
 
 ## 构建
 
+产物统一输出到 `test/`（二进制与 `megakernel.so` 同目录，靠 `rpath=$ORIGIN` 定位）。
+
 ```bash
-setarch $(uname -m) -R bash scripts/build.sh all   # -> ./megakernel.so + ./bench + ./mybench + torch/dist/*.whl
+scripts/build.sh so        # test/megakernel.so     （接口层 + kernel）
+scripts/build.sh mybench   # test/mybench           （每进程一张卡的 MPI 性能基准）
+scripts/build.sh check     # test/check             （MPI 正确性测试）
+scripts/build.sh bench     # test/bench             （单进程多卡 benchmark，旧口径）
+scripts/build.sh whl       # torch/dist/*.whl       （需 python+torch，PYTHON= 可指定）
+scripts/build.sh all       # = so bench mybench check（不含 whl）
 ```
 
-`scripts/build.sh`（亦可 `./scripts/build`）支持目标参数，可多选：
-
-| 目标 | 产物 | 说明 |
-|---|---|---|
-| `so` | `megakernel.so` | host C++ 接口层 + kernel |
-| `bench` | `bench` | benchmark，只调接口，链接 megakernel.so |
-| `mybench` | `mybench` | 每进程一张卡的 MPI 基准 |
-| `whl` | `torch/dist/*.whl` | torch 层 wheel（需 python+torch，可用 `PYTHON=` 指定） |
-| `all` | 以上全部 | 等价 `so bench mybench whl` |
-| `-h` | 帮助 | 打印用法 |
-
-不带目标时等价 `all`；`bench`/`mybench`/`whl` 会自动先编 `so`。
+不带目标时等价 `all`；`mybench`/`check`/`bench`/`whl` 会自动先编 `so`。
+`whl` 不进 `all`：它依赖 torch 环境，本机未装 torch 时会必然失败。
 
 依赖：MACA（`MACA_PATH=/opt/maca`）、`cucc`、`mcr` 运行时、系统头 `cute`
-（位于 `/opt/maca/include`）。`so`/`bench`/`mybench` 无需 torch / 容器，
-`whl` 目标需 python+torch。运行 `./bench` 时经 rpath
-`$ORIGIN` 自动加载同目录的 `./megakernel.so`。
+（位于 `/opt/maca/include`）。`so`/`mybench`/`check`/`bench` 无需 torch / 容器。
 
 > 运行前必须 `export LD_LIBRARY_PATH=${MACA_PATH}/lib:${MACA_PATH}/ompi/lib:$LD_LIBRARY_PATH`：
 > 系统 `ld.so.cache` 中含 `/opt/maca-3.8.4/lib`，否则会与 `/opt/maca` 混版，
 > 报 `libmcpti.so: undefined symbol: TRACER_RECORD_NUM`。`scripts/build.sh`
-> 已内置该导出；`test/*/run.sh` 亦已内置。
+> 已内置该导出；`scripts/run.sh` 亦已内置。
+
+## 运行
+
+`scripts/run.sh [程序] [-R N] [参数...]`，程序为 `mybench`（默认）| `check` | `bench`。
+内部用 `mpirun -np R`（每进程一张卡），默认持 `.agents/work/lock/lock_gpu` 避免多 Agent 争抢。
+
+```bash
+# 性能（mybench）
+scripts/run.sh mybench -R 32 -s 1 -tprs 1,4,16,32,33,64,128,256,512   # 均衡（默认场景）
+scripts/run.sh mybench -R 32 -s 2 -top 50                              # TK 实录前 50 个
+scripts/run.sh mybench -R 32 -s 2 -cases 804900,807500                 # 指定 TK launch
+
+# 正确性（check）
+scripts/run.sh check --smoke     # 冒烟，<10s
+scripts/run.sh check --all       # 全量（均衡 TPR 表 + 全部 TK launch），不限时
+```
+
+实测（R=32，2026-10-08）：
+
+| 命令 | wall |
+|---|---|
+| `build.sh so` / `mybench` / `check` / `all` | 35s / 38s / 39s / 48s（后三者含重编 so） |
+| `run.sh mybench -R 32 -s 1 -tprs 1..512` | 7.2s |
+| `run.sh mybench -R 32 -s 2 -cases 804900,807500` | 6.7s |
+| `run.sh mybench -R 32 -s 2 -top 50` | 13.1s |
+| `run.sh check --smoke` | 8.0 ~ 9.0s（3 次） |
+| `run.sh check --all` | 约 4 分钟（762 用例） |
+
+`check --all` 结果见 `test/77.correctness/测试流程.md`（L0/REDUCE/graph 全 PASS；
+36 例 TK 用例 L1 未解决）。
 
 ## 测试（R=32 TPR=16/64/256）
 
