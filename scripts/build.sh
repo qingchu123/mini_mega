@@ -35,5 +35,12 @@ KERNEL_CFLAGS=${KERNEL_CFLAGS:-}
   ./megakernel.so -L"$MACA_PATH/ompi/lib" -lmpi \
   -Wl,-rpath,'$ORIGIN' -Wl,-rpath,"$MACA_PATH/ompi/lib"
 
+# 3) mybench：每进程一张卡的 MPI 基准（test/1.mytest），同样链接 MPI + megakernel.so。
+"$CUCC" -O3 -std=c++17 "${INC[@]}" -I"$MACA_PATH/ompi/include" \
+  -o mybench src/mybench.cu \
+  ./megakernel.so -L"$MACA_PATH/ompi/lib" -lmpi \
+  -Wl,-rpath,'$ORIGIN' -Wl,-rpath,"$MACA_PATH/ompi/lib"
+
 echo "built: $PWD/megakernel.so"
 echo "built: $PWD/bench"
+echo "built: $PWD/mybench"

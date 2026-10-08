@@ -1,5 +1,6 @@
 /bench
 /megakernel.so
+/mybench
 .opencode/
 .deep-copilot/
 

@@ -1,0 +1,21 @@
+
+run.sh -R 32 ->
+    main ->
+        parse_args
+        MPI_INIT
+        Gather IPC Handles for d_base_ptrs
+
+        if --s 0: (均衡模式)
+            --tprs 1,4,16,32,64,128
+            foreach : data_init mcMalloc x/topk_weights/ ...
+            foreach : eager luauch
+            forench : graph capture node x20
+            
+            foreach : 
+                warmup graph replay 
+                measuer start
+                graph repley x 2
+                measuer end
+
+        gather all rank timing
+        打印 min/max/mean timing
