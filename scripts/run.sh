@@ -12,7 +12,8 @@
 #     scripts/run.sh -R 32 --s 0 --tprs 1,4,16,32,64,128 --nodes 20 --replays 2
 #
 # 环境变量：BENCH（默认 ./mybench）、DEV（默认 0..R-1）、TIMEOUT（默认 600）、
-#          NP、MPIRUN、MACA_PATH（默认 /opt/maca）、WAIT_FREE=1（等外部占卡清空）。
+#          NP、MPIRUN、MACA_PATH（默认 /opt/maca）、WAIT_FREE=1（等外部占卡清空）、
+#          MPI_MCA（默认见下文，设为空则用 OpenMPI 默认传输）。
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -40,6 +41,12 @@ DEV=${DEV:-$(seq -s, 0 $((R - 1)))}
 BENCH=${BENCH:-./mybench}
 MPIRUN=${MPIRUN:-$MACA_PATH/ompi/bin/mpirun}
 TIMEOUT=${TIMEOUT:-600}
+# MPI 传输（单机）：默认 pml=ob1 + btl=self,vader + osc 去 ucx。
+# OpenMPI 默认 pml/ucx 选择在本机 R=32 下 MPI_Init 约 6s、MPI_Finalize 约 4s；
+# 此组合约 0.2s。mybench 只用 80B handle 的 Allgather/Barrier，无跨机需求。
+# 多机运行请设 MPI_MCA="" 恢复 OpenMPI 默认。
+MPI_MCA=${MPI_MCA-"--mca pml ob1 --mca btl self,vader --mca osc ^ucx"}
+read -ra MCA_ARGS <<< "$MPI_MCA"
 
 if [ ! -x "$BENCH" ]; then
     echo "[run.sh] $BENCH 不存在，先构建：bash scripts/build.sh" >&2
@@ -62,7 +69,7 @@ fi
 export MACA_VISIBLE_DEVICES="$DEV"
 echo "[run.sh] $MPIRUN -np $NPROC $BENCH ${PASSTHRU[*]:-<default>}  (R=$R, MACA_VISIBLE_DEVICES=$DEV)"
 timeout -k 5 "$TIMEOUT" "$MPIRUN" --allow-run-as-root --oversubscribe \
-    -np "$NPROC" "$BENCH" "${PASSTHRU[@]}"
+    "${MCA_ARGS[@]}" -np "$NPROC" "$BENCH" "${PASSTHRU[@]}"
 rc=$?
 echo "[run.sh] rc=$rc"
 exit $rc
