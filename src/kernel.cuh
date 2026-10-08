@@ -46,6 +46,7 @@ struct MegaArgs {
     int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
     int64_t slice_flags_idx, l1_prog_idx;
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
+    int* rsc_ptr;               // route_slot_counts（local_data）
     uint8_t* pool_ptr;   // [A-RWK] pool 独立缓冲基址（nullptr → self+pool_off）
     // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）
     // 已迁入 local_flags（lf->...），此处不再持有独立指针。
@@ -203,13 +204,13 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
         if (blockIdx.x == 0) {
             const int route_cycle =
                 (int)(a.lf->current_time[0][0] % M_CYCLE);
-            route_build_body(a.topk_idx, a.self, a.rsc_off, a.remote_peers,
-                             route_cycle, a.R, a.rank, a.tokens,
-                             a.slot_capacity, 0, 0, ctr);
+            route_build_body(a.topk_idx, a.self, a.rsc_ptr, a.rsc_off,
+                             a.remote_peers, route_cycle, a.R, a.rank,
+                             a.tokens, a.slot_capacity, 0, 0, ctr);
             if (kTick) a.lf->pre_ticks[0] = clock64();
-            publish_counts_body(a.self, a.rsc_off, a.remote_peers, route_cycle,
-                                a.R, a.rank, a.publish_epoch, a.recv_stride, 0,
-                                ctr);
+            publish_counts_body(a.self, a.rsc_ptr, a.rsc_off, a.remote_peers,
+                                route_cycle, a.R, a.rank, a.publish_epoch,
+                                a.recv_stride, 0, ctr);
             if (kTick) a.lf->pre_ticks[1] = clock64();
         }
     } else {

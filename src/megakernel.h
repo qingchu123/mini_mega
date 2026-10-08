@@ -53,6 +53,7 @@ struct MegaLaunchArgs {
     // ---- 前序 ----
     const int64_t* topk_idx = nullptr;   // 本 rank 输入路由
     const uint8_t* self = nullptr;       // 本 rank 对称区基址
+    int* rsc_ptr = nullptr;              // route_slot_counts（local_data）
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址表（设备数组）
     int R = 0, rank = 0;
     int tokens = 0;          // 实际 token 数

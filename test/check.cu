@@ -143,10 +143,11 @@ bool run_l0(Env& e, const Spec& s, const mt::Routes& routes) {
     ProdLayout Lc = e.geo.L;
     Lc.win_capacity = e.geo.max_tokens;
     std::string msg;
-    bool ok = validate_route(Lc, e.R, s.tokens, e.rank, routes, e.d.sym, &msg,
+    const uint8_t* ld_base = reinterpret_cast<const uint8_t*>(e.d.ld);
+    bool ok = validate_route(Lc, e.R, s.tokens, e.rank, routes, ld_base, &msg,
                              e.d.rd);
     if (ok)
-        ok = validate_publish(Lc, e.R, s.tokens, e.rank, routes, e.d.sym, kPublishEpoch,
+        ok = validate_publish(Lc, e.R, s.tokens, e.rank, routes, ld_base, kPublishEpoch,
                               &msg, (int)Lc.recv_stride, Lc.expert_recv_counts_off,
                               e.d.rd);
     if (ok) {
@@ -154,7 +155,7 @@ bool run_l0(Env& e, const Spec& s, const mt::Routes& routes) {
         CHECK(mcSetDevice(e.rank));
         CHECK(mcMemcpy(ts.data(), e.d.lf->out_total, kGrid * sizeof(int),
                        mcMemcpyDeviceToHost));
-        ok = validate_task_setup(Lc, e.R, e.rank, routes, e.d.sym, nullptr, ts.data(), &msg);
+        ok = validate_task_setup(Lc, e.R, e.rank, routes, ld_base, nullptr, ts.data(), &msg);
     }
     if (!ok) detail(e, "L0", msg);
     return ok;

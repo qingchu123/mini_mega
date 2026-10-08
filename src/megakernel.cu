@@ -81,6 +81,7 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     MegaArgs m{};
     m.topk_idx = a.topk_idx;
     m.self = a.self;
+    m.rsc_ptr = a.rsc_ptr;
     m.peer_bases = a.peer_bases;
     m.R = a.R;
     m.rank = a.rank;

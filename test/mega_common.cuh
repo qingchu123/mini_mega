@@ -64,6 +64,8 @@ inline Geo make_geo(int R, int max_tokens, int win) {
     g.win = win;
     g.L = compute_layout(R, max_tokens, kTopk, kHidden, kIntermediate, win);
     g.L.win_capacity = win;
+    g.L.route_slot_counts_off = (int64_t)offsetof(local_data, route_slot_counts);
+    g.L.prefix_tbl_off = (int64_t)offsetof(local_data, prefix_tbl);
     const int64_t barrier_pad_off = ((g.L.sym_bytes + 255) / 256) * 256;
     const int64_t recv_pad_off =
         ((barrier_pad_off + (int64_t)R * 64 * 4 + 255) / 256) * 256;
@@ -243,8 +245,9 @@ inline void reset_dev(const Geo& g, const Dev& d, const Routes& routes, int toke
     CHECK(mcSetDevice(d.rank));
     CHECK(mcMemcpy(d.sym + L.topk_idx_off, route.data(), route.size() * sizeof(int64_t),
                    mcMemcpyHostToDevice));
-    CHECK(mcMemset(d.sym + L.route_slot_counts_off, 0, (size_t)g.R * kEPR * sizeof(int)));
-    CHECK(mcMemset(d.sym + L.prefix_tbl_off, 0, (size_t)L.prefix_tbl_bytes));
+    CHECK(mcMemset(d.ld ? &d.ld->route_slot_counts[0] : (int*)(d.sym + L.route_slot_counts_off),
+                   0, (size_t)g.R * kEPR * sizeof(int)));
+    CHECK(mcMemset(&d.ld->prefix_tbl[0][0], 0, (size_t)L.prefix_tbl_bytes));
     CHECK(mcMemset(d.sym + L.barrier_slots_off, 0, (size_t)g.R * g.R * 4));
     CHECK(mcMemset(d.lf, 0, sizeof(local_flags)));
     CHECK(mcMemset(d.rf, 0, sizeof(ranks_flags)));
@@ -275,6 +278,7 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.ring = kRing;
     a.src_off = L.src_index_table_off;
     a.rsc_off = L.route_slot_counts_off;
+    a.rsc_ptr = d.ld ? &d.ld->route_slot_counts[0] : nullptr;
     a.recv_off = L.expert_recv_counts_off;
     a.prefix_off = L.prefix_tbl_off;
     a.barrier_off = L.barrier_slots_off;
@@ -298,7 +302,7 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.max_spins = (int)kSpinLimit;
     a.publish_epoch = kPublishEpoch;
     a.recv_stride = (int)L.recv_stride;
-    a.prefix_ptr = nullptr;
+    a.prefix_ptr = d.ld ? &d.ld->prefix_tbl[0][0] : nullptr;
     a.w1 = d.w1;
     a.l1_n_total = kIntermediate * 2;
     a.l1_block_n = 256;

@@ -104,9 +104,10 @@
 // 骨架 bench:190-224 逐条移植（仅 block0 调用；tid_base/smem_off 供 WS 子集）。
 __device__ __forceinline__ void route_build_body(
         const int64_t* __restrict__ topk_idx, const uint8_t* self,
-        int64_t rsc_off, ranks_data* const* remote_peers, int cycle, int R,
-        int rank, int tokens, int slot_capacity, int tid_base = 0,
-        int smem_off = 0, unsigned long long* ctr = nullptr) {
+        int* rsc_ptr, int64_t rsc_off, ranks_data* const* remote_peers,
+        int cycle, int R, int rank, int tokens, int slot_capacity,
+        int tid_base = 0, int smem_off = 0,
+        unsigned long long* ctr = nullptr) {
     extern __shared__ __align__(16) uint8_t smem_raw[];
     int* slots = reinterpret_cast<int*>(smem_raw + smem_off);
     const int E = R * kEPR;
@@ -194,7 +195,9 @@ __device__ __forceinline__ void route_build_body(
         __threadfence_system();
     }
     __syncthreads();
-    int* rsc = reinterpret_cast<int*>(const_cast<uint8_t*>(self) + rsc_off);
+    int* rsc = (rsc_ptr != nullptr)
+                   ? rsc_ptr
+                   : reinterpret_cast<int*>(const_cast<uint8_t*>(self) + rsc_off);
     for (int e = tid; e < E; e += nthr) {
         const int c = slots[e];
         rsc[e] = c > slot_capacity ? slot_capacity : c;
@@ -205,8 +208,9 @@ __device__ __forceinline__ void route_build_body(
 // ------------------------------------------------------------ PUBLISH_COUNTS --
 // 骨架 bench:229-255 逐条移植（仅 block0 调用；行宽 recv_stride 由调用方保证）。
 __device__ __forceinline__ void publish_counts_body(
-        const uint8_t* self, int64_t rsc_off, ranks_data* const* remote_peers,
-        int cycle, int R, int rank, unsigned epoch,
+        const uint8_t* self, const int* rsc_ptr, int64_t rsc_off,
+        ranks_data* const* remote_peers, int cycle, int R, int rank,
+        unsigned epoch,
         int recv_stride = (int)((kEPR + 1 + 3) & ~3), int tid_base = 0,
         unsigned long long* ctr = nullptr) {
     const int E = R * kEPR;
@@ -214,7 +218,9 @@ __device__ __forceinline__ void publish_counts_body(
     const int nthr = (tid_base != 0) ? 128 : (int)blockDim.x;
     // [集71] PUBLISH_COUNTS 执行次数（tid0 计一次）
     if (tid == 0) MX_CTR_ADD(ctr, kCtrPhasePublish, 1);
-    const int* rsc = reinterpret_cast<const int*>(self + rsc_off);
+    const int* rsc = (rsc_ptr != nullptr)
+                         ? rsc_ptr
+                         : reinterpret_cast<const int*>(self + rsc_off);
     for (int e = tid; e < E; e += nthr) {
         const int dst = e / kEPR;
         const int le = e % kEPR;
