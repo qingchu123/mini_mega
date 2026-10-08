@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <mpi.h>   // MPI 模式（每进程一 rank/一卡）
 
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -90,8 +91,11 @@ struct RankRes {
 static std::atomic<int> g_rb_cnt{0};
 static std::atomic<int> g_rb_gen{0};
 static int g_rb_n = 0;
+static int g_mpi_rank = 0;   // MPI rank（mpirun 下 = 本进程负责的 rank）
+static int g_mpi_size = 1;   // MPI size（>1 走单进程单 rank 路径）
 
 static void rank_barrier() {
+    if (g_mpi_size > 1) { MPI_Barrier(MPI_COMM_WORLD); return; }
     const int n = g_rb_n;
     if (n <= 1) return;
     const int gen = g_rb_gen.load(std::memory_order_acquire);
@@ -2466,17 +2470,322 @@ static int run_aligned(RunOpts o) {
 }
 
 // ---------------------------------------------------------------- main --
+// ======================================================== MPI 模式 --
+// 每进程一张卡：rank = MPI rank，R = MPI size。用 MPI_Allgather 交换 IPC handle、
+// MPI_Barrier 做栅栏；每进程只建本 rank 的资源。与 run_aligned 同口径（均衡/tk）。
+static int run_aligned_mpi(RunOpts o) {
+    const int R = g_mpi_size;
+    const int rank = g_mpi_rank;
+    o.scene.ranks = R;
+    CHECK(mcSetDevice(rank));
+
+    const bool tk_mode = !o.tk_info.empty();
+    std::vector<TkCase> cases;
+    if (o.tk_all) {
+        std::string e;
+        if (!load_tk_all(o.tk_info, R, kTopk, kEPR, &cases, &e)) {
+            std::fprintf(stderr, "[bench] %s\n", e.c_str());
+            return 2;
+        }
+        if (o.tk_first > 0 && (int)cases.size() > o.tk_first) cases.resize(o.tk_first);
+    } else if (tk_mode) {
+        TkCase c;
+        std::string e;
+        if (!load_tk_case(o.tk_info, o.tk_launch, R, kTopk, kEPR, &c, &e)) {
+            std::fprintf(stderr, "[bench] %s\n", e.c_str());
+            return 2;
+        }
+        cases.push_back(c);
+    } else {
+        const std::vector<int> tprs =
+            o.tpr_list.empty() ? aligned_tpr_sweep() : o.tpr_list;
+        for (int t : tprs) {
+            TkCase c;
+            c.tokens = t;
+            c.max_expert = t * kTopk / kEPR;
+            c.routes.resize(R);
+            for (int rr = 0; rr < R; ++rr)
+                c.routes[rr] = make_routes(RoutePattern::Balanced, rr, R, t);
+            cases.push_back(c);
+        }
+    }
+    int tmax = 0, cap_need = 0;
+    for (const TkCase& c : cases) {
+        tmax = std::max(tmax, c.tokens);
+        cap_need = std::max(cap_need, c.max_expert);
+    }
+    const int max_tokens =
+        o.max_tokens_set
+            ? std::max(std::max(o.scene.max_tokens, tmax), cap_need)
+            : std::max(std::max(512, tmax), cap_need);
+    bool imbalanced = false;
+    for (TkCase& c : cases) {
+        std::map<int, int> cnt;
+        for (const auto& rr : c.routes)
+            for (int64_t e : rr)
+                if (e >= 0 && e < (int64_t)R * kEPR) ++cnt[(int)e];
+        int med = 1;
+        if (!cnt.empty()) {
+            std::vector<int> nz;
+            nz.reserve(cnt.size());
+            for (const auto& kv : cnt) nz.push_back(kv.second);
+            std::sort(nz.begin(), nz.end());
+            med = nz[nz.size() / 2];
+        }
+        c.imbalanced = (c.max_expert >= 3 * std::max(1, med));
+        if (c.imbalanced) imbalanced = true;
+        int wc;
+        if (o.scene.win_cap > 0) {
+            wc = o.scene.win_cap;
+        } else if (c.imbalanced) {
+            int tgt = (med >= 32) ? (c.max_expert + kRing - 1) / kRing
+                                  : std::min((int)48, c.max_expert);
+            tgt = ((tgt + kM - 1) / kM) * kM;
+            wc = std::min(max_tokens, std::max((int)kM, tgt));
+        } else {
+            wc = std::max(128, max_tokens);
+        }
+        c.win_cap = std::max((int)kM, wc);
+    }
+    int win_cap = kM;
+    for (const TkCase& c : cases) win_cap = std::max(win_cap, c.win_cap);
+    if (o.scene.win_cap > 0) win_cap = o.scene.win_cap;
+    const int nodes = o.nodes_set ? o.scene.nodes : 20;
+    const int replays = o.replays_set ? o.measure_replays : 2;
+    o.scene.tokens = tmax;
+    o.scene.max_tokens = max_tokens;
+    o.scene.win_cap = win_cap;
+
+    ProdLayout L = compute_layout(R, max_tokens, kTopk, kHidden, kIntermediate,
+                                  win_cap + o.scene.win_pad);
+    L.win_capacity = win_cap;
+    const int64_t barrier_pad_off = ((L.sym_bytes + 255) / 256) * 256;
+    const int64_t recv_pad_off =
+        ((barrier_pad_off + (int64_t)R * 64 * 4 + 255) / 256) * 256;
+    const int64_t combine_f32_off =
+        ((recv_pad_off + (int64_t)R * 64 * 4 + 255) / 256) * 256;
+    const int64_t combine_rows_end =
+        ((combine_f32_off + (int64_t)kTopk * max_tokens * kHidden * 2 + 255) /
+         256) * 256;
+    const int64_t sym_alloc = combine_rows_end;
+
+    if (rank == 0) {
+        std::printf("设备数=%d(MPI) topk=%d 路由=%s graph: nodes=%d replays=%d\n",
+                    R, kTopk,
+                    o.tk_all ? "TK_ALL" : (tk_mode ? "不均衡(TK_INFO)" : "均衡"),
+                    nodes, replays);
+        if (tk_mode && !o.tk_all) {
+            const TkCase& c = cases[0];
+            std::printf("[TK_INFO] launch=%d tokens=%d 单专家最大收行=%d 非零专家=%d/%d\n",
+                        c.launch, c.tokens, c.max_expert, c.nz_expert, R * kEPR);
+        }
+        if (o.tk_all)
+            std::printf("%-9s %-5s %-6s %-7s %-6s %10s %10s %10s %10s\n", "launch",
+                        "ranks", "tokens", "maxexp", "nz", "us_sel", "us_min",
+                        "us_max", "us_mean");
+        else
+            std::printf("%-4s %-6s %10s %10s %10s %14s\n", "R", "TPR", "us_sel",
+                        "us_min", "us_max", "口径");
+    }
+
+    // ---- 本 rank 资源 ----
+    RankRes r;
+    r.rank = rank;
+    r.dev = rank;
+    void* p = nullptr;
+    if (mcExtMallocWithFlags(&p, (size_t)sym_alloc, mcDeviceMallocFinegrained) !=
+            mcSuccess || p == nullptr)
+        CHECK(mcMalloc(&p, (size_t)sym_alloc));
+    r.sym = static_cast<uint8_t*>(p);
+    CHECK(mcMemset(r.sym, 0, (size_t)sym_alloc));
+    CHECK(mcMalloc((void**)&r.lf, sizeof(local_flags)));
+    CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
+    {
+        void* rfp = nullptr;
+        if (mcExtMallocWithFlags(&rfp, sizeof(ranks_flags), mcDeviceMallocFinegrained) !=
+                mcSuccess || rfp == nullptr)
+            CHECK(mcMalloc(&rfp, sizeof(ranks_flags)));
+        r.rf = static_cast<ranks_flags*>(rfp);
+        CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
+    }
+    CHECK(mcMalloc((void**)&r.w1, (size_t)kEPR * 2 * kIntermediate * kHidden));
+    CHECK(mcMalloc((void**)&r.w2, (size_t)kEPR * kHidden * kIntermediate));
+    fp8mega::fill_weights_lane(r.w1, kEPR * 2 * kIntermediate, kHidden, 17u, 0);
+    fp8mega::fill_weights_lane(r.w2, kEPR * kHidden, kIntermediate, 91u, 0);
+    CHECK(mcMalloc((void**)&r.ffn_hidden,
+                   (size_t)kEPR * kRing * win_cap * kIntermediate));
+    CHECK(mcMemset(r.ffn_hidden, 0, (size_t)kEPR * kRing * win_cap * kIntermediate));
+    CHECK(mcMalloc((void**)&r.l2_out, (size_t)kGrid * win_cap * kHidden * 2));
+    CHECK(mcMemset(r.l2_out, 0, (size_t)kGrid * win_cap * kHidden * 2));
+    CHECK(mcMalloc((void**)&r.y, (size_t)max_tokens * kHidden * sizeof(float)));
+    CHECK(mcMemset(r.y, 0, (size_t)max_tokens * kHidden * sizeof(float)));
+    r.frag_a = nullptr;
+    r.frag2 = nullptr;
+    if (imbalanced) {
+        const int mt_total = (win_cap + 15) >> 4;
+        const size_t asz = (size_t)(kHidden / 32) * mt_total * 512;
+        const size_t f2sz = (size_t)(kIntermediate / 32) * mt_total * 512;
+        if (mt_total > 0) {
+            CHECK(mcMalloc((void**)&r.frag_a, (size_t)kEPR * kRing * asz));
+            CHECK(mcMalloc((void**)&r.frag2, (size_t)kEPR * kRing * f2sz));
+        }
+    }
+    {
+        std::vector<uint8_t> xb((size_t)max_tokens * kHidden);
+        for (int t = 0; t < max_tokens; ++t)
+            for (int cc = 0; cc < kHidden; ++cc)
+                xb[(size_t)t * kHidden + cc] =
+                    (uint8_t)((rank * 37 + t * 7 + cc * 3) & 0x3f);
+        CHECK(mcMemcpy(r.sym + L.x_off, xb.data(), xb.size(), mcMemcpyHostToDevice));
+        std::vector<float> wv((size_t)max_tokens * kTopk);
+        for (int i = 0; i < max_tokens * kTopk; ++i)
+            wv[i] = 1.0f + rank * 0.25f + (i % 7) * 0.01f;
+        CHECK(mcMemcpy(r.sym + L.topk_weights_off, wv.data(),
+                       wv.size() * sizeof(float), mcMemcpyHostToDevice));
+    }
+    r.peer_sym.assign(R, nullptr);
+    r.peer_rf.assign(R, nullptr);
+    CHECK(mcIpcGetMemHandle(&r.handle, r.sym));
+    CHECK(mcIpcGetMemHandle(&r.rf_handle, r.rf));
+
+    // ---- MPI 交换 IPC handle ----
+    std::vector<mcIpcMemHandle_t> all_h(R), all_rfh(R);
+    MPI_Allgather(&r.handle, (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, all_h.data(),
+                  (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, MPI_COMM_WORLD);
+    MPI_Allgather(&r.rf_handle, (int)sizeof(mcIpcMemHandle_t), MPI_BYTE,
+                  all_rfh.data(), (int)sizeof(mcIpcMemHandle_t), MPI_BYTE,
+                  MPI_COMM_WORLD);
+    for (int d = 0; d < R; ++d) {
+        if (d == rank) continue;
+        void* q = nullptr;
+        if (mcIpcOpenMemHandle(&q, all_h[d], mcIpcMemLazyEnablePeerAccess) !=
+            mcSuccess) {
+            std::fprintf(stderr, "rank%d open peer%d sym failed\n", rank, d);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        r.peer_sym[d] = static_cast<uint8_t*>(q);
+        void* qr = nullptr;
+        if (mcIpcOpenMemHandle(&qr, all_rfh[d], mcIpcMemLazyEnablePeerAccess) !=
+            mcSuccess) {
+            std::fprintf(stderr, "rank%d open peer%d rf failed\n", rank, d);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        r.peer_rf[d] = static_cast<ranks_flags*>(qr);
+    }
+    for (int d = 0; d < R; ++d) {
+        if (d == rank) continue;
+        int can = 0;
+        if (mcDeviceCanAccessPeer(&can, rank, d) == mcSuccess && can)
+            mcDeviceEnablePeerAccess(d, 0);
+    }
+    {
+        std::vector<uint8_t*> bp(R);
+        std::vector<ranks_flags*> rp(R);
+        for (int d = 0; d < R; ++d) {
+            bp[d] = (d == rank) ? r.sym : r.peer_sym[d];
+            rp[d] = (d == rank) ? r.rf : r.peer_rf[d];
+        }
+        CHECK(mcMalloc((void**)&r.d_base_ptrs, R * sizeof(uint8_t*)));
+        CHECK(mcMemcpy(r.d_base_ptrs, bp.data(), R * sizeof(uint8_t*),
+                       mcMemcpyHostToDevice));
+        CHECK(mcMalloc((void**)&r.d_rf_ptrs, R * sizeof(ranks_flags*)));
+        CHECK(mcMemcpy(r.d_rf_ptrs, rp.data(), R * sizeof(ranks_flags*),
+                       mcMemcpyHostToDevice));
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // ---- 逐测例 ----
+    for (const TkCase& c : cases) {
+        o.scene.tokens = c.tokens;
+        CHECK(mcMemcpy(r.sym + L.topk_idx_off, c.routes[rank].data(),
+                       c.routes[rank].size() * sizeof(int64_t),
+                       mcMemcpyHostToDevice));
+        CHECK(mcMemset(r.sym + L.src_index_table_off, 0,
+                       (size_t)L.src_index_table_bytes));
+        CHECK(mcMemset(r.sym + L.barrier_slots_off, 0, (size_t)R * R * 4));
+        CHECK(mcMemset(r.lf, 0, sizeof(local_flags)));
+        CHECK(mcMemset(r.rf, 0, sizeof(ranks_flags)));
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        mcStream_t st = nullptr;
+        CHECK(mcStreamCreate(&st));
+        const int wc_case = std::min(win_cap, c.win_cap);
+        fp8mega::MegaLaunchArgs a = make_mega_args(o, L, r, wc_case, combine_f32_off);
+        const bool reuse_prologue = std::getenv("MX_NO_REUSE") == nullptr;
+        int reuse_mode = 2;
+        if (const char* rm = std::getenv("MX_REUSE_MODE")) reuse_mode = std::atoi(rm);
+        bool cap = false;
+        double per_r = -1.0;
+        std::string cal = chain_measure(
+            st, nodes, replays,
+            [&](mcStream_t s, int k) {
+                fp8mega::MegaLaunchArgs b = a;
+                b.skip_prologue = (reuse_prologue && k != 0) ? reuse_mode : 0;
+                fp8mega::launch_full(b, s);
+            },
+            &per_r, &cap);
+        mcStreamDestroy(st);
+
+        std::vector<double> allper(R, -1.0);
+        MPI_Allgather(&per_r, 1, MPI_DOUBLE, allper.data(), 1, MPI_DOUBLE,
+                      MPI_COMM_WORLD);
+        double vmin = 1e30, vmax = -1.0, vsum = 0.0;
+        int vcnt = 0;
+        for (int d = 0; d < R; ++d)
+            if (allper[d] > 0.0) {
+                vmin = std::min(vmin, allper[d]);
+                vmax = std::max(vmax, allper[d]);
+                vsum += allper[d];
+                ++vcnt;
+            }
+        double vmean = vcnt ? vsum / vcnt : -1.0;
+        double best = vmin;   // 与 run_aligned 同：us_sel = 跨 rank 取 min
+        if (rank == 0) {
+            if (o.tk_all)
+                std::printf("%-9d %-5d %-6d %-7d %-6d %10.2f %10.2f %10.2f %10.2f %s\n",
+                            c.launch, c.ranks, c.tokens, c.max_expert, c.nz_expert,
+                            best, vmin, vmax, vmean, cal.c_str());
+            else
+                std::printf("%-4d %-6d %10.2f %10.2f %10.2f %s\n", R, c.tokens, best,
+                            vmin, vmax, cal.c_str());
+        }
+        std::fflush(stdout);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &g_mpi_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &g_mpi_size);
     RunOpts o;
     std::string err;
     if (!parse_args(argc, argv, &o, &err)) {
         std::fprintf(stderr, "[bench] %s\n", err.c_str());
         usage(argv[0]);
+        MPI_Finalize();
         return 2;
     }
-    if (o.aligned) return run_aligned(o);
-    if (o.sweep) return run_sweep(o);
-    // 单档（旧行为）：--aligned 0 且不带 --sweep 时与改造前完全一致
-    SceneResult r;
-    return run_scene(o, &r);
+    int rc = 0;
+    if (g_mpi_size > 1) {
+        // MPI 模式：每进程一 rank/一卡（mpirun -np R）
+        if (o.aligned) {
+            rc = run_aligned_mpi(o);
+        } else {
+            if (g_mpi_rank == 0)
+                std::fprintf(stderr, "[bench] MPI 模式仅支持 --aligned 1\n");
+            rc = 2;
+        }
+    } else if (o.aligned) {
+        rc = run_aligned(o);
+    } else if (o.sweep) {
+        rc = run_sweep(o);
+    } else {
+        // 单档（旧行为）：--aligned 0 且不带 --sweep 时与改造前完全一致
+        SceneResult r;
+        rc = run_scene(o, &r);
+    }
+    MPI_Finalize();
+    return rc;
 }

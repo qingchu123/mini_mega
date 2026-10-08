@@ -30,9 +30,10 @@ KERNEL_CFLAGS=${KERNEL_CFLAGS:-}
 
 # 2) bench：只 include megakernel.h，链接 megakernel.so（rpath=$ORIGIN 便于原地运行）
 #    文件名非 lib*.so，故直接以路径链接（不用 -l）。
-"$CUCC" -O3 -std=c++17 "${INC[@]}" \
+"$CUCC" -O3 -std=c++17 "${INC[@]}" -I"$MACA_PATH/ompi/include" \
   -o bench src/bench.cu \
-  ./megakernel.so -Wl,-rpath,'$ORIGIN'
+  ./megakernel.so -L"$MACA_PATH/ompi/lib" -lmpi \
+  -Wl,-rpath,'$ORIGIN' -Wl,-rpath,"$MACA_PATH/ompi/lib"
 
 echo "built: $PWD/megakernel.so"
 echo "built: $PWD/bench"
