@@ -52,88 +52,90 @@ constexpr int kFp8BarFlagsNumInt32 = 1032;
 constexpr int kCombineSlicesMax = 32;
 constexpr int kMaxCombineRows = 512;
 
-// ---- 本 rank 私有（普通显存）----
-struct alignas(256) local_flags {
+#define ALSIZE()  alignas(1048576)
+
+// ---- 本 rank 私有（mcMalloc显存）----
+struct ALSIZE() local_flags {
     // 每 block 单调 launch 计数：[kGrid][MX_FLAGS_NO_CACHE]
     //   [b][0] xbar 相位；[b][1] task_setup 相位；其余列预留。
-    alignas(256) int64_t current_time[kGrid][MX_FLAGS_NO_CACHE];
+    ALSIZE() int64_t current_time[kGrid][MX_FLAGS_NO_CACHE];
 
     // 原 bar_flags 旗区（索引逐一对应原 kBar*Idx，行为不变）：
     //   xrelease/task_ready/task_counter/l2_done/slice_flags/l1_prog/nslice_eff ...
     // [M_CYCLE] 旋转维：本轮只用 bar[c]，同一槽位每 M_CYCLE 轮才复用一次。
-    alignas(256) uint32_t bar[M_CYCLE][kFp8BarFlagsNumInt32];
+    ALSIZE() uint32_t bar[M_CYCLE][kFp8BarFlagsNumInt32];
 
     // ---- 控制/诊断状态（原 MegaArgs 独立指针迁入）----
-    alignas(256) int out_total[kGrid];       // 每 block 总窗口数（TASK_SETUP 写）
-    alignas(256) int out_processed[kGrid];   // 每 block 处理任务数（任务循环写）
-    alignas(256) int dbg[8];                 // 诊断码（超时归因）
-    alignas(256) uint32_t ck_dbg[kEPR * 16]; // checksum 超时行诊断（可选）
+    ALSIZE() int out_total[kGrid];       // 每 block 总窗口数（TASK_SETUP 写）
+    ALSIZE() int out_processed[kGrid];   // 每 block 处理任务数（任务循环写）
+    ALSIZE() int dbg[8];                 // 诊断码（超时归因）
+    ALSIZE() uint32_t ck_dbg[kEPR * 16]; // checksum 超时行诊断（可选）
     // 前序/计算链相位时间戳：task_trace 打开时每 block 16 槽，普通 8；统一按 16 分配
-    alignas(256) unsigned long long pre_ticks[kGrid * 16];
-    alignas(256) float l1_chk[kGrid];        // L1 数值校验累加
-    alignas(256) float l2_chk[kGrid];        // L2 数值校验累加
+    ALSIZE() unsigned long long pre_ticks[kGrid * 16];
+    ALSIZE() float l1_chk[kGrid];        // L1 数值校验累加
+    ALSIZE() float l2_chk[kGrid];        // L2 数值校验累加
 };
 
 // ---- 跨 rank（FG 显存，peer 可写）----
-struct alignas(256) ranks_flags {
+struct ALSIZE() ranks_flags {
     // 跨 rank ROUTE_READY barrier，转置布局 xbar_barrier[c][src][dst]
     // （与原 sym 内 barrier_slots 的 src*R+dst 语义一致，行 stride 用 kGrid）。
     // [M_CYCLE] 旋转维：本轮只用 copy c。
-    alignas(256) uint32_t xbar_barrier[M_CYCLE][kGrid][kGrid];
+    ALSIZE() uint32_t xbar_barrier[M_CYCLE][kGrid][kGrid];
 
     // 跨 rank COMBINE 完成标记：combine_sums[c][k][token][slice] = epoch。
     // 取代原 sym::combine_sums（uint32 区）；行 stride = kMaxCombineRows。
     // combine_rows（BF16 数据）仍留在 sym，不在此。
     // [M_CYCLE] 旋转维：本轮只用 copy c（±2MB/rank，可接受）。
-    alignas(256) uint32_t
+    ALSIZE() uint32_t
         combine_sums[M_CYCLE][kTopk][kMaxCombineRows][kCombineSlicesMax];
 };
 
-// ---- 本 rank 私有（普通显存）----
-struct alignas(256) local_data {
+// ---- 本 rank 私有（mcMalloc显存）----
+struct ALSIZE() local_data {
     // 输入复用
-    alignas(256) uint8_t x[kMaxTPR][kHidden];
-    alignas(256) int64_t topk_idx[kMaxTPR][kTopk];
-    alignas(256) float topk_weights[kMaxTPR][kTopk];
+    ALSIZE() uint8_t x[kMaxTPR][kHidden];
+    ALSIZE() int64_t topk_idx[kMaxTPR][kTopk];
+    ALSIZE() float topk_weights[kMaxTPR][kTopk];
 
     // 内部使用
-    alignas(256) int32_t route_slot_counts[kRanks * kEPR];
-    alignas(256) int32_t prefix_tbl[kEPR][kRanks + 1];
-    alignas(256) uint8_t expert_tokens[kEPR* kRing][kMaxTPR][kHidden];
-    alignas(256) float token_route_weights[kEPR + kGrid][kMaxTPR];
-    alignas(256) int token_src_meta[kEPR + kGrid][kMaxTPR][3];
+    ALSIZE() int32_t route_slot_counts[kRanks * kEPR];
+    ALSIZE() int32_t prefix_tbl[kEPR][kRanks + 1];
+    ALSIZE() uint8_t expert_tokens[kEPR* kRing][kMaxTPR][kHidden];
+    ALSIZE() float token_route_weights[kEPR + kGrid][kMaxTPR];
+    ALSIZE() int token_src_meta[kEPR + kGrid][kMaxTPR][3];
 
 
-    alignas(256) uint8_t w1[kEPR][2*kIntermediate][kHidden];
-    alignas(256) uint8_t w2[kEPR][kHidden][kIntermediate];
-    alignas(256) uint8_t ffn_hidden[kEPR * kRing][kMaxTPR][kIntermediate];
-    alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
-    alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden/32) * ((kMaxTPR + 15) / 16) * 512];
-    alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate/32) * ((kMaxTPR + 15) / 16) * 512];
-    alignas(256) float y[kMaxTPR][kHidden];
-    alignas(256) float ynode[kMaxTPR][kHidden]; //for debug
+    ALSIZE() uint8_t w1[kEPR][2*kIntermediate][kHidden];
+    ALSIZE() uint8_t w2[kEPR][kHidden][kIntermediate];
+    ALSIZE() uint8_t ffn_hidden[kEPR * kRing][kMaxTPR][kIntermediate];
+    ALSIZE() uint16_t l2_out[kGrid][kMaxTPR][kHidden];
+    ALSIZE() uint8_t frag_a[kEPR * kRing][int(kHidden/32) * ((kMaxTPR + 15) / 16) * 512];
+    ALSIZE() uint8_t frag2[kEPR * kRing][int(kIntermediate/32) * ((kMaxTPR + 15) / 16) * 512];
+    ALSIZE() float y[kMaxTPR][kHidden];
+    ALSIZE() float ynode[kMaxTPR][kHidden]; //for debug
 };
 
-// ---- 本 rank 私有（普通显存）----
-struct alignas(256) rwk_data {
+// ---- 本 rank 私有（mcMalloc显存）----
+struct ALSIZE() rwk_data {
     local_flags lf;
     local_data ld;
 };
 
 
 // ---- 跨 rank（FG 显存，peer 可写）----
-struct alignas(256) ranks_data {
+struct ALSIZE() ranks_data {
 
-    alignas(256) uint32_t src_index_table[M_CYCLE][kEPR][kRanks][kMaxTPR];
-    alignas(256) uint32_t expert_recv_counts[M_CYCLE][kRanks][(((kEPR + 1) + 3) / 4) * 4];
-    alignas(256) uint16_t combine_rows[M_CYCLE][kTopk][kMaxTPR][kHidden];
+    ALSIZE() uint32_t src_index_table[M_CYCLE][kEPR][kRanks][kMaxTPR];
+    ALSIZE() uint32_t expert_recv_counts[M_CYCLE][kRanks][(((kEPR + 1) + 3) / 4) * 4];
+    ALSIZE() uint16_t combine_rows[M_CYCLE][kTopk][kMaxTPR][kHidden];
 
 };
 
 
 
-// ---- 本 rank 私有（普通显存）----
-struct alignas(256) unk_data {
+// ---- 本 rank 私有（mcMalloc显存）----
+struct ALSIZE() unk_data {
     ranks_flags rf;
     ranks_data rd;
 };
