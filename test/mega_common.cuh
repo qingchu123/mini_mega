@@ -76,10 +76,10 @@ inline Geo make_geo(int R, int max_tokens, int win) {
     return g;
 }
 
-// 每 launch 的窗口容量。统一取 win = max_tokens（= slot_capacity）。
-//   自适应窗（win < slot）在当前内核下数值错误（check --all: REDUCE rel≈1/8），
-//   其根因独立于 task_setup/dispatch 的窗表口径——已留档待后续定位。
-//   在干净复现出正确性之前不得开启 adaptive。
+// 每 launch 的窗口容量。已验证正确：win == slot == max_tokens。
+//   自适应窗（win<slot）在当前内核会令部分 launch 的 REDUCE/graph 失败（见 test/mega_common.cuh 注释与
+//   test/77.correctness/测试流程.md），其精确位置在 COMBINE/L2 窗槽 stride 关系，尚未根治。
+//   现行策略在此保持等式约束；adaptive 已停用不构成行为变化。
 inline int choose_win_cap_counts(const std::vector<int>& per_expert, int max_tokens) {
     (void)per_expert;
     return max_tokens;

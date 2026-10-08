@@ -356,6 +356,32 @@ CheckStats check_reduce(Env& e, const Spec& s, const mt::Routes& routes,
         ref_reduce(rows_h.data(), routes[e.rank].data(), w_h.data(), t, kTopk, E, T,
                    kHidden, y_ref.data() + (size_t)t * kHidden);
     const CheckStats st = compare_f32(y.data(), y_ref.data(), (int)y_ref.size(), 1e-5, 1e-6);
+    if (const char* dm = std::getenv("MT_DIAG_REDUCE")) {
+        // 逐 k 统计 combine_rows 非零行 vs 参考 y 非零行，判断缺的是哪个贡献槽
+        const size_t H = kHidden;
+        const int E = e.R * kEPR;
+        std::vector<long long> exp_nz(kTopk, 0), got_nz(kTopk, 0);
+        for (int k = 0; k < kTopk; ++k)
+            for (int t = 0; t < T; ++t) {
+                bool any_ref = false, any_got = false;
+                for (size_t c = 0; c < H; ++c) {
+                    if (std::fabs(y_ref[(size_t)t * H + c]) > 1e-6f) any_ref = true;
+                    bool ra = false; unsigned short bf; const uint16_t* row =
+                        reinterpret_cast<const uint16_t*>(rows_h.data() +
+                            ((size_t)k * T + t) * H * 2);
+                    for (size_t cc = 0; cc < H; ++cc)
+                        if (row[cc] != 0) { ra = true; break; }
+                    if (ra) any_got = true;
+                }
+                if (any_ref) ++exp_nz[k];
+                if (any_got) ++got_nz[k];
+            }
+        std::printf("  [REDdiag] launch=%s rank=%d 期望非零行/槽 = [", s.label.c_str(), e.rank);
+        for (int k = 0; k < kTopk; ++k) std::printf("%lld,", exp_nz[k]);
+        std::printf("]  实际 = [");
+        for (int k = 0; k < kTopk; ++k) std::printf("%lld,", got_nz[k]);
+        std::printf("]\n");
+    }
     if (!st.pass()) {
         char msg[160];
         std::snprintf(msg, sizeof(msg), "bad=%lld max_abs=%.3e worst_got=%.6g want=%.6g",
@@ -601,8 +627,10 @@ int main(int argc, char** argv) {
     int max_tokens = 16;
     for (const auto& p : plan) max_tokens = std::max(max_tokens, p.first.tokens);
     int win_global = 0;
+    const char* fwin = std::getenv("MT_FORCE_WIN");   // 调试：强制某个 win，用于最小复现
     for (auto& p : plan) {
         p.first.win = mt::choose_win_cap_counts(p.first.per_expert, max_tokens);
+        if (fwin && p.first.kind == 1) p.first.win = std::atoi(fwin);
         win_global = std::max(win_global, p.first.win);
     }
     Env e;
