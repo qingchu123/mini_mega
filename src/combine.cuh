@@ -455,11 +455,6 @@ __device__ __forceinline__ void combine_push_pair(
             const uint4 v = *reinterpret_cast<const uint4*>(srow + col);
             __stwt(reinterpret_cast<uint4*>(drow_h + col), v);
         }
-        // 发布序：先各 lane 把自己的 __stwt 排到 system 可见，再 lane0 写完成标记。
-        // 否则 lane0 可能在其它 lane 的列片尚未可见时就放行 REDUCE（多窗口倾斜
-        // 路径会放大该竞争：rank23/expert7 等多窗口场景）。
-        __threadfence_system();
-        __syncwarp();
         // slice 完成标记：值 = epoch（REDUCE 以 >= epoch 放行）
         // [FIX-NSE] 写满本物理任务覆盖的全部逻辑 slice（merge 个），与
         // combine_mark_rows 同因：保证任意源 rank 按其 nslice_eff 等待都不漏槽。

@@ -15,7 +15,6 @@
 #include <mpi.h>
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -65,21 +64,12 @@ inline Geo make_geo(int R, int max_tokens, int win) {
     g.win = win;
     g.L = compute_layout(R, max_tokens, kTopk, kHidden, kIntermediate, win);
     g.L.win_capacity = win;
-    g.L.x_off = (int64_t)offsetof(local_data, x);
-    g.L.topk_idx_off = (int64_t)offsetof(local_data, topk_idx);
-    g.L.topk_weights_off = (int64_t)offsetof(local_data, topk_weights);
-    g.L.route_slot_counts_off = (int64_t)offsetof(local_data, route_slot_counts);
-    g.L.prefix_tbl_off = (int64_t)offsetof(local_data, prefix_tbl);
-    g.L.expert_tokens_off = (int64_t)offsetof(local_data, expert_tokens);
-    g.L.token_route_weights_off =
-        (int64_t)offsetof(local_data, token_route_weights);
-    g.L.token_src_meta_off = (int64_t)offsetof(local_data, token_src_meta);
-    g.L.barrier_slots_off = 0;
-    g.L.src_index_table_off = 0;
-    g.L.expert_recv_counts_off = 0;
-    g.L.sym_bytes = (int64_t)sizeof(local_data);
-    g.combine_off = (int64_t)offsetof(ranks_data, combine_rows);
-    g.sym_alloc = (int64_t)sizeof(local_data);
+    const int64_t barrier_pad_off = ((g.L.sym_bytes + 255) / 256) * 256;
+    const int64_t recv_pad_off =
+        ((barrier_pad_off + (int64_t)R * 64 * 4 + 255) / 256) * 256;
+    g.combine_off = ((recv_pad_off + (int64_t)R * 64 * 4 + 255) / 256) * 256;
+    g.sym_alloc = ((g.combine_off +
+                    (int64_t)kTopk * max_tokens * kHidden * 2 + 255) / 256) * 256;
     g.block_n = prod_block_n(256);
     g.threads = g.block_n == 512 ? 1024 : 512;
     g.smem = prod_smem(R, 8, g.block_n);
@@ -108,7 +98,6 @@ inline std::vector<int> counts_of(const Routes& routes, int E) {
 struct Dev {
     int rank = 0;
     uint8_t* sym = nullptr;          // 对称区（FG）
-    local_data* ld = nullptr;        // 本 rank 本地数据（FG）
     local_flags* lf = nullptr;       // 私有旗区
     ranks_flags* rf = nullptr;       // 跨 rank 旗区（FG）
     ranks_data* rd = nullptr;        // 远端字段（FG）
@@ -153,12 +142,11 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     CHECK(mcSetDevice(rank));
     d.rank = rank;
     void* p = nullptr;
-    if (mcExtMallocWithFlags(&p, sizeof(local_data), mcDeviceMallocFinegrained) !=
+    if (mcExtMallocWithFlags(&p, (size_t)g.sym_alloc, mcDeviceMallocFinegrained) !=
             mcSuccess || !p)
-        CHECK(mcMalloc(&p, sizeof(local_data)));
-    d.ld = static_cast<local_data*>(p);
-    d.sym = reinterpret_cast<uint8_t*>(d.ld);
-    CHECK(mcMemset(d.sym, 0, sizeof(local_data)));
+        CHECK(mcMalloc(&p, (size_t)g.sym_alloc));
+    d.sym = static_cast<uint8_t*>(p);
+    CHECK(mcMemset(d.sym, 0, (size_t)g.sym_alloc));
     CHECK(mcMalloc((void**)&d.lf, sizeof(local_flags)));
     CHECK(mcMemset(d.lf, 0, sizeof(local_flags)));
     void* rfp = nullptr;
@@ -176,16 +164,19 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     d.rd = static_cast<ranks_data*>(rdp);
     CHECK(mcMemset(d.rd, 0, sizeof(ranks_data)));
 
-    d.w1 = &d.ld->w1[0][0][0];
-    d.w2 = &d.ld->w2[0][0][0];
+    CHECK(mcMalloc((void**)&d.w1, (size_t)kEPR * 2 * kIntermediate * kHidden));
+    CHECK(mcMalloc((void**)&d.w2, (size_t)kEPR * kHidden * kIntermediate));
     fp8mega::fill_weights_lane(d.w1, kEPR * 2 * kIntermediate, kHidden, 17u, 0);
     fp8mega::fill_weights_lane(d.w2, kEPR * kHidden, kIntermediate, 91u, 0);
     CHECK(mcDeviceSynchronize());
 
-    d.ffn = &d.ld->ffn_hidden[0][0][0];
-    d.l2 = &d.ld->l2_out[0][0][0];
+    CHECK(mcMalloc((void**)&d.ffn, ffn_bytes(g)));
+    CHECK(mcMemset(d.ffn, 0, ffn_bytes(g)));
+    CHECK(mcMalloc((void**)&d.l2, l2_bytes(g)));
+    CHECK(mcMemset(d.l2, 0, l2_bytes(g)));
     const size_t y_bytes = (size_t)ynode_rows * kHidden * sizeof(float);
-    d.y = &d.ld->y[0][0];
+    CHECK(mcMalloc((void**)&d.y, y_bytes));
+    CHECK(mcMemset(d.y, 0, y_bytes));
     d.ynode.assign(nodes, nullptr);
     for (int n = 0; n < nodes; ++n) {
         CHECK(mcMalloc((void**)&d.ynode[n], y_bytes));
@@ -252,11 +243,7 @@ inline void reset_dev(const Geo& g, const Dev& d, const Routes& routes, int toke
                    mcMemcpyHostToDevice));
     CHECK(mcMemset(d.sym + L.route_slot_counts_off, 0, (size_t)g.R * kEPR * sizeof(int)));
     CHECK(mcMemset(d.sym + L.prefix_tbl_off, 0, (size_t)L.prefix_tbl_bytes));
-    CHECK(mcMemset(d.sym + L.token_route_weights_off, 0,
-                   (size_t)kGrid * g.win * sizeof(float)));
-    CHECK(mcMemset(d.sym + L.token_src_meta_off, 0,
-                   (size_t)kGrid * g.win * 3 * sizeof(int)));
-    CHECK(mcMemset(d.ld->expert_tokens, 0, sizeof(d.ld->expert_tokens)));
+    CHECK(mcMemset(d.sym + L.barrier_slots_off, 0, (size_t)g.R * g.R * 4));
     CHECK(mcMemset(d.lf, 0, sizeof(local_flags)));
     CHECK(mcMemset(d.rf, 0, sizeof(ranks_flags)));
     CHECK(mcMemset(d.rd, 0, sizeof(ranks_data)));
