@@ -94,24 +94,24 @@ struct alignas(256) local_data {
     // 输入复用
     alignas(256) uint8_t x[kMaxTPR][kHidden];
     alignas(256) int64_t topk_idx[kMaxTPR][kTopk];
-    alignas(256) uint8_t topk_weights[kMaxTPR][kTopk];
+    alignas(256) float topk_weights[kMaxTPR][kTopk];
 
     // 内部使用
     alignas(256) int32_t route_slot_counts[kRanks * kEPR];
     alignas(256) int32_t prefix_tbl[kEPR][kRanks + 1];
-    alignas(256) int8_t expert_tokens[kEPR* kRing][kMaxWin][kHidden];
-    alignas(256) float token_route_weights[kEPR + kGrid][kMaxWin];
-    alignas(256) int token_src_meta[kEPR + kGrid][kMaxWin][3];
+    alignas(256) uint8_t expert_tokens[kEPR* kRing][kMaxTPR][kHidden];
+    alignas(256) float token_route_weights[kEPR + kGrid][kMaxTPR];
+    alignas(256) int token_src_meta[kEPR + kGrid][kMaxTPR][3];
 
 
     alignas(256) uint8_t w1[kEPR][2*kIntermediate][kHidden];
     alignas(256) uint8_t w2[kEPR][kHidden][kIntermediate];
-    alignas(256) uint8_t ffn_hidden[kEPR * kRing][2*kMaxWin][kIntermediate];
-    alignas(256) uint16_t l2_out[kGrid][2*kMaxWin][kHidden];
-    alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden/32) * ((kMaxWin + 15) / 16) * 512];
-    alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate/32) * ((kMaxWin + 15) / 16) * 512];
-    alignas(256) uint8_t y[kMaxTPR][kHidden];
-    alignas(256) uint8_t ynode[kMaxTPR][kHidden]; //for debug
+    alignas(256) uint8_t ffn_hidden[kEPR * kRing][kMaxTPR][kIntermediate];
+    alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
+    alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden/32) * ((kMaxTPR + 15) / 16) * 512];
+    alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate/32) * ((kMaxTPR + 15) / 16) * 512];
+    alignas(256) float y[kMaxTPR][kHidden];
+    alignas(256) float ynode[kMaxTPR][kHidden]; //for debug
 };
 
 // ---- 本 rank 私有（普通显存）----

@@ -97,7 +97,8 @@ inline std::vector<int> counts_of(const Routes& routes, int E) {
 // ------------------------------------------------------------ 设备资源 --
 struct Dev {
     int rank = 0;
-    uint8_t* sym = nullptr;          // 对称区（FG）
+    uint8_t* sym = nullptr;          // 输入/路由区（FG）
+    local_data* ld = nullptr;        // 本地热缓冲（mcMalloc）
     local_flags* lf = nullptr;       // 私有旗区
     ranks_flags* rf = nullptr;       // 跨 rank 旗区（FG）
     ranks_data* rd = nullptr;        // 远端字段（FG）
@@ -164,19 +165,20 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     d.rd = static_cast<ranks_data*>(rdp);
     CHECK(mcMemset(d.rd, 0, sizeof(ranks_data)));
 
-    CHECK(mcMalloc((void**)&d.w1, (size_t)kEPR * 2 * kIntermediate * kHidden));
-    CHECK(mcMalloc((void**)&d.w2, (size_t)kEPR * kHidden * kIntermediate));
+    void* lp = nullptr;
+    CHECK(mcMalloc(&lp, sizeof(local_data)));
+    d.ld = static_cast<local_data*>(lp);
+    CHECK(mcMemset(d.ld, 0, sizeof(local_data)));
+    d.w1 = &d.ld->w1[0][0][0];
+    d.w2 = &d.ld->w2[0][0][0];
     fp8mega::fill_weights_lane(d.w1, kEPR * 2 * kIntermediate, kHidden, 17u, 0);
     fp8mega::fill_weights_lane(d.w2, kEPR * kHidden, kIntermediate, 91u, 0);
     CHECK(mcDeviceSynchronize());
 
-    CHECK(mcMalloc((void**)&d.ffn, ffn_bytes(g)));
-    CHECK(mcMemset(d.ffn, 0, ffn_bytes(g)));
-    CHECK(mcMalloc((void**)&d.l2, l2_bytes(g)));
-    CHECK(mcMemset(d.l2, 0, l2_bytes(g)));
+    d.ffn = &d.ld->ffn_hidden[0][0][0];
+    d.l2 = &d.ld->l2_out[0][0][0];
     const size_t y_bytes = (size_t)ynode_rows * kHidden * sizeof(float);
-    CHECK(mcMalloc((void**)&d.y, y_bytes));
-    CHECK(mcMemset(d.y, 0, y_bytes));
+    d.y = &d.ld->y[0][0];
     d.ynode.assign(nodes, nullptr);
     for (int n = 0; n < nodes; ++n) {
         CHECK(mcMalloc((void**)&d.ynode[n], y_bytes));
@@ -290,6 +292,7 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.x_off = L.x_off;
     a.weights_off = L.topk_weights_off;
     a.pool_off = L.expert_tokens_off;
+    a.pool_ptr = d.ld ? &d.ld->expert_tokens[0][0][0] : nullptr;
     a.w_off = L.token_route_weights_off;
     a.meta_off = L.token_src_meta_off;
     a.max_spins = (int)kSpinLimit;
