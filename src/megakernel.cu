@@ -126,6 +126,10 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.frag_a = a.frag_a;
     m.frag2 = a.frag2;
     m.l2_k_out = a.l2_k_out;
+    m.w1 = a.w1;
+    m.w2 = a.w2;
+    m.ffn_hidden = a.ffn_hidden;
+    m.l2_out = a.l2_out;
     m.combine_rows_off = a.combine_rows_off;
     return m;
 }

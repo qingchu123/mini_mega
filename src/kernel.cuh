@@ -59,6 +59,11 @@ struct MegaArgs {
     uint8_t* frag_a;          // [OPT-AFRAG] A 输入 fragment 缓冲（可 nullptr，可空语义保留）
     uint8_t* frag2;           // [OPT-AFRAG] L1 输出 fragment 缓冲（可 nullptr，可空语义保留）
     int l2_k_out;
+    // [步骤2b-A 修订] 计算链缓冲由 host 决定来源（torch 按 win_alloc，mega_common 指向 rwk->ld）
+    const uint8_t* w1;        // [EPR][2I][H] lane 序 packed tile（gate/up 配对布局）
+    const uint8_t* w2;        // [EPR][H][I] lane 序 packed tile
+    uint8_t* ffn_hidden;      // [EPR][ring][win_cap][I] FP8
+    uint16_t* l2_out;         // [kGrid][win_cap][H] BF16
     // ---- 收尾 ----
     int64_t combine_rows_off;  // 目标 rank 的 combine_rows 区偏移（BF16，留在 sym）
     // ---- [集71] 内部执行次数统计（编译期默认关：MX_DBG_COUNT=0）----
@@ -139,9 +144,9 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
         a.x_off, a.weights_off, a.pool_off, a.w_off, a.meta_off,
         a.pool_ptr, a.rwk->lf.bar[cycle],
         a.task_counter_idx, a.l2_done_idx, a.task_ready_idx, a.slice_flags_idx,
-        a.l1_prog_idx, a.rwk->lf.out_processed, a.rwk->lf.dbg, a.max_spins, &a.rwk->ld.w1[0][0][0],
-        a.l1_n_total, a.l1_block_n, a.l1_k_out, &a.rwk->ld.ffn_hidden[0][0][0], a.rwk->lf.l1_chk, &a.rwk->ld.w2[0][0][0],
-        &a.rwk->ld.l2_out[0][0][0], a.l2_k_out, a.rwk->lf.l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
+        a.l1_prog_idx, a.rwk->lf.out_processed, a.rwk->lf.dbg, a.max_spins, a.w1,
+        a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.rwk->lf.l1_chk, a.w2,
+        a.l2_out, a.l2_k_out, a.rwk->lf.l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
         a.prefix_ptr, a.rwk->lf.pre_ticks, a_smem, b_smem, frag_a, frag2, ctr);
 }
 
@@ -254,7 +259,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.block_idx = (int)blockIdx.x;
                 tail.ctx.cycle = cyc;   // [M_CYCLE] combine_sums 片
                 tail.ctx.epoch = (uint64_t)a.rwk->lf.current_time[0][1];
-                tail.out_base = reinterpret_cast<const uint8_t*>(&a.rwk->ld.l2_out[0][0][0]);
+                tail.out_base = reinterpret_cast<const uint8_t*>(a.l2_out);
                 tail.nwarps = 8;
                 // [R29] 融合推送能力 + 上下文（on 由任务体在 r24 L2 路径激活）
                 tail.fuse.capable = true;
