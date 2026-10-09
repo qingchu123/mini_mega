@@ -434,6 +434,9 @@ __device__ __forceinline__ void combine_push_pair(
     const int wchunk = (count + nwarps - 1) / nwarps;
     const int row_lo = warp * wchunk;
     const int row_hi = (row_lo + wchunk < count) ? (row_lo + wchunk) : count;
+    // 两遍：① 本 warp 全部有效行的数据推送；② 一次全局可见 fence + warp 同步；
+    // ③ lane0 写各行完成标记。标记必须晚于其覆盖的全部数据可见（否则 REDUCE 可能
+    // 读到未写完的列段，见 fail_cases.md 六.6.3 / t4 复现）。
     for (int s2 = row_lo; s2 < row_hi; ++s2) {
         const size_t stag = (size_t)c.block_idx * c.staging_cap + s2;
         if (c.weights[stag] == 0.0f) continue;   // 无效行（dispatch 零填充）
@@ -449,6 +452,16 @@ __device__ __forceinline__ void combine_push_pair(
             const uint4 v = *reinterpret_cast<const uint4*>(srow + col);
             __stwt(reinterpret_cast<uint4*>(drow_h + col), v);
         }
+    }
+    __threadfence();   // 本 warp 所有 lane 的数据推送对对端可见（与融合路径 combine_mark_rows 同序）
+    __syncwarp();
+    for (int s2 = row_lo; s2 < row_hi; ++s2) {
+        const size_t stag = (size_t)c.block_idx * c.staging_cap + s2;
+        if (c.weights[stag] == 0.0f) continue;
+        const int* m = c.meta + stag * 3;
+        const int src = m[0];
+        const int stok = m[1];
+        const int kk = m[2];
         // slice 完成标记：值 = epoch（REDUCE 以 >= epoch 放行）
         // [FIX-NSE] 写满本物理任务覆盖的全部逻辑 slice（merge 个），与
         // combine_mark_rows 同因：保证任意源 rank 按其 nslice_eff 等待都不漏槽。
