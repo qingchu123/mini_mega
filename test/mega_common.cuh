@@ -113,7 +113,9 @@ struct Dev {
     std::vector<float*> ynode;       // graph 逐节点输出（同形状）
     uint8_t** d_base = nullptr;
     ranks_flags** d_rf = nullptr;
-    mcIpcMemHandle_t h{}, rh{}, rdh{};
+    rwk_data* rwk = nullptr;         // 本 rank 普通显存整块（lf + ld）
+    unk_data* unk = nullptr;         // 本 rank FG 整块（rf + rd），IPC 导出
+    mcIpcMemHandle_t h{}, uh{};
     mcStream_t st = nullptr;
     mcGraphExec_t exec = nullptr;
 };
@@ -150,27 +152,22 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
         CHECK(mcMalloc(&p, (size_t)g.sym_alloc));
     d.sym = static_cast<uint8_t*>(p);
     CHECK(mcMemset(d.sym, 0, (size_t)g.sym_alloc));
-    CHECK(mcMalloc((void**)&d.lf, sizeof(local_flags)));
-    CHECK(mcMemset(d.lf, 0, sizeof(local_flags)));
-    void* rfp = nullptr;
-    if (mcExtMallocWithFlags(&rfp, sizeof(ranks_flags), mcDeviceMallocFinegrained) !=
-            mcSuccess || !rfp)
-        CHECK(mcMalloc(&rfp, sizeof(ranks_flags)));
-    d.rf = static_cast<ranks_flags*>(rfp);
-    CHECK(mcMemset(d.rf, 0, sizeof(ranks_flags)));
-
-    void* rdp = nullptr;
-    if (mcExtMallocWithFlags(&rdp, sizeof(ranks_data),
-                             mcDeviceMallocFinegrained) != mcSuccess ||
-        !rdp)
-        CHECK(mcMalloc(&rdp, sizeof(ranks_data)));
-    d.rd = static_cast<ranks_data*>(rdp);
-    CHECK(mcMemset(d.rd, 0, sizeof(ranks_data)));
-
-    void* lp = nullptr;
-    CHECK(mcMalloc(&lp, sizeof(local_data)));
-    d.ld = static_cast<local_data*>(lp);
-    CHECK(mcMemset(d.ld, 0, sizeof(local_data)));
+    // rwk：普通显存整块（lf + ld）
+    void* rwkp = nullptr;
+    CHECK(mcMalloc(&rwkp, sizeof(rwk_data)));
+    d.rwk = static_cast<rwk_data*>(rwkp);
+    CHECK(mcMemset(d.rwk, 0, sizeof(rwk_data)));
+    d.lf = &d.rwk->lf;
+    d.ld = &d.rwk->ld;
+    // unk：FG 整块（rf + rd），优先 FG，失败回退普通显存
+    void* unkp = nullptr;
+    if (mcExtMallocWithFlags(&unkp, sizeof(unk_data), mcDeviceMallocFinegrained) !=
+            mcSuccess || !unkp)
+        CHECK(mcMalloc(&unkp, sizeof(unk_data)));
+    d.unk = static_cast<unk_data*>(unkp);
+    CHECK(mcMemset(d.unk, 0, sizeof(unk_data)));
+    d.rf = &d.unk->rf;
+    d.rd = &d.unk->rd;
     d.w1 = &d.ld->w1[0][0][0];
     d.w2 = &d.ld->w2[0][0][0];
     fp8mega::fill_weights_lane(d.w1, kEPR * 2 * kIntermediate, kHidden, 17u, 0);
@@ -189,19 +186,16 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     fill_inputs(g, d);
     CHECK(mcStreamCreate(&d.st));
     CHECK(mcIpcGetMemHandle(&d.h, d.sym));
-    CHECK(mcIpcGetMemHandle(&d.rh, d.rf));
-    CHECK(mcIpcGetMemHandle(&d.rdh, d.rd));
+    CHECK(mcIpcGetMemHandle(&d.uh, d.unk));
 }
 
 // MPI 交换 IPC 句柄，打开 peer，构造 d_base / d_rf 设备指针表。
 // 必须在所有 rank 的 alloc_dev 之后调用（内部含 MPI 集合通信）。
 inline void exchange_ipc(Dev& d, int R) {
-    std::vector<mcIpcMemHandle_t> all_h(R), all_rh(R), all_rdh(R);
+    std::vector<mcIpcMemHandle_t> all_h(R), all_uh(R);
     MPI_Allgather(&d.h, (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, all_h.data(),
                   (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, MPI_COMM_WORLD);
-    MPI_Allgather(&d.rh, (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, all_rh.data(),
-                  (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, MPI_COMM_WORLD);
-    MPI_Allgather(&d.rdh, (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, all_rdh.data(),
+    MPI_Allgather(&d.uh, (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, all_uh.data(),
                   (int)sizeof(mcIpcMemHandle_t), MPI_BYTE, MPI_COMM_WORLD);
     CHECK(mcSetDevice(d.rank));
     std::vector<uint8_t*> bp(R);
@@ -217,12 +211,12 @@ inline void exchange_ipc(Dev& d, int R) {
         void* q = nullptr;
         CHECK(mcIpcOpenMemHandle(&q, all_h[s], mcIpcMemLazyEnablePeerAccess));
         bp[s] = static_cast<uint8_t*>(q);
-        void* qr = nullptr;
-        CHECK(mcIpcOpenMemHandle(&qr, all_rh[s], mcIpcMemLazyEnablePeerAccess));
-        rp[s] = static_cast<ranks_flags*>(qr);
-        void* qd = nullptr;
-        CHECK(mcIpcOpenMemHandle(&qd, all_rdh[s], mcIpcMemLazyEnablePeerAccess));
-        rdp[s] = static_cast<ranks_data*>(qd);
+        // unk 整块：rf 与 rd 同一基址，偏移由 unk_data 布局决定
+        void* qu = nullptr;
+        CHECK(mcIpcOpenMemHandle(&qu, all_uh[s], mcIpcMemLazyEnablePeerAccess));
+        auto* ur = static_cast<unk_data*>(qu);
+        rp[s] = &ur->rf;
+        rdp[s] = &ur->rd;
     }
     for (int s = 0; s < R; ++s) {
         if (s == d.rank) continue;
