@@ -33,11 +33,6 @@ constexpr int kM = 16;               // M tile 行数
 
 // 自旋上限（异常保护）：约 1s（4M 周期 @2GHz）
 constexpr long long kSpinLimit = 4000000LL;
-// [R37] NSLICE 生效值（nslice_eff）广播槽：布局保留区空闲槽（kBarFlagsNumInt32=1024
-// 内的 1021，与 kBarTaskReady/WashSink/TaskCounter=1018/1019/1020 相邻且不冲突）。
-// dispatch 每 launch 由 block0 写一次，REDUCE 读取以确定 combine 完成标记的
-// 等待槽数（kTopk×nslice_eff），使 NSLICE=16 不因 kNSlice 放大 REDUCE 开销。
-constexpr int kBarNsliceEffIdx = 1021;
 // PUBLISH 校验槽 epoch（阶段 1 用常量；生产为 epoch_base+1）
 constexpr unsigned kPublishEpoch = 1u;
 

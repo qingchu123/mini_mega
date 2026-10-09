@@ -958,10 +958,6 @@ __device__ __forceinline__ void dispatch_pull_body(
     const int total_tasks = raw_tasks / merge;
     // [集71] 任务循环进入 block 数
     if (tid == 0) MX_CTR_ADD(ctr, kCtrLoopEnter, 1);
-    // [R37] 广播 nslice_eff 给 REDUCE（combine 完成标记等待槽数 = kTopk×nslice_eff）
-    if (blockIdx.x == 0 && tid == 0)
-        *reinterpret_cast<volatile uint32_t*>(bar_flags + kBarNsliceEffIdx) =
-            (uint32_t)nslice_eff;
     // 任务体调度参数（循环不变量打包，按 const& 传给两个 noinline 任务体）
     R19Sched S;
     S.self = self;

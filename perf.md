@@ -529,3 +529,43 @@ fragment 必需（禁用 +38~62%）。
   （torch/mxmegakernel/mega/__init__.py）+ bench 的 imbalanced merge 开关。
 - 实验脚手架（pool_ptr/A-RWK、PULL_*/NO_AFRAG/NO_GEN_FIX 诊断宏、MX_MERGE1 env）
   建议清理后再合。
+
+## [261009_12_50] 新基准：mybench（HEAD e8c321e，工作区含未提交的守卫/torch 改动）
+
+口径：`scripts/run.sh mybench`，R=32，max_tokens=512，win 为 harness 默认（=max_tokens，
+未设 MYBENCH_WIN）；graph nodes=20 replays=2，取 us_mean。
+
+| 场景 | 指标 | 基准 (µs) |
+|---|---|---:|
+| `-s 1` 均衡 TPR=1 | us_mean | 302.75 |
+| `-s 1` TPR=4 | us_mean | 320.16 |
+| `-s 1` TPR=16 | us_mean | 347.95 |
+| `-s 1` TPR=32 | us_mean | 468.41 |
+| `-s 1` TPR=33 | us_mean | 506.25 |
+| `-s 1` TPR=64 | us_mean | 644.81 |
+| `-s 1` TPR=128 | us_mean | 1030.45 |
+| `-s 1` TPR=256 | us_mean | 1909.77 |
+| `-s 1` TPR=512 | us_mean | 3698.75 |
+| `-s 2 -top 50` | 50 launch 平均 | **3274.10** |
+
+> 注：`-s 2 -top 50` 的 50 个 launch 均为 win=512（harness 默认），未启用自适应 win。
+> 首次 `-s 1` 因 GPU 队列创建超时（环境问题，ioctl 重试约 7 分钟）被 timeout 终止，重跑通过。
+
+## [261009_13_13] 固定逻辑 slice 协议（去除 kBarNsliceEffIdx 广播）
+
+口径同 [261009_12_50]。HEAD 基准 e8c321e。
+
+| 场景 | 指标 | 基准 [261009_12_50] (µs) | 本次 (µs) | 变化 |
+|---|---|---:|---:|---:|
+| `-s 1` TPR=1 | us_mean | 302.75 | 306.15 | +1.1% |
+| `-s 1` TPR=4 | us_mean | 320.16 | 317.80 | -0.7% |
+| `-s 1` TPR=16 | us_mean | 347.95 | 346.91 | -0.3% |
+| `-s 1` TPR=32 | us_mean | 468.41 | 473.77 | +1.1% |
+| `-s 1` TPR=33 | us_mean | 506.25 | 506.12 | 0.0% |
+| `-s 1` TPR=64 | us_mean | 644.81 | 647.92 | +0.5% |
+| `-s 1` TPR=128 | us_mean | 1030.45 | 1038.20 | +0.8% |
+| `-s 1` TPR=256 | us_mean | 1909.77 | 1913.66 | +0.2% |
+| `-s 1` TPR=512 | us_mean | 3698.75 | 3708.25 | +0.3% |
+| `-s 2 -top 50` | 50 launch 平均 | 3274.10 | **3149.45**（复测 3149.33 / 3148.75） | -3.8% |
+
+> 注：`-s 1` 各档在 ±1.2% 内。`-s 2 -top 50` 下降的原因未确认：新旧列段写法数据量等价，待查，暂不计为已确认优化。

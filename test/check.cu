@@ -581,13 +581,9 @@ bool run_graph(Env& e, const Spec& s, const mt::Routes& routes,
                     std::fflush(stdout);
                     if (data_ref.worst >= 0) {
                         const long long dtok = data_ref.worst / kHidden;
-                        int ns_bar = 0;
-                        CHECK(mcMemcpy(&ns_bar,
-                                       &(e.d.lf->bar[cyc_rows][kBarNsliceEffIdx]),
-                                       sizeof(ns_bar), mcMemcpyDeviceToHost));
-                        std::printf("    [graph-k] rank=%d node=%d token=%lld 标志期望=%llu 有效槽=%d",
+                        std::printf("    [graph-k] rank=%d node=%d token=%lld 标志期望=%llu 逻辑槽=%d",
                                     e.rank, n, dtok, (unsigned long long)epoch_expect,
-                                    ns_bar);
+                                    kNSlice);
                         for (int k = 0; k < kTopk; ++k) {
                             const int64_t ex = routes[e.rank][(size_t)dtok * kTopk + k];
                             const float wv = g_w[(size_t)dtok * kTopk + k];
@@ -603,7 +599,7 @@ bool run_graph(Env& e, const Spec& s, const mt::Routes& routes,
                             }
                             std::printf(" [k%d:专家=%lld,权重=%.6g,非零=%lld,和=%.6g,绝和=%.6g,标志=",
                                         k, (long long)ex, (double)wv, nz, ssum, asum);
-                            for (int s2 = 0; s2 < ns_bar && s2 < kCombineSlicesMax; ++s2)
+                            for (int s2 = 0; s2 < kNSlice && s2 < kCombineSlicesMax; ++s2)
                                 std::printf("%llu,", (unsigned long long)sum_flags
                                             [((size_t)k * kMaxCombineRows + dtok) *
                                              kCombineSlicesMax + s2]);

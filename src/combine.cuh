@@ -424,11 +424,15 @@ __device__ __forceinline__ void combine_mark_rows(
 __device__ __forceinline__ void combine_push_pair(
         const CombineCtx& c, const uint8_t* out_base, int count, int lane,
         int warp, int nwarps) {
-    // 本物理 slice 的列范围（BF16 元素；c0s 起、cols_per_slice 列）
-    // [R35] 粗化后每个物理任务覆盖合并后的列段（kHidden/nslice_eff）
-    const int cols_per_slice = kHidden / c.nslice_eff;
-    const int c0s = c.slice * cols_per_slice;
-    const int n8s = cols_per_slice / 8;   // 本 slice 的 uint4 数（每 lane 8 列）
+    // [docs/05] 列段按逻辑 slice 固定划分：逻辑 L 覆盖列 [L*cpl, (L+1)*cpl)，
+    // cpl = kHidden/kNSlice（与 rank 的 win/merge 无关）。本物理任务覆盖逻辑
+    // [slice*merge, slice*merge+merge)，因此逐段推送这 merge 个列段，与
+    // combine_mark_rows 写满的 merge 个标记一一对应。
+    constexpr int kCpl = kHidden / kNSlice;
+    static_assert(kHidden % kNSlice == 0 && kCpl % 8 == 0,
+                  "列段须整除且为 8 的倍数（每 lane 8 列 uint4）");
+    const int lg0 = c.slice * c.merge;          // 本物理任务覆盖的首个逻辑 slice
+    const int n8s = kCpl / 8;                   // 每逻辑段 uint4 数
     const uint16_t* out_h = reinterpret_cast<const uint16_t*>(out_base);
     // [OPT-PUSH] warp 连续行段（原按 warp 交错）：同行段局部性更好
     const int wchunk = (count + nwarps - 1) / nwarps;
@@ -447,10 +451,13 @@ __device__ __forceinline__ void combine_push_pair(
         const uint16_t* srow = out_h + stag * kHidden;
         uint16_t* drow_h = cmb_rows_compat(c.remote_peers, c.peer_bases, c.rows_off, src, c.cycle) +
             ((size_t)kk * kMaxTPR + stok) * kHidden;
-        for (int i = lane; i < n8s; i += 64) {   // 每 lane 3 个 uint4（1536 列）
-            const int col = c0s + i * 8;
-            const uint4 v = *reinterpret_cast<const uint4*>(srow + col);
-            __stwt(reinterpret_cast<uint4*>(drow_h + col), v);
+        for (int mi = 0; mi < c.merge; ++mi) {   // 覆盖的每个逻辑列段
+            const int c0 = (lg0 + mi) * kCpl;
+            for (int i = lane; i < n8s; i += 64) {
+                const int col = c0 + i * 8;
+                const uint4 v = *reinterpret_cast<const uint4*>(srow + col);
+                __stwt(reinterpret_cast<uint4*>(drow_h + col), v);
+            }
         }
     }
     __threadfence();   // 本 warp 所有 lane 的数据推送对对端可见（与融合路径 combine_mark_rows 同序）
@@ -530,14 +537,13 @@ __device__ __forceinline__ void reduce_body(
         // 标记）。旧写法 tid0 串行等 32 个 volatile 读，每读一次 L2 往返
         // （~10µs+/block，16 block/SM 时明显）；并行等待后每线程只做一次
         // 观察，观察后各自 __threadfence 再 barrier 的发布序语义不变。
-        // [R37] 等待槽数按运行期 nslice_eff（dispatch 广播于 kBarNsliceEffIdx）
-        int ns_eff = (int)*reinterpret_cast<volatile const uint32_t*>(
-            bar_flags + kBarNsliceEffIdx);
-        if (ns_eff < 1) ns_eff = 1;
-        if (ns_eff > kNSlice) ns_eff = kNSlice;
-        if (tid < kTopk * ns_eff) {
-            const int k = tid / ns_eff;
-            const int s2 = tid % ns_eff;
+        // 等待槽数固定为逻辑 slice 数 kNSlice（与任何 rank 的 win/merge 无关，
+        // 见 docs/05）。标记由目标端按逻辑 slice 写满，不再读广播值。
+        static_assert(kTopk * kNSlice <= 256,
+                      "REDUCE 等待线程数 kTopk*kNSlice 须不超过 blockDim(256)");
+        if (tid < kTopk * kNSlice) {
+            const int k = tid / kNSlice;
+            const int s2 = tid % kNSlice;
             if (ok8[k]) {
                 const volatile uint64_t* part =
                     &rf->combine_sums[cyc][k][token][0];
