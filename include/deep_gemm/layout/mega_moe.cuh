@@ -533,40 +533,44 @@ static constexpr int kMegaMoeWinRing = 8;   // [RING8] 同专家并发窗上限�
                                             // kBarWinReleaseIdx+64=899≤1024。
 static constexpr int kBarReleaseIdx = kMegaMoeMaxGridBlocks;       // 64
 static constexpr int kBarXreleaseIdx = kMegaMoeMaxGridBlocks + 1;  // 65
-static constexpr int kBarSliceFlagsIdx = kMegaMoeMaxGridBlocks + 3;  // 67：DISPATCH 分片就绪旗区
-static constexpr int kBarSliceFlagsLen = 256;   // EPR×ring×NSLICE ≤ 256（host 断言）
-// 323：L1→L2 进度旗区（同 slice 旗索引方式）
-static constexpr int kBarL1ProgressIdx = kBarSliceFlagsIdx + kBarSliceFlagsLen;
-static constexpr int kBarL1ProgressLen = 256;
-// 579：ring 槽复用门——(expert, ring_slot) 的 L2 完成计数（计数型，XBAR 前由 block0
+// [NS16] 切片/L1 进度旗区扩到 1024：容量契约 EPR×ring×NSLICE ≤ 1024
+// （NSLICE=16、EPR=8、ring=8 时恰好 1024）。
+static constexpr int kBarMaxNSlice = 16;
+static constexpr int kBarSliceFlagsIdx = kMegaMoeMaxGridBlocks + 3;  // 67..1090：DISPATCH 分片就绪旗区
+static constexpr int kBarSliceFlagsLen = 1024;
+static constexpr int kBarL1ProgressIdx = kBarSliceFlagsIdx + kBarSliceFlagsLen;  // 1091..2114
+static constexpr int kBarL1ProgressLen = 1024;
+// ring 槽复用门——(expert, ring_slot) 的 L2 完成计数（计数型，XBAR 前由 block0
 // 清零；旗值型门放不下「同一槽位被多代窗口复用」的计数语义）
-static constexpr int kBarL2DoneIdx = kBarL1ProgressIdx + kBarL1ProgressLen;
-// [RING8] 容量只需 EPR×ring ≤ 256（与切片旗区同一契约：EPR×ring×NSLICE ≤ 256
-// 在 host 断言；NSLICE≥1 时已覆盖）。不能写成 kMegaMoeMaxGridBlocks×ring——
-// ring>4 时会让后续旗区整体后移并越界（RING8 首版即因此编译失败）。
+static constexpr int kBarL2DoneIdx = kBarL1ProgressIdx + kBarL1ProgressLen;  // 2115..2370
 static constexpr int kBarL2DoneLen = 256;   // EPR×ring ≤ 256
-// 835：窗口 release 旗区【已弃用：window_expert_barrier 在队列形态下无调用，
+// 窗口 release 旗区【已弃用：window_expert_barrier 在队列形态下无调用，
 // 常量保留防旧代码复活时与切片旗区撞号】
-static constexpr int kBarWinReleaseIdx = kBarL2DoneIdx + kBarL2DoneLen;
-static constexpr int kBarFlagsNumInt32 = 1024;
-static_assert(kBarWinReleaseIdx + kMegaMoeMaxGridBlocks <= kBarFlagsNumInt32,
-              "local_bar_flags 容量不足以放下全部旗区");
+static constexpr int kBarWinReleaseIdx = kBarL2DoneIdx + kBarL2DoneLen;  // 2371..2434
+static_assert(8 * kMegaMoeWinRing * kBarMaxNSlice <= kBarSliceFlagsLen,
+              "切片旗区容量不足：EPR(8)×ring×NSLICE 须 ≤ kBarSliceFlagsLen");
+static_assert(kBarL1ProgressIdx + kBarL1ProgressLen == kBarL2DoneIdx,
+              "L1 进度旗区与 L2 完成区不连续");
 
 // ---- FP8 (feature/c600ul-fp8-megamoe) 追加旗区 ----
 // REDUCE 前跨 rank combine 完成 arrive 旗（[grid≤64]）。不复用 [0..63] 通用 arrive
 // flags：热点专家的多窗口 barrier 会在同槽写更大窗口序号，单调比较会误判提前到达。
 // 放在 C600UL 已弃用保留区（kBarWinReleaseIdx=707..770）之后，不与切片/L1/L2 撞号。
 static constexpr int kBarFinalCombineArriveIdx =
-    kBarWinReleaseIdx + kMegaMoeMaxGridBlocks;      // 771..834
+    kBarWinReleaseIdx + kMegaMoeMaxGridBlocks;      // 2435..2498
 // 动态任务队列控制旗。FP8 任务前缀表已迁入 scratch.prefix_tbl（见 MegaMoeScratch），
-// 因此不再占用 bar_flags；这三个旗与 C600UL 内核使用的 1018/1019/1020 同址。
-static constexpr int kBarTaskReadyIdx = 1018;
-static constexpr int kBarWashSinkIdx = 1019;
-static constexpr int kBarTaskCounterIdx = 1020;
+// 因此不再占用 bar_flags。原硬编码 1018/1019/1020 落在扩容后的切片区内，改为相对偏移。
+static constexpr int kBarTaskReadyIdx = kBarFinalCombineArriveIdx + kMegaMoeMaxGridBlocks;   // 2499
+static constexpr int kBarWashSinkIdx = kBarTaskReadyIdx + 1;                                  // 2500
+static constexpr int kBarTaskCounterIdx = kBarTaskReadyIdx + 2;                               // 2501
 static_assert(kBarFinalCombineArriveIdx + kMegaMoeMaxGridBlocks <= kBarTaskReadyIdx,
               "FP8 最终 combine arrive 旗区与动态任务控制旗重叠");
+// 普通旗区总长：覆盖全部索引（最大为 kBarTaskCounterIdx=2501），取 2560 留余量。
+static constexpr int kBarFlagsNumInt32 = 2560;
 static_assert(kBarTaskCounterIdx < kBarFlagsNumInt32,
               "local_bar_flags 容量不足以放下动态任务控制旗");
+static_assert(kBarWinReleaseIdx + kMegaMoeMaxGridBlocks <= kBarFlagsNumInt32,
+              "local_bar_flags 容量不足以放下全部旗区");
 // ---- FP8 设备侧 epoch（fp8xfp8；CUDA graph 安全，替代 host 传入的 epoch_base）----
 // epoch_slot 持有【本 launch】的 epoch_base：由上一 launch 最后完成的 block
 // （finisher）预发布，buffer 创建时清零 → launch0 读得 0，与旧 host
@@ -578,9 +582,9 @@ static_assert(kBarTaskCounterIdx < kBarFlagsNumInt32,
 // seq 空间回绕点清零普通旗区——此刻全 block 已收尾，清零不与任何读写并发。
 // CUDA graph 重放会真实执行本协议 → epoch 逐 launch 递增，eager/graph/混跑
 // 语义一致（host 传参在 graph 下被冻结，是本改造的动因）。
-static constexpr int kFp8BarEpochSlotIdx = kBarFlagsNumInt32;        // 1024
-static constexpr int kFp8BarDoneCtrIdx = kBarFlagsNumInt32 + 1;      // 1025
-static constexpr int kFp8BarFlagsNumInt32 = kBarFlagsNumInt32 + 8;   // 1032
+static constexpr int kFp8BarEpochSlotIdx = kBarFlagsNumInt32;        // 2560
+static constexpr int kFp8BarDoneCtrIdx = kBarFlagsNumInt32 + 1;      // 2561
+static constexpr int kFp8BarFlagsNumInt32 = kBarFlagsNumInt32 + 8;   // 2568
 // 与 host 侧 _FP8_EPOCH_PERIOD（mxmegakernel/mega/__init__.py）同源：epoch 取
 // [0, 2*period) 内偶数，保证 base+1/base+2 不回绕到 0/UINT32_MAX（零初始化态）。
 static constexpr uint32_t kFp8EpochPeriod = (1u << 31) - 1u;

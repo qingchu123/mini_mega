@@ -41,10 +41,10 @@ constexpr int MX_FLAGS_NO_CACHE = 64;
 //   各 rank 的 c 同步前进。M_CYCLE>=3 是「预清 ct2 + 不碰 ct1」成立的前提。
 constexpr int M_CYCLE = 8;
 
-// 旧扁平 bar_flags 布局容量（与生产布局头同源）：
-//   kBarFlagsNumInt32=1024（普通旗区）、kFp8BarFlagsNumInt32=1032（+epoch/done 保留槽）
-constexpr int kBarFlagsNumInt32 = 1024;
-constexpr int kFp8BarFlagsNumInt32 = 1032;
+// 旗区容量（与生产布局头 include/deep_gemm/layout/mega_moe.cuh 同源，NSLICE=16 扩容后）：
+//   kBarFlagsNumInt32=2560（普通旗区），kFp8BarFlagsNumInt32=2568（+epoch/done 保留槽）
+constexpr int kBarFlagsNumInt32 = 2560;
+constexpr int kFp8BarFlagsNumInt32 = 2568;
 
 // COMBINE 完成标记容量（kernel 侧不 include 布局头，故本地重述）：
 //   kCombineSlicesMax 与 include/deep_gemm/layout/mega_moe.cuh 的

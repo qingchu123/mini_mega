@@ -23,7 +23,7 @@ constexpr int kRanks = 32;
 #ifndef KNSLICE_OVERRIDE
 #define KNSLICE_OVERRIDE 4
 #endif
-constexpr int kNSlice = KNSLICE_OVERRIDE;  // 每窗口任务切片数（K 片 / N 组）
+constexpr int kNSlice = KNSLICE_OVERRIDE;  // 每窗口任务切片数（K 片 / N 组）；旗区已扩容，NSLICE=16 需另行解决 N 组几何（见 block_n）
 #ifndef KRING_OVERRIDE
 #define KRING_OVERRIDE 8
 #endif
