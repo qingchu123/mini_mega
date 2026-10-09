@@ -29,6 +29,20 @@ mini_mega/
 └── README.md
 ```
 
+## 关键编译期参数（`src/common.cuh`）
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `KNSLICE_OVERRIDE`（`kNSlice`） | 8 | 每窗口任务切片数；NS=8 时 L1 每片 2 组、L2 每片 3 组，均整除。NS=16 暂不可用（L2 N 组几何不整除，待设计） |
+| `kRing` | 8 | 同专家并发窗上限 |
+| `kEPR` / `kTopk` / `kHidden` / `kIntermediate` | 8 / 8 / 6144 / 2048 | 场景维度 |
+| `kGrid` | 32 | grid 块数（= SM 数） |
+
+切片/L1 进度旗区容量由 `include/deep_gemm/layout/mega_moe.cuh` 定义
+（`kBarMaxNSlice=16`，两旗区各 1024 项，承载 EPR×ring×NSLICE≤1024）。
+NS=8 下 `r19_small_task` 的 L2 `g_l2=3` 走单批 3 组路径（`[R35]`，见
+`compute_big.cuh`），不能走 `[O3]` 的 3+3 两批。
+
 ## 分层
 
 - **接口层**：`src/megakernel.h`（声明 `fp8mega::MegaLaunchArgs` 与
