@@ -4,7 +4,7 @@
 #
 # 用法：
 #   scripts/run.sh [程序] [-R N] [程序参数...]
-#     程序：mybench（默认）| check | bench
+#     程序：mybench（默认）| check
 #
 # 示例：
 #   scripts/run.sh mybench -R 32 -s 1 -tprs 1,4,16,32,33,64,128,256,512   # 均衡
@@ -39,8 +39,8 @@ if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
     shift
 fi
 case "$PROG" in
-    mybench|check|bench) ;;
-    *) echo "[run.sh] 未知程序: $PROG（可选 mybench|check|bench）" >&2; exit 2 ;;
+    mybench|check) ;;
+    *) echo "[run.sh] 未知程序: $PROG（可选 mybench|check）" >&2; exit 2 ;;
 esac
 
 # ---- GPU 临界区（AGENTS.md §4）：可重入保护，GPU_LOCK=0 关闭 ----
@@ -71,7 +71,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$NPROC" ]; then
-    if [ "$PROG" = bench ]; then NPROC=1; else NPROC="$R"; fi
+    NPROC="$R"
 fi
 
 BENCH=${BENCH:-test/$PROG}

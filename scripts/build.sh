@@ -8,12 +8,11 @@
 #   so       test/megakernel.so   fp8 mega kernel 的 host C++ 接口层（src/megakernel.cu）
 #   mybench  test/mybench         每进程一张卡的 MPI 性能基准（test/mybench.cu）
 #   check    test/check           MPI 正确性测试（test/check.cu）
-#   bench    test/bench           单进程多卡 benchmark（src/bench.cu，旧口径）
 #   whl      torch/dist/*.whl     torch 层 wheel（需 python+torch，PYTHON= 可指定）
-#   all      等价于 so bench mybench check（不含 whl：whl 依赖 torch 环境）
+#   all      等价于 so mybench check（不含 whl：whl 依赖 torch 环境）
 #   -h       显示帮助
 #
-# 不带目标时等价 all。mybench/check/bench/whl 会自动先编 so。
+# 不带目标时等价 all。mybench/check/whl 会自动先编 so。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,9 +24,8 @@ usage() {
   so        test/megakernel.so（host C++ 接口层 + kernel）
   mybench   test/mybench（每进程一张卡的 MPI 性能基准）
   check     test/check（MPI 正确性测试）
-  bench     test/bench（单进程多卡 benchmark，旧口径）
   whl       torch/dist/*.whl（需 python+torch；PYTHON= 指定解释器）
-  all       等价于 so bench mybench check（不含 whl）
+  all       等价于 so mybench check（不含 whl）
   -h, --help 显示本帮助
 
 不带目标时等价 all。mybench/check/bench/whl 会自动先编 so。
@@ -39,7 +37,7 @@ TARGETS=()
 for arg in "$@"; do
   case "$arg" in
     -h|--help) usage; exit 0 ;;
-    so|mybench|check|bench|whl|all) TARGETS+=("$arg") ;;
+    so|mybench|check|whl|all) TARGETS+=("$arg") ;;
     *) echo "未知参数: $arg" >&2; usage >&2; exit 2 ;;
   esac
 done
@@ -48,13 +46,13 @@ done
 declare -A DO=()
 for t in "${TARGETS[@]}"; do
   if [ "$t" = all ]; then
-    DO[so]=1; DO[bench]=1; DO[mybench]=1; DO[check]=1
+    DO[so]=1; DO[mybench]=1; DO[check]=1
   else
     DO[$t]=1
   fi
 done
-# mybench/check/bench/whl 依赖 megakernel.so，自动补齐 so
-if [ -n "${DO[bench]:-}${DO[mybench]:-}${DO[check]:-}${DO[whl]:-}" ]; then
+# mybench/check/whl 依赖 megakernel.so，自动补齐 so
+if [ -n "${DO[mybench]:-}${DO[check]:-}${DO[whl]:-}" ]; then
   DO[so]=1
 fi
 
@@ -89,13 +87,6 @@ build_so() {
   echo "built: $PWD/$OUT/megakernel.so"
 }
 
-build_bench() {
-  "$CUCC" -O3 -std=c++17 "${INC[@]}" "${MPI_INC[@]}" \
-    -o "$OUT/bench" src/bench.cu \
-    "$OUT/megakernel.so" "${MPI_LIB[@]}"
-  echo "built: $PWD/$OUT/bench"
-}
-
 build_mybench() {
   "$CUCC" -O3 -std=c++17 "${INC[@]}" "${MPI_INC[@]}" $KERNEL_CFLAGS \
     -o "$OUT/mybench" test/mybench.cu \
@@ -120,7 +111,6 @@ build_whl() {
 }
 
 [ -n "${DO[so]:-}" ] && build_so
-[ -n "${DO[bench]:-}" ] && build_bench
 [ -n "${DO[mybench]:-}" ] && build_mybench
 [ -n "${DO[check]:-}" ] && build_check
 [ -n "${DO[whl]:-}" ] && build_whl
