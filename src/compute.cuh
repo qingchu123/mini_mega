@@ -948,12 +948,10 @@ __device__ __forceinline__ void dispatch_pull_body(
     // [LONGTAIL] merge 上限：缺省 gridDim.x（把物理任务粗化到 ≤ 单波）；
     // 不均衡长尾场景 host 传一个很大的 merge_grid，令 merge 保持 1（不粗化），
     // 使大专家切成更多、更小的任务摊到更多 block。
-    int merge = 1;
-    const int merge_cap = (merge_grid > 0) ? merge_grid : (int)gridDim.x;
-    while (merge < kNSlice &&
-           ((raw_tasks + merge - 1) / merge) > merge_cap)
-        merge <<= 1;
-    if (kNSlice % merge != 0) merge = 1;   // 兜底（kNSlice 非 2 的幂）
+    // [步骤20a] 去掉 merge 机制：固定 merge=1（不粗化），nslice_eff=kNSlice。
+    // merge_grid 参数保留但不再使用（待后续清理协议层时删除）。
+    (void)merge_grid;
+    const int merge = 1;
     const int nslice_eff = kNSlice / merge;
     const int total_tasks = raw_tasks / merge;
     // [集71] 任务循环进入 block 数
