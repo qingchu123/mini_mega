@@ -302,7 +302,10 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.pool_ptr = d.ld ? &d.ld->expert_tokens[0][0][0] : nullptr;
     a.w_off = L.token_route_weights_off;
     a.meta_off = L.token_src_meta_off;
-    a.max_spins = (int)kSpinLimit;
+    // [NS8] 首次 launch 含 JIT 编译开销（实测首个 eager launch 前 XBAR 等待
+    // ~1.05e8 周期，远超默认 kSpinLimit=4e6 的「约 1s」预算），故放大阈值；
+    // 稳态 launch 的 xbar 自旋仅 ~8e3 周期，不依赖该放大量。
+    a.max_spins = (int)kSpinLimit * 10;
     a.publish_epoch = kPublishEpoch;
     a.recv_stride = (int)L.recv_stride;
     a.prefix_ptr = d.ld ? &d.ld->prefix_tbl[0][0] : nullptr;

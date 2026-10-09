@@ -1815,6 +1815,14 @@ __device__ R19_SMALL_ATTR void r19_small_task(
                 ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
                 lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
                 S.l2_k_out);
+        } else if (g_l2 == 3) {
+            // [R35] NSLICE=8 等 g_l2=3 几何：单批 3 组（A 一遍、K 循环一次）。
+            // 不能走下面 [O3] 的 3+3 两批：gb=g_l2/2=1，两批各 1/2 组且
+            // kBatch=3 > 组数，l2_gemm_body 的组循环一次都不进 → 输出全零。
+            l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, 3>(
+                ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
+                S.l2_k_out);
         } else if (g_l2 % 3 == 0) {
             // [O3] g_l2 为 3 的倍数（6/12/…）→ 3+3 两批对称
             const int gb = g_l2 / 2;
