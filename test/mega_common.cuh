@@ -254,6 +254,11 @@ inline void reset_dev(const Geo& g, const Dev& d, const Routes& routes, int toke
     CHECK(mcMemset(d.rd, 0, sizeof(ranks_data)));
     CHECK(mcMemset(d.ffn, 0, ffn_bytes(g)));
     CHECK(mcMemset(d.l2, 0, l2_bytes(g)));
+    // 清零必须在 device 上完成后才返回：调用方随后的 MPI_Barrier 只保证 host 侧
+    // 对齐。若某 rank 的 rd（combine_rows）memset 晚于对端推送，对端已写入的
+    // 数据会被清零，而 rf 标记（先于 rd 清零）仍在 => REDUCE 放行读到 0。
+    // 该竞争在 graph 启动更快时稳定触发（graph×1 rel≈1.25e-01）。
+    CHECK(mcDeviceSynchronize());
     (void)tokens;
 }
 
