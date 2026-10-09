@@ -252,6 +252,77 @@ int main(int argc, char** argv) {
         mcEventDestroy(e1);
         mcGraphExecDestroy(ex);
 
+        // [诊断] MYBENCH_PHASE=1：计时后做一次 reset + 单次 eager launch，读取 kernel 内置相位 tick。
+        // 注意：route..reduce 与 chain 只来自 block0 的时间线（kernel 结束要等所有 block），
+        // 真正的关键路径需看逐 block 数据（MYBENCH_PHASE_RANK=<rank>，需 -DR24_DIAG_PHASE=1）。
+        if (std::getenv("MYBENCH_PHASE") != nullptr) {
+            mt::reset_dev(geo, d, routes, tokens);
+            MPI_Barrier(MPI_COMM_WORLD);
+            fp8mega::launch_full(a, d.st);
+            MYCHK(mcStreamSynchronize(d.st));
+            MPI_Barrier(MPI_COMM_WORLD);
+            unsigned long long tp[16] = {0};
+            MYCHK(mcMemcpy(tp, d.lf->pre_ticks, sizeof(tp), mcMemcpyDeviceToHost));
+            std::vector<unsigned long long> tr((size_t)kGrid * 8, 0ull);
+            MYCHK(mcMemcpy(tr.data(), d.lf->pre_ticks + (size_t)kGrid * 8,
+                           tr.size() * sizeof(unsigned long long), mcMemcpyDeviceToHost));
+            int proc[kGrid] = {0};
+            MYCHK(mcMemcpy(proc, d.lf->out_processed, sizeof(proc), mcMemcpyDeviceToHost));
+            // 行：route publish xbar setup dispatch L1 L2tail compute reduce chain | trL1max trL2max maxtasks
+            auto cyc = [&](int hi, int lo) {
+                return (double)((long long)tp[hi] - (long long)tp[lo]);
+            };
+            double rowv[12];
+            rowv[0] = cyc(0, 6);
+            rowv[1] = cyc(1, 0);
+            rowv[2] = cyc(2, 1);
+            rowv[3] = cyc(3, 2);
+            rowv[4] = cyc(4, 3);
+            rowv[5] = cyc(5, 4);
+            rowv[6] = cyc(7, 5);
+            rowv[7] = cyc(7, 6);
+            rowv[8] = cyc(15, 7);
+            rowv[9] = cyc(15, 6);
+            unsigned long long l1max = 0, l2max = 0;
+            for (int b = 0; b < kGrid; ++b) {
+                l1max = std::max(l1max, tr[(size_t)b * 8 + 0]);
+                l2max = std::max(l2max, tr[(size_t)b * 8 + 1]);
+            }
+            rowv[10] = (double)l1max;
+            rowv[11] = (double)l2max;
+            int maxtasks = 0;
+            for (int b = 0; b < kGrid; ++b) maxtasks = std::max(maxtasks, proc[b]);
+            // 指定 rank 的逐 block 明细（需 R24_DIAG_PHASE=1；L1/L2 为 atomicAdd 累计周期）
+            if (const char* pr = std::getenv("MYBENCH_PHASE_RANK")) {
+                if (std::atoi(pr) == rank) {
+                    std::printf("[phase-blk] rank=%d block: L1cyc L2cyc tasks\n", rank);
+                    for (int b = 0; b < kGrid; ++b)
+                        std::printf("[phase-blk] b=%02d %10llu %10llu %d\n", b,
+                                    tr[(size_t)b * 8 + 0], tr[(size_t)b * 8 + 1], proc[b]);
+                    std::fflush(stdout);
+                }
+            }
+            std::vector<double> allrow((size_t)R * 13, 0.0);
+            double sendrow[13];
+            for (int i = 0; i < 12; ++i) sendrow[i] = rowv[i];
+            sendrow[12] = (double)maxtasks;
+            MPI_Gather(sendrow, 13, MPI_DOUBLE, allrow.data(), 13, MPI_DOUBLE, 0,
+                       MPI_COMM_WORLD);
+            if (rank == 0) {
+                std::printf("[phase] 单位=GPU 周期（clock64，block0 时间线）；trL1max/trL2max 需 R24_DIAG_PHASE=1\n");
+                std::printf("%-4s %9s %8s %8s %8s %8s %8s %8s %9s %8s %9s %9s %9s\n", "rank",
+                            "route", "publish", "xbar", "setup", "dispatch", "L1", "L2tail",
+                            "compute", "reduce", "chain", "trL1max", "trL2max");
+                for (int r = 0; r < R; ++r) {
+                    const double* q = allrow.data() + (size_t)r * 13;
+                    std::printf("%-4d %9.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %9.0f %8.0f %9.0f %9.0f %9.0f  tasks=%d\n",
+                                r, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8],
+                                q[9], q[10], q[11], (int)q[12]);
+                }
+                std::fflush(stdout);
+            }
+        }
+
         std::vector<double> all(R, -1.0);
         MPI_Allgather(&us, 1, MPI_DOUBLE, all.data(), 1, MPI_DOUBLE, MPI_COMM_WORLD);
         if (rank == 0) {

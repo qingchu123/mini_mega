@@ -287,6 +287,33 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
     std::vector<uint8_t> ffn_d((size_t)rows * kIntermediate);
     CHECK(mcMemcpy(ffn_d.data(), e.d.ffn + (size_t)pool_slot * win * kIntermediate,
                    ffn_d.size(), mcMemcpyDeviceToHost));
+    // L1 输出布局：行主序（ring 0）或 A-fragment 路径的 f2 布局（compute.cuh 的 f_slots /
+    // f2_slots 公式；compute_big.cuh 的 cm_store_ffn_frag 与 f2p 寻址）。
+    //   f_slots = ceil((k_in/32)*mt*512 / (win*I))，f2_slot = 1 + f_slots，
+    //   f2 槽 = e*ring + f2_slot，字节(row,col) = ((col>>5)*mt + (row>>4))*512 + (row&15)*32 + (col&31)。
+    {
+        const int mt = (win + 15) >> 4;
+        const int64_t slot_bytes = (int64_t)win * kIntermediate;
+        const int64_t f_bytes = (int64_t)(kHidden / 32) * mt * 512;
+        const int f_slots = (int)((f_bytes + slot_bytes - 1) / slot_bytes);
+        const int f2_slot = 1 + f_slots;
+        long long nz0 = 0;
+        for (size_t i = 0; i < (size_t)rows * kIntermediate; ++i)
+            if (ffn_d[i] != 0) ++nz0;
+        if (nz0 < (long long)(rows * kIntermediate) / 2) {
+            std::vector<uint8_t> f2((size_t)win * kIntermediate);
+            CHECK(mcMemcpy(f2.data(),
+                           e.d.ffn + ((size_t)ex * kRing + f2_slot) * win * kIntermediate,
+                           f2.size(), mcMemcpyDeviceToHost));
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < kIntermediate; ++c)
+                    ffn_d[(size_t)r * kIntermediate + c] =
+                        f2[((size_t)(c >> 5) * mt + (r >> 4)) * 512 + (r & 15) * 32 + (c & 31)];
+            std::printf("    [L1/L2] 布局=A-fragment（f2 槽 e*ring+%d），已解码为行主序\n", f2_slot);
+        } else {
+            std::printf("    [L1/L2] 布局=行主序（ring 0）\n");
+        }
+    }
 
     // L1：CPU 参考 -> E4M3 量化 -> 解码后与设备字节比较
     std::vector<float> ffn_exp((size_t)rows * kIntermediate);
@@ -303,7 +330,6 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
                                       (int)ffn_exp_f.size(), 7e-2, 2e-3);
     print_check_stats("L1 ffn_hidden(expert0)", s1);
     if (std::getenv("MT_L1_DIAG") != nullptr) l1_diag(e, s, routes, ex, rows, xd, ffn_d);
-
     // L2：CPU 参考（以设备 ffn 字节为输入）vs 各 block 的 l2_out 槽。
     // 每个 block 只写自己负责的 N-slice 列；对每个 slice 查找「存在一个 block 与参考一致」。
     std::vector<float> out_exp((size_t)rows * kHidden);
@@ -427,6 +453,22 @@ bool run_graph(Env& e, const Spec& s, const mt::Routes& routes,
                const std::vector<float>& y_ref, int nodes, Result* out) {
     const int T = s.tokens;
     CHECK(mcSetDevice(e.rank));
+    int graph_diag_rank = 0;
+    if (const char* diag_rank = std::getenv("MT_GRAPH_DIAG_RANK"))
+        graph_diag_rank = std::atoi(diag_rank);
+    const bool dump_graph_rows =
+        std::getenv("MT_GRAPH_ROWS_DIFF") != nullptr && e.rank == graph_diag_rank;
+    std::vector<uint8_t> eager_rows;
+    if (dump_graph_rows) {
+        long long eager_ct = 0;
+        CHECK(mcMemcpy(&eager_ct, &(e.d.lf->current_time[0][1]),
+                       sizeof(eager_ct), mcMemcpyDeviceToHost));
+        const int eager_cyc = (int)((eager_ct - 1) % M_CYCLE);
+        eager_rows.assign((size_t)kTopk * kMaxTPR * kHidden * 2, 0);
+        CHECK(mcMemcpy(eager_rows.data(),
+                       e.d.rd->combine_rows[eager_cyc],
+                       eager_rows.size(), mcMemcpyDeviceToHost));
+    }
     CHECK(mcStreamBeginCapture(e.d.st, mcStreamCaptureModeThreadLocal));
     for (int n = 0; n < nodes; ++n) {
         fp8mega::MegaLaunchArgs a = mt::make_args(e.geo, e.d, T, s.win, e.d.ynode[n]);
@@ -459,6 +501,163 @@ bool run_graph(Env& e, const Spec& s, const mt::Routes& routes,
                 std::snprintf(msg, sizeof(msg), "node%d rel_max=%.3e pattern=%lld", n,
                               rs.rel_max, rs.pattern);
                 detail(e, "graph", msg);
+                if (dump_graph_rows && n == 0) {
+                    const uint8_t* cur_dev =
+                        reinterpret_cast<const uint8_t*>(e.d.rd->combine_rows[0]);
+                    std::vector<uint8_t> cur_rows(eager_rows.size());
+                    CHECK(mcMemcpy(cur_rows.data(), cur_dev, cur_rows.size(),
+                                   mcMemcpyDeviceToHost));
+                    const uint16_t* a16 = reinterpret_cast<const uint16_t*>(eager_rows.data());
+                    const uint16_t* b16 = reinterpret_cast<const uint16_t*>(cur_rows.data());
+                    const size_t n16 = eager_rows.size() / 2;
+                    size_t first = n16;
+                    long long regions = 0;
+                    bool in_run = false;
+                    for (size_t i = 0; i < n16; ++i) {
+                        if (a16[i] != b16[i]) {
+                            if (first == n16) first = i;
+                            if (!in_run) { ++regions; in_run = true; }
+                        } else {
+                            in_run = false;
+                        }
+                    }
+                    if (first < n16) {
+                        const size_t kk = first / ((size_t)kMaxTPR * kHidden);
+                        const size_t rem = first % ((size_t)kMaxTPR * kHidden);
+                        const size_t stok = rem / kHidden;
+                        const size_t col = rem % kHidden;
+                        const int64_t dst_expert =
+                            routes[e.rank][stok * (size_t)kTopk + kk];
+                        std::printf("    [graph-raw] rank=%d node=%d raw字节差=%s 区域数=%lld "
+                                    "首差:k=%zu,token=%zu,col=%zu,期望=%u,实际=%u,目标专家=%lld\n",
+                                    e.rank, n,
+                                    (cur_rows == eager_rows ? "无" : "有"), regions,
+                                    kk, stok, col, (unsigned)a16[first],
+                                    (unsigned)b16[first], (long long)dst_expert);
+                    } else {
+                        std::printf("    [graph-raw] rank=%d node=%d raw字节差=无\n",
+                                    e.rank, n);
+                    }
+                    std::fflush(stdout);
+                }
+                if (std::getenv("MT_GRAPH_ROWS") != nullptr && e.rank == graph_diag_rank) {
+                    long long ct01 = 0;
+                    CHECK(mcSetDevice(e.rank));
+                    CHECK(mcMemcpy(&ct01, &(e.d.lf->current_time[0][1]),
+                                   sizeof(ct01), mcMemcpyDeviceToHost));
+                    const int cyc_rows = n % M_CYCLE;
+                    std::vector<uint8_t> g_rows((size_t)kTopk * T * kHidden * 2);
+                    const uint8_t* g_rows_dev =
+                        reinterpret_cast<const uint8_t*>(e.d.rd->combine_rows[cyc_rows]);
+                    for (int k = 0; k < kTopk; ++k)
+                        CHECK(mcMemcpy(g_rows.data() + (size_t)k * T * kHidden * 2,
+                                       g_rows_dev + (size_t)k * kMaxTPR * kHidden * 2,
+                                       (size_t)T * kHidden * 2, mcMemcpyDeviceToHost));
+                    std::vector<float> g_w((size_t)T * kTopk);
+                    CHECK(mcMemcpy(g_w.data(), e.d.sym + e.geo.L.topk_weights_off,
+                                   g_w.size() * sizeof(float), mcMemcpyDeviceToHost));
+                    std::vector<float> y_data((size_t)T * kHidden);
+                    for (int t = 0; t < T; ++t)
+                        ref_reduce(g_rows.data(), routes[e.rank].data(), g_w.data(), t,
+                                   kTopk, e.R * kEPR, T, kHidden,
+                                   y_data.data() + (size_t)t * kHidden);
+                    const CheckStats data_ref = compare_f32(y_data.data(), y_ref.data(),
+                                                            (int)y_data.size(), 1e-5, 1e-6);
+                    const CheckStats got_data = compare_f32(got.data(), y_data.data(),
+                                                            (int)y_data.size(), 1e-5, 1e-6);
+                    const uint64_t epoch_expect = (uint64_t)ct01;
+                    std::vector<uint64_t> sum_flags((size_t)kTopk * kMaxCombineRows *
+                                                    kCombineSlicesMax, 0);
+                    CHECK(mcMemcpy(sum_flags.data(),
+                                   &e.d.rf->combine_sums[cyc_rows][0][0][0],
+                                   sum_flags.size() * sizeof(uint64_t),
+                                   mcMemcpyDeviceToHost));
+                    std::printf("    [graph-rows] rank=%d node=%d ct01=%lld cyc=%d "
+                                "数据对eager bad=%lld max=%.3e 最差idx=%lld "
+                                "输出对数据 bad=%lld max=%.3e 最差idx=%lld\n",
+                                e.rank, n, ct01, cyc_rows,
+                                data_ref.bad, data_ref.max_abs, data_ref.worst,
+                                got_data.bad, got_data.max_abs, got_data.worst);
+                    std::fflush(stdout);
+                    if (data_ref.worst >= 0) {
+                        const long long dtok = data_ref.worst / kHidden;
+                        int ns_bar = 0;
+                        CHECK(mcMemcpy(&ns_bar,
+                                       &(e.d.lf->bar[cyc_rows][kBarNsliceEffIdx]),
+                                       sizeof(ns_bar), mcMemcpyDeviceToHost));
+                        std::printf("    [graph-k] rank=%d node=%d token=%lld 标志期望=%llu 有效槽=%d",
+                                    e.rank, n, dtok, (unsigned long long)epoch_expect,
+                                    ns_bar);
+                        for (int k = 0; k < kTopk; ++k) {
+                            const int64_t ex = routes[e.rank][(size_t)dtok * kTopk + k];
+                            const float wv = g_w[(size_t)dtok * kTopk + k];
+                            const uint16_t* row = reinterpret_cast<const uint16_t*>(
+                                g_rows.data() + ((size_t)k * T + dtok) * kHidden * 2);
+                            long long nz = 0;
+                            double ssum = 0.0, asum = 0.0;
+                            for (int c = 0; c < kHidden; ++c) {
+                                const float v = bf16_to_f32(row[c]);
+                                if (v != 0.0f) ++nz;
+                                ssum += v;
+                                asum += std::fabs(v);
+                            }
+                            std::printf(" [k%d:专家=%lld,权重=%.6g,非零=%lld,和=%.6g,绝和=%.6g,标志=",
+                                        k, (long long)ex, (double)wv, nz, ssum, asum);
+                            for (int s2 = 0; s2 < ns_bar && s2 < kCombineSlicesMax; ++s2)
+                                std::printf("%llu,", (unsigned long long)sum_flags
+                                            [((size_t)k * kMaxCombineRows + dtok) *
+                                             kCombineSlicesMax + s2]);
+                            std::printf("]");
+                        }
+                        std::printf("\n");
+                        std::fflush(stdout);
+                    }
+                }
+                if (std::getenv("MT_GRAPH_DIAG") != nullptr) {
+                    double scale = 0.0;
+                    for (size_t i = 0; i < y_ref.size(); ++i)
+                        if (std::isfinite(y_ref[i]))
+                            scale = std::max(scale, (double)std::fabs(y_ref[i]));
+                    const double tol = 1e-3 * std::max(scale, 1e-30);
+                    size_t first_bad = got.size(), worst = 0;
+                    double maxd = 0.0;
+                    long long bad = 0;
+                    for (size_t i = 0; i < got.size(); ++i) {
+                        if (!std::isfinite(got[i]) || !std::isfinite(y_ref[i]))
+                            continue;
+                        const double d = std::fabs((double)got[i] - (double)y_ref[i]);
+                        if (d > tol) {
+                            ++bad;
+                            if (first_bad == got.size()) first_bad = i;
+                            if (d > maxd) { maxd = d; worst = i; }
+                        }
+                    }
+                    long long seg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                    size_t last_bad = 0;
+                    if (first_bad < got.size()) {
+                        const size_t ftok = first_bad / kHidden;
+                        const size_t segw = kHidden / 8;
+                        for (size_t i = ftok * kHidden; i < (ftok + 1) * kHidden; ++i) {
+                            if (!std::isfinite(got[i]) || !std::isfinite(y_ref[i]))
+                                continue;
+                            if (std::fabs((double)got[i] - (double)y_ref[i]) > tol) {
+                                ++seg[(i % kHidden) / segw];
+                                last_bad = i;
+                            }
+                        }
+                    }
+                    std::printf("    [graph-diag] rank=%d node=%d n=%zu bad=%lld tol=%.3e "
+                                "first=%zu(token=%zu,col=%zu) worst=%zu(token=%zu,col=%zu,"
+                                "got=%.6g,want=%.6g) last=%zu seg=[%lld,%lld,%lld,%lld,"
+                                "%lld,%lld,%lld,%lld]\n",
+                                e.rank, n, got.size(), bad, tol,
+                                first_bad, first_bad / kHidden, first_bad % kHidden,
+                                worst, worst / kHidden, worst % kHidden,
+                                (double)got[worst], (double)y_ref[worst], last_bad,
+                                seg[0], seg[1], seg[2], seg[3],
+                                seg[4], seg[5], seg[6], seg[7]);
+                    std::fflush(stdout);
+                }
             }
             pass = false;
         }
@@ -544,6 +743,7 @@ int main(int argc, char** argv) {
 
     bool smoke = false, all = false;
     std::vector<int> only;             // --only：只跑指定 TK launch（调试用）
+    std::vector<int> tprs;             // --tprs：覆盖 --all 的均衡 TPR 列表（调试用）
     std::string tk_path = mt::kDefaultTkLog;
     int graph_nodes = 50, check_rows = 16;
     for (int i = 1; i < argc; ++i) {
@@ -553,6 +753,7 @@ int main(int argc, char** argv) {
         else if (a == "--all") all = true;
         else if (a == "--tk-info") tk_path = val();
         else if (a == "--only") only = mt::parse_csv_ints(val());
+        else if (a == "--tprs") tprs = mt::parse_csv_ints(val());
         else if (a == "--graph-nodes") graph_nodes = std::atoi(val().c_str());
         else if (a == "--check-rows") check_rows = std::atoi(val().c_str());
         else if (a == "-h" || a == "--help") {
@@ -609,7 +810,13 @@ int main(int argc, char** argv) {
         plan.push_back({mt::balanced_spec(R, 16), Flags{false, true, graph_nodes}});
     }
     if (all) {
-        for (int t : kBalancedTprs)
+        // --tprs 子集：仍自动包含 TPR=512，保证 max_tokens=512 的全局布局与全量一致
+        std::vector<int> bal = tprs.empty()
+            ? std::vector<int>(std::begin(kBalancedTprs), std::end(kBalancedTprs))
+            : tprs;
+        if (!tprs.empty() && std::find(bal.begin(), bal.end(), 512) == bal.end())
+            bal.push_back(512);
+        for (int t : bal)
             plan.push_back({mt::balanced_spec(R, t), Flags{true, true, graph_nodes}});
         for (const auto& t : tk)
             plan.push_back({mt::tk_spec(t), Flags{true, true, graph_nodes}});
@@ -621,7 +828,10 @@ int main(int argc, char** argv) {
                               std::find(only.begin(), only.end(), p.first.launch_id) != only.end();
             // 保留 TPR=512 均衡用例：它决定 max_tokens=512 的全局布局（复现 --all 的布局）
             const bool pin = p.first.kind == 0 && p.first.tokens == 512;
-            if (pick || pin) keep.push_back(p);
+            // --tprs 指定的均衡用例同样保留（子集验证用）
+            const bool bal = p.first.kind == 0 && !tprs.empty() &&
+                             std::find(tprs.begin(), tprs.end(), p.first.tokens) != tprs.end();
+            if (pick || pin || bal) keep.push_back(p);
         }
         plan.swap(keep);
     }
