@@ -36,16 +36,17 @@ struct MegaArgs {
     int tbl_cap;        // src_index_table 行容量（= max_tokens）
     int k_in, topk, ring;
     int64_t rsc_off, prefix_off;
-    local_flags* lf;               // flag 区（本 rank 私有，普通显存）
-    ranks_flags* rf;               // 跨 rank flag 区（FG 显存）
+    // [步骤2b-A] 结构体指针（替代 lf/rf/remote 等旧字段）
+    rwk_data* rwk;                 // 本 rank 普通显存整块（lf + ld）
+    unk_data* unk;                 // 本 rank FG 整块（rf + rd）
+    unk_data* const* unk_peers;    // 各 rank unk 基址表（设备数组，含 self）
+    // 过渡：rf_peers/remote_peers 设备表仍保留（2b-B 统一到 unk_peers）
     ranks_flags* const* rf_peers;  // 各 rank ranks_flags 基址表（设备数组，含 self）
-    ranks_data* remote;             // 本 rank 远端数据表
     ranks_data* const* remote_peers;  // 各 rank ranks_data 基址表
     int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
     int64_t slice_flags_idx, l1_prog_idx;
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
-    int* rsc_ptr;               // route_slot_counts（local_data）
-    uint8_t* pool_ptr;   // [A-RWK] pool 独立缓冲基址（nullptr → self+pool_off）
+    uint8_t* pool_ptr;   // [A-RWK] pool 独立缓冲基址（nullptr → self+pool_off，可空语义保留）
     // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）
     // 已迁入 local_flags（lf->...），此处不再持有独立指针。
     int max_spins;
@@ -55,14 +56,11 @@ struct MegaArgs {
     //   跳过 ROUTE_BUILD/PUBLISH/XBAR（数据持久、node0 已建立跨 rank 可见性），
     //   仅推进 cycle 计数并重跑 TASK_SETUP（重臂 flag）。0=完整前序，1=复用。
     int skip_prologue;
-    int* prefix_ptr;          // 可选独立前缀表缓冲（nullptr = self+prefix_off）    // ---- 计算链 ----
-    const uint8_t* w1;        // [EPR][2I][H] lane 序 packed tile（gate/up 配对布局）
+    int* prefix_ptr;          // 可选独立前缀表缓冲（nullptr = self+prefix_off，可空语义保留）
+    // ---- 计算链 ----
     int l1_n_total, l1_block_n, l1_k_out;
-    uint8_t* ffn_hidden;      // [EPR][ring][win_cap][I] FP8
-    uint8_t* frag_a;          // [OPT-AFRAG] A 输入 fragment 缓冲（可 nullptr）
-    uint8_t* frag2;           // [OPT-AFRAG] L1 输出 fragment 缓冲（可 nullptr）
-    const uint8_t* w2;        // [EPR][H][I] lane 序 packed tile
-    uint16_t* l2_out;         // [kGrid][win_cap][H] BF16
+    uint8_t* frag_a;          // [OPT-AFRAG] A 输入 fragment 缓冲（可 nullptr，可空语义保留）
+    uint8_t* frag2;           // [OPT-AFRAG] L1 输出 fragment 缓冲（可 nullptr，可空语义保留）
     int l2_k_out;
     // ---- 收尾 ----
     int64_t combine_rows_off;  // 目标 rank 的 combine_rows 区偏移（BF16，留在 sym）
@@ -139,15 +137,15 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
                                                    uint8_t* frag2 = nullptr,
                                                    unsigned long long* ctr = nullptr) {
     dispatch_pull_body<TaskTail, kSmallOnly, kFragCap, kCap>(
-        a.self, a.remote, cycle, a.peer_bases, a.R, a.rank, a.win_cap,
+        a.self, &a.unk->rd, cycle, a.peer_bases, a.R, a.rank, a.win_cap,
         a.pool_stride, a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off,
         a.x_off, a.weights_off, a.pool_off, a.w_off, a.meta_off,
-        a.pool_ptr, a.lf->bar[cycle],
+        a.pool_ptr, a.rwk->lf.bar[cycle],
         a.task_counter_idx, a.l2_done_idx, a.task_ready_idx, a.slice_flags_idx,
-        a.l1_prog_idx, a.lf->out_processed, a.lf->dbg, a.max_spins, a.w1,
-        a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.lf->l1_chk, a.w2,
-        a.l2_out, a.l2_k_out, a.lf->l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
-        a.prefix_ptr, a.lf->pre_ticks, a_smem, b_smem, frag_a, frag2, ctr);
+        a.l1_prog_idx, a.rwk->lf.out_processed, a.rwk->lf.dbg, a.max_spins, &a.rwk->ld.w1[0][0][0],
+        a.l1_n_total, a.l1_block_n, a.l1_k_out, &a.rwk->ld.ffn_hidden[0][0][0], a.rwk->lf.l1_chk, &a.rwk->ld.w2[0][0][0],
+        &a.rwk->ld.l2_out[0][0][0], a.l2_k_out, a.rwk->lf.l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
+        a.prefix_ptr, a.rwk->lf.pre_ticks, a_smem, b_smem, frag_a, frag2, ctr);
 }
 
 // 主 kernel（单轮）。
@@ -184,62 +182,62 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                   8 * 1024];
     };
     __shared__ ABShared s_ab;
-    if (kTick) a.lf->pre_ticks[6] = clock64();
+    if (kTick) a.rwk->lf.pre_ticks[6] = clock64();
     // 0) [M_CYCLE] 预清 ct2=(c+2)%M_CYCLE 槽（本轮 copy c 尚未定，用 current_time
     //   [b][0] 派生；入口全 block 同为 L ⇒ c 一致）。ct1 留给下一轮，本轮不碰。
-    mx_preclear_ct2(a.lf, a.rf, /*skip_xbar=*/a.skip_prologue >= 2);
+    mx_preclear_ct2(&a.rwk->lf, &a.unk->rf, /*skip_xbar=*/a.skip_prologue >= 2);
     __syncthreads();
     if (!a.skip_prologue) {
         // 1) PROLOGUE：ROUTE_BUILD + PUBLISH_COUNTS（仅 block0）
         if (blockIdx.x == 0) {
             const int route_cycle =
-                (int)(a.lf->current_time[0][0] % M_CYCLE);
-            route_build_body(a.topk_idx, a.self, a.rsc_ptr, a.rsc_off,
+                (int)(a.rwk->lf.current_time[0][0] % M_CYCLE);
+            route_build_body(a.topk_idx, a.self, &a.rwk->ld.route_slot_counts[0], a.rsc_off,
                              a.remote_peers, route_cycle, a.R, a.rank,
                              a.tokens, a.slot_capacity, 0, 0, ctr);
-            if (kTick) a.lf->pre_ticks[0] = clock64();
-            publish_counts_body(a.self, a.rsc_ptr, a.rsc_off, a.remote_peers,
+            if (kTick) a.rwk->lf.pre_ticks[0] = clock64();
+            publish_counts_body(a.self, &a.rwk->ld.route_slot_counts[0], a.rsc_off, a.remote_peers,
                                 route_cycle, a.R, a.rank, a.publish_epoch,
                                 a.recv_stride, 0, ctr);
-            if (kTick) a.lf->pre_ticks[1] = clock64();
+            if (kTick) a.rwk->lf.pre_ticks[1] = clock64();
         }
     } else {
         // [R38] 复用前序：路由/计数持久，跳过 ROUTE/PUBLISH（数据与 node0 相同）。
-        if (kTick) a.lf->pre_ticks[0] = a.lf->pre_ticks[1] = clock64();
+        if (kTick) a.rwk->lf.pre_ticks[0] = a.rwk->lf.pre_ticks[1] = clock64();
     }
     // 2) XBAR_ROUTE_READY（全 grid，mode3：转置 + warp 并行发布）：每节点保留，
     //    既是 route/publish 可见性门，也是跨 rank 的每节点对齐（防漂移）。
     if (a.skip_prologue >= 2) {
         // 诊断模式：连 xbar 也跳过，仅推进 xbar 相位计数
-        if (threadIdx.x == 0) a.lf->current_time[blockIdx.x][0] += 1;
+        if (threadIdx.x == 0) a.rwk->lf.current_time[blockIdx.x][0] += 1;
         __syncthreads();
     } else {
-        xbar_route_ready_body(a.rf, a.rf_peers, a.lf, a.R, a.rank,
-                              a.xrelease_idx, a.lf->dbg, a.max_spins, 0, ctr);
+        xbar_route_ready_body(&a.unk->rf, a.rf_peers, &a.rwk->lf, a.R, a.rank,
+                              a.xrelease_idx, a.rwk->lf.dbg, a.max_spins, 0, ctr);
     }
-    if (kTick) a.lf->pre_ticks[2] = clock64();
+    if (kTick) a.rwk->lf.pre_ticks[2] = clock64();
     // 3) TASK_SETUP（block0 leader：checksum -> prefix -> 窗口表 -> task_ready）
     if (a.skip_prologue) {
         // [R38] 复用前序：prefix/路由/计数持久，仅轻量重臂 flag（省 checksum
         //   轮询与 prefix 重建）。
-        task_setup_light_body(a.lf, a.task_ready_idx, a.task_counter_idx,
-                              a.l2_done_idx, a.max_spins, a.lf->dbg);
+        task_setup_light_body(&a.rwk->lf, a.task_ready_idx, a.task_counter_idx,
+                              a.l2_done_idx, a.max_spins, a.rwk->lf.dbg);
     } else {
-        task_setup_body(a.self, a.remote, a.R, a.rank, a.slot_capacity,
-                        a.prefix_off, a.lf, a.task_ready_idx,
+        task_setup_body(a.self, &a.unk->rd, a.R, a.rank, a.slot_capacity,
+                        a.prefix_off, &a.rwk->lf, a.task_ready_idx,
                         a.task_counter_idx, a.l2_done_idx,
-                        a.lf->out_total, a.lf->dbg, a.max_spins,
+                        a.rwk->lf.out_total, a.rwk->lf.dbg, a.max_spins,
                         a.recv_stride, /*reset_ring=*/true, /*tid_base=*/0,
                         /*sb_cnt=*/nullptr, /*smem_off=*/0, a.prefix_ptr,
-                        a.lf->ck_dbg, ctr);
+                        a.rwk->lf.ck_dbg, ctr);
     }
-    if (kTick) a.lf->pre_ticks[3] = clock64();
+    if (kTick) a.rwk->lf.pre_ticks[3] = clock64();
     // 4) 任务循环（DISPATCH -> L1 -> L2 -> tail(COMBINE)）
     if (kWithCompute) {
         // [M_CYCLE] 任务循环 / COMBINE / REDUCE 用的 copy c：task_setup 结束时
         //   current_time[b][1] 已自增到 L+1，故 (ct-1)%M_CYCLE = L%M_CYCLE，与
         //   xbar/task_setup 所用 c 一致。COMBINE 完成标记与 REDUCE 等待须同片。
-        const int cyc = (int)((a.lf->current_time[blockIdx.x][1] - 1) % M_CYCLE);
+        const int cyc = (int)((a.rwk->lf.current_time[blockIdx.x][1] - 1) % M_CYCLE);
         // [集33] tail 实例统一：任务循环恒用 CombineTail，combine 关闭时
         //   （combine_rows_off<0）融合能力置 false 且 tail 为空操作。这样
         //   mega_kernel<..., NoTaskTail> 不再实例化第二份重型任务体
@@ -259,8 +257,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.staging_cap = a.win_cap;
                 tail.ctx.block_idx = (int)blockIdx.x;
                 tail.ctx.cycle = cyc;   // [M_CYCLE] combine_sums 片
-                tail.ctx.epoch = (uint64_t)a.lf->current_time[0][1];
-                tail.out_base = reinterpret_cast<const uint8_t*>(a.l2_out);
+                tail.ctx.epoch = (uint64_t)a.rwk->lf.current_time[0][1];
+                tail.out_base = reinterpret_cast<const uint8_t*>(&a.rwk->ld.l2_out[0][0][0]);
                 tail.nwarps = 8;
                 // [R29] 融合推送能力 + 上下文（on 由任务体在 r24 L2 路径激活）
                 tail.fuse.capable = true;
@@ -279,7 +277,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.staging_cap = a.win_cap;
                 tail.ctx.block_idx = (int)blockIdx.x;
                 tail.ctx.cycle = cyc;   // [M_CYCLE]（combine 关闭，仅占位）
-                tail.ctx.epoch = (uint64_t)a.lf->current_time[0][1];
+                tail.ctx.epoch = (uint64_t)a.rwk->lf.current_time[0][1];
                 tail.out_base = nullptr;
                 tail.nwarps = 8;
                 tail.fuse.capable = false;
@@ -293,7 +291,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 ctr);
         }
     }
-    if (kTick) a.lf->pre_ticks[15] = clock64();
+    if (kTick) a.rwk->lf.pre_ticks[15] = clock64();
 }
 
 // ---------------------------------------------------------------- REDUCE --

@@ -86,7 +86,6 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     MegaArgs m{};
     m.topk_idx = a.topk_idx;
     m.self = a.self;
-    m.rsc_ptr = a.rsc_ptr;
     m.peer_bases = a.peer_bases;
     m.R = a.R;
     m.rank = a.rank;
@@ -100,11 +99,11 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.ring = a.ring;
     m.rsc_off = a.rsc_off;
     m.prefix_off = a.prefix_off;
-    // [步骤2a] 由结构体指针派生 kernel 旧字段（kernel 内部不变）
-    m.lf = a.rwk ? &a.rwk->lf : nullptr;
-    m.rf = a.unk ? &a.unk->rf : nullptr;
+    // [步骤2b-A] kernel 直接使用结构体指针
+    m.rwk = a.rwk;
+    m.unk = a.unk;
+    m.unk_peers = a.unk_peers;
     m.rf_peers = a.rf_peers;
-    m.remote = a.unk ? &a.unk->rd : nullptr;
     m.remote_peers = a.remote_peers;
     m.xrelease_idx = a.xrelease_idx;
     m.task_ready_idx = a.task_ready_idx;
@@ -123,15 +122,11 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.recv_stride = a.recv_stride;
     m.skip_prologue = a.skip_prologue;
     m.prefix_ptr = a.prefix_ptr;
-    m.w1 = a.w1;
     m.l1_n_total = a.l1_n_total;
     m.l1_block_n = a.l1_block_n;
     m.l1_k_out = a.l1_k_out;
-    m.ffn_hidden = a.ffn_hidden;
     m.frag_a = a.frag_a;
     m.frag2 = a.frag2;
-    m.w2 = a.w2;
-    m.l2_out = a.l2_out;
     m.l2_k_out = a.l2_k_out;
     m.combine_rows_off = a.combine_rows_off;
     return m;
