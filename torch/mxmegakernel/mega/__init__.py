@@ -40,7 +40,6 @@ _L1_BLOCK_N = 256
 # kernel 常量（与 src/common.cuh 对齐）
 _KERNEL_RING = 8        # kRing：每专家窗口槽数
 _KERNEL_M_TILE = 16     # kM：M tile 行数（win_cap 对齐粒度）
-_KERNEL_GRID = 32       # kGrid：grid 块数（缺省 merge 上限）
 # 自适应 win 下限：kernel 守卫（src/megakernel.cu）仅放行 win==slot 或
 # 16 的倍数且 48<=win<=slot；win<48 的小窗在 REDUCE/graph 上未验证。
 _WIN_ADAPT_MIN = 48
@@ -139,8 +138,9 @@ def _view(buf: torch.Tensor, dtype: torch.dtype, shape: Tuple[int, ...],
 class SymmBuffer:
     """对称区（fine-grained 显存 + 跨 rank IPC）。
 
-    world_size==1 时退化为单块 FG 显存；>1 时用 all_gather_object 交换 IPC
-    handle，经 _C.open_ipc_handle 建立本进程内的全 rank 基址表。
+    所有显存（sym / rwk / unk / 计算链缓冲）由 C++ 分配与释放（_C.create_symm_buffer）。
+    world_size>1 时用 all_gather_object 交换 sym/unk 的 IPC 句柄，由 C++ 打开远端
+    并构造设备表（_C.symm_import_peers）；Python 不持有任何裸指针的所有权。
     """
 
     def __init__(self, group, num_experts: int, num_max_tokens_per_rank: int,
@@ -194,7 +194,7 @@ class SymmBuffer:
         self.grid_num_tokens = int(grid_num_tokens if grid_num_tokens is not None
                                    else num_max_tokens_per_rank)
         self.launch_count = 0
-        # 逐 launch 配置缓存 (win_cap, merge_grid, use_frag)：eager 阶段按真实
+        # 逐 launch 配置缓存 (win_cap, use_frag)：eager 阶段按真实
         # 路由计算，capture 阶段复用（graph 内无法做 host 同步）。
         self._launch_cfg = None
         self._capture_node = 0
@@ -213,50 +213,26 @@ class SymmBuffer:
          self.src_index_table_bytes, self.expert_recv_counts_bytes,
          self.prefix_tbl_bytes, self.recv_stride) = (int(v) for v in info)
 
-        # ---- 分配 fine-grained 对称区（跨 rank 写必须 FG）----
-        self._sym_ptr = int(_C.allocate_finegrained(total_bytes, device))
+        # ---- C++ 自有分配：sym(FG) / rwk / unk(FG) / 计算链缓冲 ----
+        # Python 不再分配任何显存；指针与句柄全部经 _C 绑定获取。
+        self._impl = _C.create_symm_buffer(
+            rank, world_size, num_experts, cap, num_topk, hidden,
+            intermediate_hidden, self.win_phys, device)
+        self._sym_ptr = int(_C.symm_sym_ptr(self._impl))
         self.buffer = _C.wrap_device_ptr(self._sym_ptr, total_bytes, device)
         self.buffer.zero_()
-        self._lf_ptr = int(_C.alloc_local_flags(device))
-        self._rf_ptr = int(_C.alloc_ranks_flags_fg(device))
-        self._owns = True
 
-        # ---- IPC：交换 sym / rf handle，建立全 rank 基址表 ----
-        self._remote_sym = []
-        self._remote_rf = []
-        if world_size == 1:
-            base_ptrs = [self._sym_ptr]
-            rf_ptrs = [self._rf_ptr]
-        else:
-            sym_handle = _C.get_ipc_handle(self._sym_ptr)
-            rf_handle = _C.get_ipc_handle(self._rf_ptr)
-            sym_handles = [sym_handle] * world_size
-            rf_handles = [rf_handle] * world_size
-            dist.all_gather_object(sym_handles, sym_handle, group=group)
-            dist.all_gather_object(rf_handles, rf_handle, group=group)
-            base_ptrs = []
-            rf_ptrs = []
-            for i in range(world_size):
-                if i == rank:
-                    base_ptrs.append(self._sym_ptr)
-                    rf_ptrs.append(self._rf_ptr)
-                else:
-                    p = int(_C.open_ipc_handle(sym_handles[i]))
-                    q = int(_C.open_ipc_handle(rf_handles[i]))
-                    self._remote_sym.append(p)
-                    self._remote_rf.append(q)
-                    base_ptrs.append(p)
-                    rf_ptrs.append(q)
-                    _C.enable_peer_access(device, i)
+        # ---- IPC：交换 sym / unk 句柄，C++ 打开远端并构造设备表 ----
+        if world_size > 1:
+            sym_h, unk_h = _C.symm_export_handles(self._impl)
+            sym_handles = [None] * world_size
+            unk_handles = [None] * world_size
+            dist.all_gather_object(sym_handles, sym_h, group=group)
+            dist.all_gather_object(unk_handles, unk_h, group=group)
+            _C.symm_import_peers(self._impl, sym_handles, unk_handles)
             if group is not None:
                 group.barrier()
             torch.cuda.synchronize()
-
-        # ---- C++ 侧组装（设备基址表 + 计算链 staging）----
-        self._impl = _C.create_symm_buffer(
-            self._sym_ptr, self._lf_ptr, self._rf_ptr, base_ptrs, rf_ptrs, rank,
-            world_size, num_experts, cap, num_topk, hidden, intermediate_hidden,
-            self.win_phys, device)
 
         # ---- 输入视图 ----
         self.x = _view(self.buffer, torch.float8_e4m3fn, (cap, hidden), x_off)
@@ -278,10 +254,6 @@ class SymmBuffer:
         # REDUCE 输出（FP32），launch 后转 BF16 拷进用户 y
         self._y_fp32 = torch.empty((cap, hidden), dtype=torch.float32,
                                    device=device)
-
-        import types
-        self.handle = types.SimpleNamespace(
-            buffer_ptrs=base_ptrs, rank=rank, world_size=world_size)
 
         # 建档期（capture 之前）预热：第 1 次发射触发跨 rank IPC 懒映射，
         # 首档存在残余竞态（202 R=32 实测 1/3 首档偶发错）。sglang 首次
@@ -318,14 +290,14 @@ class SymmBuffer:
             # 避免合成均衡路由污染 _launch_cfg。
             _C.fp8_mega_moe(self._y_fp32, tl1.view(torch.uint8),
                             tl2.view(torch.uint8), self._impl, T, 1e30,
-                            int(self.expert_window), _KERNEL_GRID, False, 0)
+                            int(self.expert_window), False, 0)
             torch.cuda.synchronize()
         del l1, l2, tl1, tl2
         torch.cuda.empty_cache()
 
     # ---------------------------------------------------------- 自适应发射配置
     def _select_adaptive_cfg(self, num_tokens: int):
-        """按真实路由选择本次 launch 的 (win_cap, merge_grid, use_frag)。
+        """按真实路由选择本次 launch 的 (win_cap, use_frag)。
 
         与 C++ bench 的 tk 长尾判据逐式一致：
           imbalanced = max_expert >= 3 * max(1, median(nonzero counts))
@@ -334,7 +306,7 @@ class SymmBuffer:
           否则：保持 AUTO 逻辑窗口 + 缺省粗化 + 不用 frag。
         只在非 capture 路径做 host 同步；capture 用缓存值（无则回退缺省）。
         """
-        base = (int(self.expert_window), _KERNEL_GRID, False)
+        base = (int(self.expert_window), False)
         if num_tokens <= 0 or self.group is None or self.world_size <= 1:
             return base
         if os.environ.get("MXK_ADAPTIVE", "1") == "0":
@@ -371,11 +343,7 @@ class SymmBuffer:
                 if win < _WIN_ADAPT_MIN or win > hi:
                     self._launch_cfg = base
                     return base   # 放行区间为空：回退 base，不伪造 win
-                # [TEST] merge=1（不粗化，多波）验证 GEN 代际修复。
-                #   MXK_MERGE1=0 可回退单波粗化做 A/B。
-                merge_g = (0x3FFFFFFF
-                           if os.environ.get("MXK_MERGE1", "1") != "0" else 0)
-                cfg = (win, merge_g, True)
+                cfg = (win, True)
                 self._launch_cfg = cfg
                 return cfg
         except Exception:  # noqa: BLE001
@@ -384,11 +352,10 @@ class SymmBuffer:
         return base
 
     def launch_config(self, num_tokens: int):
-        """当前应使用的 (win_cap, merge_grid, use_frag, skip_prologue)。"""
+        """当前应使用的 (win_cap, use_frag, skip_prologue)。"""
         capturing = _is_stream_capturing()
         if capturing:
-            cfg = self._launch_cfg or (int(self.expert_window), _KERNEL_GRID,
-                                       False)
+            cfg = self._launch_cfg or (int(self.expert_window), False)
             skip = 2 if (self.prologue_reuse and self._capture_node > 0) else 0
             self._capture_node += 1
             return cfg[0], cfg[1], cfg[2], skip
@@ -397,33 +364,14 @@ class SymmBuffer:
         return cfg[0], cfg[1], cfg[2], 0
 
     def destroy(self):
+        # C++ 统一释放 sym/rwk/unk/计算链缓冲，并关闭全部远端 IPC 句柄。
         try:
             if getattr(self, "_impl", None) is not None:
                 _C.destroy_symm_buffer(self._impl)
                 self._impl = None
         except Exception as e:  # noqa: BLE001
             print(f"[mxmegakernel] destroy_symm_buffer failed: {e}")
-        for p in getattr(self, "_remote_sym", []) or []:
-            try:
-                _C.close_ipc_handle(p)
-            except Exception:  # noqa: BLE001
-                pass
-        for p in getattr(self, "_remote_rf", []) or []:
-            try:
-                _C.close_ipc_handle(p)
-            except Exception:  # noqa: BLE001
-                pass
-        if getattr(self, "_owns", False):
-            for attr in ("_sym_ptr", "_lf_ptr", "_rf_ptr"):
-                p = getattr(self, attr, 0)
-                if p:
-                    try:
-                        _C.free_device(p)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    setattr(self, attr, 0)
-        self._remote_sym = []
-        self._remote_rf = []
+        self._sym_ptr = 0
         self.buffer = None
         self.handle = None
         self.group = None
@@ -560,7 +508,7 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
                 f"expert_window={ew} 超出 [8, {sym_buffer.win_phys}]")
         sym_buffer.expert_window = ew
     # 逐 launch 配置：eager 按路由自适应，capture 复用缓存。
-    win_cap, merge_grid, use_frag, skip = sym_buffer.launch_config(num_tokens)
+    win_cap, use_frag, skip = sym_buffer.launch_config(num_tokens)
     # 首次 launch 兜底预热（建档预热失败时）：捕获中禁止，避免捕获流阻塞。
     if not getattr(sym_buffer, "_mega_moe_warmed", False):
         sym_buffer._mega_moe_warmed = True
@@ -569,11 +517,11 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
                 _C.fp8_mega_moe(
                     sym_buffer._y_fp32, l1_weights.view(torch.uint8),
                     l2_weights.view(torch.uint8), sym_buffer._impl, num_tokens,
-                    clamp, int(sym_buffer.expert_window), _KERNEL_GRID, False, 0)
+                    clamp, int(sym_buffer.expert_window), False, 0)
                 torch.cuda.synchronize()
     _C.fp8_mega_moe(sym_buffer._y_fp32, l1_weights.view(torch.uint8),
                     l2_weights.view(torch.uint8), sym_buffer._impl, num_tokens,
-                    clamp, win_cap, merge_grid, use_frag, skip)
+                    clamp, win_cap, use_frag, skip)
     sym_buffer.launch_count += 1
     if num_tokens > 0:
         y.copy_(sym_buffer._y_fp32[:num_tokens].to(torch.bfloat16))

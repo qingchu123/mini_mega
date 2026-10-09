@@ -12,10 +12,8 @@
 
 // flags_bridge.cu 导出（C ABI）
 extern "C" {
-int64_t mxk_local_flags_bytes();
-int64_t mxk_ranks_flags_bytes();
-int64_t mxk_alloc_local_flags(int device);
-int64_t mxk_alloc_ranks_flags_fg(int device);
+int64_t mxk_rwk_bytes();
+int64_t mxk_unk_bytes();
 }
 
 namespace mxk {
@@ -120,12 +118,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("wrap_device_ptr", &wrap_device_ptr);
 
   // ---------------- flags 区 ----------------
-  m.def("local_flags_bytes", &mxk_local_flags_bytes);
-  m.def("ranks_flags_bytes", &mxk_ranks_flags_bytes);
-  m.def("alloc_local_flags",
-        [](int64_t device) { return mxk_alloc_local_flags((int)device); });
-  m.def("alloc_ranks_flags_fg",
-        [](int64_t device) { return mxk_alloc_ranks_flags_fg((int)device); });
+  m.def("rwk_bytes", &mxk_rwk_bytes);
+  m.def("unk_bytes", &mxk_unk_bytes);
 
   // ---------------- SymmBuffer ----------------
   py::class_<mxk::SymmBuffer>(m, "SymmBuffer")
@@ -141,24 +135,56 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("expert_window", &mxk::SymmBuffer::win)
       .def_readonly("layout", &mxk::SymmBuffer::L);
 
-  m.def("create_symm_buffer", &mxk::create_symm_buffer,
-        py::arg("sym_ptr"), py::arg("lf_ptr"), py::arg("rf_ptr"),
-        py::arg("base_ptrs"), py::arg("rf_ptrs"), py::arg("rank"),
-        py::arg("num_ranks"), py::arg("num_experts"),
-        py::arg("num_max_tokens_per_rank"), py::arg("num_topk"),
-        py::arg("hidden"), py::arg("intermediate_hidden"),
-        py::arg("win_alloc"), py::arg("device") = -1,
-        // 所有权归 Python 侧显式管理：SymmBuffer.destroy() 调
-        // destroy_symm_buffer；若这里用 take_ownership，pybind 会在 _impl
-        // 包装对象被回收时再 delete 一次，导致 double free。
+  // C++ 自有分配：sym / rwk / unk / 计算链缓冲全部由 C++ 分配并释放。
+  m.def("create_symm_buffer",
+        [](int64_t rank, int64_t R, int64_t num_experts, int64_t cap,
+           int64_t topk, int64_t hidden, int64_t intermediate_hidden,
+           int64_t win_alloc, int64_t device) {
+          return mxk::create_symm_buffer_owned(rank, R, num_experts, cap, topk,
+                                               hidden, intermediate_hidden,
+                                               win_alloc, device);
+        },
+        py::arg("rank"), py::arg("R"), py::arg("num_experts"),
+        py::arg("cap"), py::arg("topk"), py::arg("hidden"),
+        py::arg("intermediate_hidden"), py::arg("win_alloc"),
+        py::arg("device"),
+        // 生命周期由 destroy_symm_buffer 显式管理（不 take_ownership，避免 double free）
         py::return_value_policy::reference);
+  // 指针与布局只读访问（Python 视图/IPC 用）
+  m.def("symm_sym_ptr", [](mxk::SymmBuffer* b) {
+    return reinterpret_cast<int64_t>(b->sym); }, py::arg("buf"));
+  m.def("symm_unk_ptr", [](mxk::SymmBuffer* b) {
+    return reinterpret_cast<int64_t>(b->unk); }, py::arg("buf"));
+  m.def("symm_sym_bytes", [](mxk::SymmBuffer* b) {
+    return b->L.total_bytes; }, py::arg("buf"));
+  m.def("symm_export_handles", [](mxk::SymmBuffer* b) {
+    const auto sh = mxk::export_sym_handle(*b);
+    const auto uh = mxk::export_unk_handle(*b);
+    return py::make_tuple(py::bytes(reinterpret_cast<const char*>(sh.data()), sh.size()),
+                          py::bytes(reinterpret_cast<const char*>(uh.data()), uh.size()));
+  }, py::arg("buf"));
+  m.def("symm_import_peers",
+        [](mxk::SymmBuffer* b, const std::vector<py::bytes>& sym_handles,
+           const std::vector<py::bytes>& unk_handles) {
+          auto to_vec = [](const py::bytes& h) {
+            char* buf = nullptr; Py_ssize_t n = 0;
+            if (PyBytes_AsStringAndSize(h.ptr(), &buf, &n) != 0)
+              throw py::error_already_set();
+            return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(buf),
+                                        reinterpret_cast<uint8_t*>(buf) + n);
+          };
+          std::vector<std::vector<uint8_t>> sv, uv;
+          for (const auto& h : sym_handles) sv.push_back(to_vec(h));
+          for (const auto& h : unk_handles) uv.push_back(to_vec(h));
+          mxk::import_peers(b, sv, uv);
+        },
+        py::arg("buf"), py::arg("sym_handles"), py::arg("unk_handles"));
   m.def("destroy_symm_buffer", &mxk::destroy_symm_buffer);
 
   m.def("fp8_mega_moe",
         [](torch::Tensor y_fp32, torch::Tensor l1, torch::Tensor l2,
            mxk::SymmBuffer* buf, int64_t num_tokens, double activation_clamp,
-           int64_t win_cap, int64_t merge_grid, bool use_frag,
-           int64_t skip_prologue) {
+           int64_t win_cap, bool use_frag, int64_t skip_prologue) {
           TORCH_CHECK(y_fp32.is_cuda() &&
                           y_fp32.scalar_type() == torch::kFloat32,
                       "y_fp32 must be a CUDA float32 tensor");
@@ -172,12 +198,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           mxk::launch_fp8_mega_moe(buf, y_fp32.data_ptr<float>(),
                                    l1.data_ptr<uint8_t>(), l2.data_ptr<uint8_t>(),
                                    num_tokens, current_stream(), win_cap,
-                                   merge_grid, use_frag, skip_prologue);
+                                   use_frag, skip_prologue);
         },
         py::arg("y_fp32"), py::arg("l1_weights"), py::arg("l2_weights"),
         py::arg("sym_buffer"), py::arg("num_tokens"),
         py::arg("activation_clamp") = 1e30, py::arg("win_cap") = 0,
-        py::arg("merge_grid") = 0, py::arg("use_frag") = false,
+        py::arg("use_frag") = false,
         py::arg("skip_prologue") = 0);
 
   // ---------------- mini_mega kernel 探针 ----------------
