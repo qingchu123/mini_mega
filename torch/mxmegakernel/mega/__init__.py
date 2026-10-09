@@ -354,14 +354,15 @@ class SymmBuffer:
     def launch_config(self, num_tokens: int):
         """当前应使用的 (win_cap, use_frag, skip_prologue)。"""
         capturing = _is_stream_capturing()
+        # 配置元组为 (win_cap, use_frag)；skip_prologue 由 capture 节点号决定。
         if capturing:
             cfg = self._launch_cfg or (int(self.expert_window), False)
             skip = 2 if (self.prologue_reuse and self._capture_node > 0) else 0
             self._capture_node += 1
-            return cfg[0], cfg[1], cfg[2], skip
+            return cfg[0], cfg[1], skip
         self._capture_node = 0
         cfg = self._select_adaptive_cfg(int(num_tokens))
-        return cfg[0], cfg[1], cfg[2], 0
+        return cfg[0], cfg[1], 0
 
     def destroy(self):
         # C++ 统一释放 sym/rwk/unk/计算链缓冲，并关闭全部远端 IPC 句柄。

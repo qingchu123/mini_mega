@@ -695,6 +695,25 @@ bool run_spec(Env& e, const Spec& s, const Flags& f) {
     std::vector<float> y;
     if (f.eager || f.graph > 0) {
         run_eager(e, s, routes, &y);
+        // [DUMP] MT_DUMP_Y=<dir>：把本 rank 的 eager 输出 y（tokens x H float）写入
+        //   <dir>/y_<label>_r<rank>.bin，供 torch 对比脚本逐元素比较。只读输出，不改数值路径。
+        if (const char* dd = std::getenv("MT_DUMP_Y")) {
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/y_%s_r%d.bin", dd,
+                          s.label.c_str(), e.d.rank);
+            if (FILE* fp = std::fopen(path, "wb")) {
+                std::fwrite(y.data(), sizeof(float), y.size(), fp);
+                std::fclose(fp);
+            }
+            // 同时导出本 rank 的路由（int64，tokens*topk，行主序 [token][k]），供 torch 对拍复现输入
+            std::snprintf(path, sizeof(path), "%s/route_%s_r%d.bin", dd,
+                          s.label.c_str(), e.d.rank);
+            if (FILE* fr = std::fopen(path, "wb")) {
+                const auto& rr = routes[(size_t)e.d.rank];
+                std::fwrite(rr.data(), sizeof(int64_t), rr.size(), fr);
+                std::fclose(fr);
+            }
+        }
         if (f.eager) {
             r.l12 = agree(check_l1l2(e, s, routes));
             const CheckStats red = check_reduce(e, s, routes, y);
@@ -844,6 +863,7 @@ int main(int argc, char** argv) {
     const char* fwin = std::getenv("MT_FORCE_WIN");   // 调试：强制某个 win，用于最小复现
     for (auto& p : plan) {
         p.first.win = mt::choose_win_cap_counts(p.first.per_expert, max_tokens);
+        // [MT_FORCE_WIN] 扩展：原仅 TK 用例；对拍需要均衡用例指定同一 win，故两类都生效
         if (fwin && p.first.kind == 1) p.first.win = std::atoi(fwin);
         win_global = std::max(win_global, p.first.win);
     }
