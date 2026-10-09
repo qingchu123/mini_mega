@@ -21,9 +21,9 @@ constexpr int kIntermediate = 2048;  // I（中间维度）
 constexpr int kGrid = 32;            // grid 块数（= SM 数）
 constexpr int kRanks = 32;           
 #ifndef KNSLICE_OVERRIDE
-#define KNSLICE_OVERRIDE 8
+#define KNSLICE_OVERRIDE 4
 #endif
-constexpr int kNSlice = KNSLICE_OVERRIDE;  // 每窗口任务切片数（K 片 / N 组）；NS=8：L1 每片 2 组、L2 每片 3 组，均整除
+constexpr int kNSlice = KNSLICE_OVERRIDE;  // 每窗口任务切片数（K 片 / N 组）；NS=4：L1 每片 4 组、L2 每片 6 组
 #ifndef KRING_OVERRIDE
 #define KRING_OVERRIDE 8
 #endif

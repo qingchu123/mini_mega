@@ -33,7 +33,7 @@ mini_mega/
 
 | 参数 | 值 | 说明 |
 |---|---|---|
-| `KNSLICE_OVERRIDE`（`kNSlice`） | 8 | 每窗口任务切片数；NS=8 时 L1 每片 2 组、L2 每片 3 组，均整除。NS=16 暂不可用（L2 N 组几何不整除，待设计） |
+| `KNSLICE_OVERRIDE`（`kNSlice`） | 4 | 每窗口任务切片数；NS=4 时 L1 每片 4 组、L2 每片 6 组。NS=8 已验证可用（`g_l2=3` 需走 `compute_big.cuh` 的 `[R35]` 单批 3 组分支）；NS=16 暂不可用（L2 N 组几何不整除，待设计） |
 | `kRing` | 8 | 同专家并发窗上限 |
 | `kEPR` / `kTopk` / `kHidden` / `kIntermediate` | 8 / 8 / 6144 / 2048 | 场景维度 |
 | `kGrid` | 32 | grid 块数（= SM 数） |
