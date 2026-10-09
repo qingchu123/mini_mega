@@ -147,3 +147,19 @@ REDUCE 当作等待数使用。源 rank 的 REDUCE 能否正确放行，取决�
 - 验证：smoke 5/5、子集 12/12、top50 52/52（默认、win=48/64/128）全部 PASS。
 - 性能：`-s 1` 各档 ±1.2%；`-s 2 -top 50` 由 3274 降至 3149 µs（两次复测一致）。
   等价写法不应改变数据量，该差异原因未确认，记录为待查，不作为已确认的优化。
+
+## 11. 不一致 win/merge 实验（rank 奇偶不同 win）
+
+方法：临时在 check 中按 rank 奇偶设置不同 win（`MT_FORCE_WIN` 偶数 rank、`MT_FORCE_WIN_ODD` 奇数 rank），
+布局仍按各 rank 最大 win 统一分配。实验补丁未提交（已还原）。
+
+| 偶 rank win | 奇 rank win | 用例 | 结果 |
+|---:|---:|---|---|
+| 64 | 128 | 子集 12 | 12/12 PASS |
+| 64 | 128 | top50 | 52/52 PASS |
+| 48 | 96 | top50 | 52/52 PASS |
+
+探针（64/128 子集）确认 raw 任务数对应 merge=1 与 merge=2 并存，即 rank 间 merge 确实不一致。
+
+结论：第 1 步之后，rank 间 win（因此 merge）不一致不影响功能。
+范围限制：仅 check harness（单布局、统一 win_global）；torch 真实路径、多机、非 16 倍数 win 未测。
