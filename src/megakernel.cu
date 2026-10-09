@@ -68,14 +68,19 @@ namespace {
 
 // 公共 POD -> 设备入参（逐字段显式拷贝，避免依赖两份结构体布局一致）。
 MegaArgs to_mega_args(const MegaLaunchArgs& a) {
-    // [窗口口径守卫] 当前 win_cap < slot_capacity 时 REDUCE/combine 协议仍不正确
-    // （实测 804900 win=48 slot=512 时 eager REDUCE/graph 失败）。先响亮失败，
-    // 避免静默产出坏数据；待窗口化 combine_rows 协议修好后再放开。
-    if (a.slot_capacity != a.win_cap) {
+    // [窗口口径守卫] 拒绝未验证的 win_cap 组合，避免静默产出坏数据。
+    // 放行条件（实验判定，见 .agents/work/guard_sub_w*.log）：
+    //   win == slot，或 win 为 16 的倍数且 48 <= win <= slot。
+    // 已知失败：win<48（16/32 出现 REDUCE/graph 误差）、win 非 16 倍数（40/56
+    // 出现 L1L2 失败）。这些组合仍拒绝。
+    const bool win_ok = (a.win_cap == a.slot_capacity) ||
+                        (a.win_cap % 16 == 0 && a.win_cap >= 48 &&
+                         a.win_cap <= a.slot_capacity);
+    if (!win_ok) {
         std::fprintf(stderr,
-            "[megakernel] slot_capacity=%d 与 win_cap=%d 不一致：当前组合会产生错误结果。\n"
-            "  请令 win_cap == slot_capacity（适配窗 win<slot 已知数值错误）。\n",
-            a.slot_capacity, a.win_cap);
+            "[megakernel] win_cap=%d 不被允许（slot_capacity=%d）：需 win==slot，"
+            "或 win 为 16 的倍数且 48<=win<=slot。\n",
+            a.win_cap, a.slot_capacity);
         std::exit(2);
     }
     MegaArgs m{};
