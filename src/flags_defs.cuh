@@ -94,30 +94,30 @@ struct alignas(256) local_data {
     // 输入复用
     // alignas(256) uint8_t x[kMaxTPR][kHidden];
     // alignas(256) float topk_weights[kMaxTPR][kTopk];
-    alignas(256) int64_t topk_idx[kMaxTPR][kTopk];
+    // [冗余，暂注释] alignas(256) int64_t topk_idx[kMaxTPR][kTopk];  // 输入走 sym
 
     // 内部使用
     alignas(256) int32_t route_slot_counts[kRanks * kEPR];
     alignas(256) int32_t prefix_tbl[kEPR][kRanks + 1];
     alignas(256) uint8_t expert_tokens[kEPR* kRing][kMaxTPR][kHidden];
-    alignas(256) float token_route_weights[kEPR + kGrid][kMaxTPR];
-    alignas(256) int token_src_meta[kEPR + kGrid][kMaxTPR][3];
+    // [冗余，暂注释] alignas(256) float token_route_weights[kEPR + kGrid][kMaxTPR];  // 走 scratch 偏移
+    // [冗余，暂注释] alignas(256) int token_src_meta[kEPR + kGrid][kMaxTPR][3];  // 走 scratch 偏移
 
 
     alignas(256) uint8_t w1[kEPR][2*kIntermediate][kHidden];
     alignas(256) uint8_t w2[kEPR][kHidden][kIntermediate];
     alignas(256) uint8_t ffn_hidden[kEPR * kRing][kMaxTPR][kIntermediate];
     alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
-    alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden/32) * ((kMaxTPR + 15) / 16) * 512];
-    alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate/32) * ((kMaxTPR + 15) / 16) * 512];
+    // [冗余，暂注释] alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden/32) * ((kMaxTPR + 15) / 16) * 512];
+    // [冗余，暂注释] alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate/32) * ((kMaxTPR + 15) / 16) * 512];
     alignas(256) float y[kMaxTPR][kHidden];
-    alignas(256) float ynode[kMaxTPR][kHidden]; //for debug
+    // [冗余，暂注释] alignas(256) float ynode[kMaxTPR][kHidden];  // mega_common 另行分配 d.ynode
 };
 
 // ---- 本 rank 私有（普通显存）----
 struct alignas(256) rwk_data {
-    local_flags lf;
-    local_data ld;
+    alignas(256) local_flags lf;
+    alignas(256) local_data ld;
 };
 
 
@@ -132,8 +132,8 @@ struct alignas(256) ranks_data {
 
 
 
-// ---- 本 rank 私有（普通显存）----
+// ---- 本 rank 私有（普通mcMalloc显存）----
 struct alignas(256) unk_data {
-    ranks_flags rf;
-    ranks_data rd;
+    alignas(256)ranks_flags rf;
+    alignas(256)ranks_data rd;
 };
