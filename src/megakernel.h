@@ -28,6 +28,8 @@ struct local_flags;
 struct ranks_flags;
 struct local_data;
 struct ranks_data;
+struct rwk_data;
+struct unk_data;
 
 // 设备侧权重生成的值函数（host 参考与 device 生成必须逐字节一致，故同头共享）。
 // -DWPROBE=1 切到「非周期 + 小值」诊断模式（见 bench.cu 注释）。
@@ -64,13 +66,14 @@ struct MegaLaunchArgs {
     int k_in = 0, topk = 0, ring = 0;
     int64_t src_off = 0, rsc_off = 0, recv_off = 0, prefix_off = 0,
             barrier_off = 0;
-    local_flags* lf = nullptr;             // 本 rank 私有旗区（普通显存）
-    ranks_flags* rf = nullptr;             // 跨 rank 旗区（FG 显存）
-    ranks_flags* const* rf_peers = nullptr;  // 各 rank ranks_flags 基址表
-    local_data* local = nullptr;             // 本 rank 非共享数据
-    local_data* const* local_peers = nullptr; // 各 rank local_data（self = local[rank]）
-    ranks_data* remote = nullptr;             // 本 rank 远端数据表
-    ranks_data* const* remote_peers = nullptr;  // 各 rank ranks_data 基址表
+    // [步骤2a] 结构体指针：rwk = 本 rank 普通显存整块（lf + ld）；
+    //          unk = 本 rank FG 整块（rf + rd）；unk_peers = 各 rank unk 基址表。
+    rwk_data* rwk = nullptr;
+    unk_data* unk = nullptr;
+    unk_data* const* unk_peers = nullptr;
+    // 过渡：rf_peers / remote_peers 仍为设备表（2b 统一到 unk_peers）
+    ranks_flags* const* rf_peers = nullptr;
+    ranks_data* const* remote_peers = nullptr;
     int64_t xrelease_idx = 0, task_ready_idx = 0, task_counter_idx = 0,
             l2_done_idx = 0, slice_flags_idx = 0, l1_prog_idx = 0;
     int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;

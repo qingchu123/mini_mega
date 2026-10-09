@@ -113,6 +113,7 @@ struct Dev {
     std::vector<float*> ynode;       // graph 逐节点输出（同形状）
     uint8_t** d_base = nullptr;
     ranks_flags** d_rf = nullptr;
+    unk_data** d_unk = nullptr;      // 各 rank unk 整块基址表（设备数组，含 self）
     rwk_data* rwk = nullptr;         // 本 rank 普通显存整块（lf + ld）
     unk_data* unk = nullptr;         // 本 rank FG 整块（rf + rd），IPC 导出
     mcIpcMemHandle_t h{}, uh{};
@@ -201,11 +202,13 @@ inline void exchange_ipc(Dev& d, int R) {
     std::vector<uint8_t*> bp(R);
     std::vector<ranks_flags*> rp(R);
     std::vector<ranks_data*> rdp(R);
+    std::vector<unk_data*> unkp(R);
     for (int s = 0; s < R; ++s) {
         if (s == d.rank) {
             bp[s] = d.sym;
             rp[s] = d.rf;
             rdp[s] = d.rd;
+            unkp[s] = d.unk;
             continue;
         }
         void* q = nullptr;
@@ -217,6 +220,7 @@ inline void exchange_ipc(Dev& d, int R) {
         auto* ur = static_cast<unk_data*>(qu);
         rp[s] = &ur->rf;
         rdp[s] = &ur->rd;
+        unkp[s] = ur;
     }
     for (int s = 0; s < R; ++s) {
         if (s == d.rank) continue;
@@ -230,6 +234,8 @@ inline void exchange_ipc(Dev& d, int R) {
     CHECK(mcMemcpy(d.d_rf, rp.data(), R * sizeof(ranks_flags*), mcMemcpyHostToDevice));
     CHECK(mcMalloc((void**)&d.d_rd, R * sizeof(ranks_data*)));
     CHECK(mcMemcpy(d.d_rd, rdp.data(), R * sizeof(ranks_data*), mcMemcpyHostToDevice));
+    CHECK(mcMalloc((void**)&d.d_unk, R * sizeof(unk_data*)));
+    CHECK(mcMemcpy(d.d_unk, unkp.data(), R * sizeof(unk_data*), mcMemcpyHostToDevice));
 }
 
 // 上传本 rank 的路由并清零一次 launch 所需的全部状态（不清 ynode/y）。
@@ -281,10 +287,10 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.recv_off = L.expert_recv_counts_off;
     a.prefix_off = L.prefix_tbl_off;
     a.barrier_off = L.barrier_slots_off;
-    a.lf = d.lf;
-    a.rf = d.rf;
+    a.rwk = d.rwk;
+    a.unk = d.unk;
+    a.unk_peers = d.d_unk;
     a.rf_peers = d.d_rf;
-    a.remote = d.rd;
     a.remote_peers = d.d_rd;
     a.xrelease_idx = kXreleaseIdx;
     a.task_ready_idx = kTaskReadyIdx;

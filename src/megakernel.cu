@@ -100,10 +100,11 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.ring = a.ring;
     m.rsc_off = a.rsc_off;
     m.prefix_off = a.prefix_off;
-    m.lf = a.lf;
-    m.rf = a.rf;
+    // [步骤2a] 由结构体指针派生 kernel 旧字段（kernel 内部不变）
+    m.lf = a.rwk ? &a.rwk->lf : nullptr;
+    m.rf = a.unk ? &a.unk->rf : nullptr;
     m.rf_peers = a.rf_peers;
-    m.remote = a.remote;
+    m.remote = a.unk ? &a.unk->rd : nullptr;
     m.remote_peers = a.remote_peers;
     m.xrelease_idx = a.xrelease_idx;
     m.task_ready_idx = a.task_ready_idx;
@@ -152,7 +153,7 @@ int stream_is_capturing(mcStream_t stream) {
 void dbg_capture_launch(const MegaLaunchArgs& a, mcStream_t stream) {
     if (!dbg_capture_enabled()) return;
     mxk_dbg_capture_kernel<<<1, 1, 0, stream>>>(
-        a.topk_idx, a.tokens, a.topk, a.lf, a.rank,
+        a.topk_idx, a.tokens, a.topk, a.rwk ? &a.rwk->lf : nullptr, a.rank,
         stream_is_capturing(stream), nullptr);
 }
 
@@ -191,8 +192,9 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
 
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
     mega_reduce_kernel<<<2 * a.tokens, 256, 0, stream>>>(
-        a.self, a.remote, a.y, a.R, a.tokens,
-        a.combine_rows_off, a.topk_idx_off, a.weights_off, a.lf, a.rf,
+        a.self, a.unk ? &a.unk->rd : nullptr, a.y, a.R, a.tokens,
+        a.combine_rows_off, a.topk_idx_off, a.weights_off,
+        a.rwk ? &a.rwk->lf : nullptr, a.unk ? &a.unk->rf : nullptr,
         a.task_ready_idx, a.max_spins);
 }
 
