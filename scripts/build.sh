@@ -97,14 +97,14 @@ build_bench() {
 }
 
 build_mybench() {
-  "$CUCC" -O3 -std=c++17 "${INC[@]}" "${MPI_INC[@]}" \
+  "$CUCC" -O3 -std=c++17 "${INC[@]}" "${MPI_INC[@]}" $KERNEL_CFLAGS \
     -o "$OUT/mybench" test/mybench.cu \
     "$OUT/megakernel.so" "${MPI_LIB[@]}"
   echo "built: $PWD/$OUT/mybench"
 }
 
 build_check() {
-  "$CUCC" -O3 -std=c++17 "${INC[@]}" "${MPI_INC[@]}" \
+  "$CUCC" -O3 -std=c++17 "${INC[@]}" "${MPI_INC[@]}" $KERNEL_CFLAGS \
     -o "$OUT/check" test/check.cu \
     "$OUT/megakernel.so" "${MPI_LIB[@]}"
   echo "built: $PWD/$OUT/check"

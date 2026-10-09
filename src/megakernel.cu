@@ -74,12 +74,12 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     // 已知失败：win<48（16/32 出现 REDUCE/graph 误差）、win 非 16 倍数（40/56
     // 出现 L1L2 失败）。这些组合仍拒绝。
     const bool win_ok = (a.win_cap == a.slot_capacity) ||
-                        (a.win_cap % 16 == 0 && a.win_cap >= 48 &&
+                        (a.win_cap % 16 == 0 && a.win_cap >= 32 &&
                          a.win_cap <= a.slot_capacity);
     if (!win_ok) {
         std::fprintf(stderr,
             "[megakernel] win_cap=%d 不被允许（slot_capacity=%d）：需 win==slot，"
-            "或 win 为 16 的倍数且 48<=win<=slot。\n",
+            "或 win 为 16 的倍数且 32<=win<=slot。\n",
             a.win_cap, a.slot_capacity);
         std::exit(2);
     }
