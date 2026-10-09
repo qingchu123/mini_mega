@@ -319,7 +319,6 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.sums_stride = deep_gemm::layout::kMegaMoeMaxCombineSlices;
     a.y = y;
     a.grid = kGrid;
-    a.merge_grid = kGrid;
     a.threads = g.threads;
     a.smem = g.smem;
     return a;
