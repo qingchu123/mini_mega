@@ -265,7 +265,7 @@ __device__ __forceinline__ void l1_progress_publish(
 //     block0 读自己槽 c 并发布 epoch=c+1，写回 c+1；其余 block 读自己槽 c，
 //     期望 release==c+1，通过后写回 c+1。同一 launch 内各 block 计数同步前进。
 __device__ __forceinline__ void xbar_route_ready_body(
-        ranks_flags* rf, ranks_flags* const* rf_peers, local_flags* lf, int R,
+        ranks_flags* rf, unk_data* const* unk_peers, local_flags* lf, int R,
         int rank, int64_t xrelease_idx, int* dbg, int max_spins,
         int tid_base = 0, unsigned long long* ctr = nullptr) {
     (void)tid_base;   // 骨架恒用 block0 的 threadIdx.x<64
@@ -291,7 +291,7 @@ __device__ __forceinline__ void xbar_route_ready_body(
         // 每 lane 发一个 peer（lane==rank 无动作）；转置槽 xbar_barrier[rank][lane]
         if (lane < R && lane != rank) {
             uint32_t* slot =
-                &rf_peers[lane]->xbar_barrier[cyc][rank][lane];
+                &unk_peers[lane]->rf.xbar_barrier[cyc][rank][lane];
             __stwt(slot, epoch);
         }
         __threadfence_system();

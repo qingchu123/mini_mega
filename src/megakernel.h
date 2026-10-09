@@ -71,9 +71,6 @@ struct MegaLaunchArgs {
     rwk_data* rwk = nullptr;
     unk_data* unk = nullptr;
     unk_data* const* unk_peers = nullptr;
-    // 过渡：rf_peers / remote_peers 仍为设备表（2b 统一到 unk_peers）
-    ranks_flags* const* rf_peers = nullptr;
-    ranks_data* const* remote_peers = nullptr;
     int64_t xrelease_idx = 0, task_ready_idx = 0, task_counter_idx = 0,
             l2_done_idx = 0, slice_flags_idx = 0, l1_prog_idx = 0;
     int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;

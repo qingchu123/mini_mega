@@ -290,8 +290,6 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.rwk = d.rwk;
     a.unk = d.unk;
     a.unk_peers = d.d_unk;
-    a.rf_peers = d.d_rf;
-    a.remote_peers = d.d_rd;
     a.xrelease_idx = kXreleaseIdx;
     a.task_ready_idx = kTaskReadyIdx;
     a.task_counter_idx = kTaskCounterIdx;

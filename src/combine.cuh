@@ -121,9 +121,9 @@ __device__ __forceinline__ const uint16_t* cmb_rows(const ranks_data* rd,
 }
 // 兼容旧调用点（未提供 ranks_data 时回退到 sym + rows_off）。
 __device__ __forceinline__ uint16_t* cmb_rows_compat(
-        ranks_data* const* rp, uint8_t* const* pb, long long off, int src,
+        unk_data* const* up, uint8_t* const* pb, long long off, int src,
         int cycle) {
-    if (rp != nullptr) return cmb_rows(rp[src], cycle);
+    if (up != nullptr) return cmb_rows(&up[src]->rd, cycle);
     return reinterpret_cast<uint16_t*>(const_cast<uint8_t*>(pb[src]) + off);
 }
 
@@ -142,10 +142,8 @@ struct CombineCtx {
     const int* meta = nullptr;          // staging 元数据视图（见上）
     const float* weights = nullptr;     // staging 权重视图（无效行 = 0）
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址（含 self）
-    ranks_data* const* remote_peers = nullptr;  // 各 rank ranks_data（含 self）
+    unk_data* const* unk_peers = nullptr;  // 各 rank unk（含 self）：rd=combine_rows，rf=完成标记
     long long rows_off = -1;            // 目标 rank combine_rows 区偏移（BF16）
-    // 各 rank 的 ranks_flags（含 self）：combine_sums 完成标记区（FG 显存）
-    ranks_flags* const* rf_peers = nullptr;
     uint64_t epoch = 0;                 // 本窗 64 位 epoch（= current_time）
     int slice = 0;                      // 本 block 任务切片号 [0, kNSlice)
     int block_idx = 0;                  // staging 块号（= blockIdx.x）
@@ -179,7 +177,7 @@ struct CombineFuseCtx {
     const int* meta = nullptr;       // staging 元数据视图
     const float* weights = nullptr;  // staging 权重视图（无效行 = 0）
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址（含 self）
-    ranks_data* const* remote_peers = nullptr;  // 各 rank ranks_data（含 self）
+    unk_data* const* unk_peers = nullptr;  // 各 rank unk（含 self）
     int cycle = 0;                   // [M_CYCLE] combine_rows 片
     long long rows_off = -1;         // 目标 rank combine_rows 区偏移（BF16）
     int staging_cap = 0;             // staging 行容量（= win_capacity）
@@ -202,7 +200,7 @@ __device__ __forceinline__ void combine_push_one_row(
     const int stok = m[1];
     const int kk = m[2];
     const uint16_t* srow = out_h + stag * kHidden + col_lo;
-    uint16_t* drow_h = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src, f.cycle) +
+    uint16_t* drow_h = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src, f.cycle) +
         ((size_t)kk * kMaxTPR + stok) * kHidden + col_lo;
     for (int i = lane; i < nu4; i += 64) {
 #if R30_DIAG_NOREAD
@@ -272,13 +270,13 @@ __device__ __forceinline__ void combine_push_chunk_rows(
         const int src1 = m1[0], stok1 = m1[1], kk1 = m1[2];
         const int src2 = m2[0], stok2 = m2[1], kk2 = m2[2];
         const int src3 = m3[0], stok3 = m3[1], kk3 = m3[2];
-        uint16_t* d0 = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src0, f.cycle) +
+        uint16_t* d0 = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src0, f.cycle) +
             ((size_t)kk0 * kMaxTPR + stok0) * kHidden + col_lo;
-        uint16_t* d1 = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src1, f.cycle) +
+        uint16_t* d1 = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src1, f.cycle) +
             ((size_t)kk1 * kMaxTPR + stok1) * kHidden + col_lo;
-        uint16_t* d2 = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src2, f.cycle) +
+        uint16_t* d2 = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src2, f.cycle) +
             ((size_t)kk2 * kMaxTPR + stok2) * kHidden + col_lo;
-        uint16_t* d3 = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, src3, f.cycle) +
+        uint16_t* d3 = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src3, f.cycle) +
             ((size_t)kk3 * kMaxTPR + stok3) * kHidden + col_lo;
         const uint16_t* s0 = out_h + stag * kHidden + col_lo;
 #if R30_PUSHSTRIDE
@@ -364,7 +362,7 @@ __device__ __forceinline__ void combine_push_warp_cols(
         if (f.weights[stag] == 0.0f) continue;
         const int* m = f.meta + stag * 3;
         const uint16_t* srow = out_h + stag * kHidden;
-        uint16_t* drow = cmb_rows_compat(f.remote_peers, f.peer_bases, f.rows_off, m[0], f.cycle) +
+        uint16_t* drow = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, m[0], f.cycle) +
             ((size_t)m[2] * kMaxTPR + m[1]) * kHidden;
         for (int q = 0; q < nb; ++q) {
             const int col = (g0 + q) * block_n + warp * n_per_warp + j * 8;
@@ -403,8 +401,7 @@ __device__ __forceinline__ void combine_mark_rows(
             // nslice_eff 等待时会漏槽超时（win_cap<max_tokens 时各 rank 的
             // nslice_eff 不一致的核心根因）。物理 slice 覆盖逻辑
             // [c.slice*c.merge, c.slice*c.merge + c.merge)。
-            uint64_t* base = &c.rf_peers[src]
-                                  ->combine_sums[c.cycle][kk][stok]
+            uint64_t* base = &c.unk_peers[src]->rf.combine_sums[c.cycle][kk][stok]
                                   [c.slice * c.merge];
             for (int mi = 0; mi < c.merge; ++mi) __stwt(base + mi, c.epoch);
         }
@@ -449,7 +446,7 @@ __device__ __forceinline__ void combine_push_pair(
         const int stok = m[1];   // 源 token
         const int kk = m[2];     // topk 槽
         const uint16_t* srow = out_h + stag * kHidden;
-        uint16_t* drow_h = cmb_rows_compat(c.remote_peers, c.peer_bases, c.rows_off, src, c.cycle) +
+        uint16_t* drow_h = cmb_rows_compat(c.unk_peers, c.peer_bases, c.rows_off, src, c.cycle) +
             ((size_t)kk * kMaxTPR + stok) * kHidden;
         for (int mi = 0; mi < c.merge; ++mi) {   // 覆盖的每个逻辑列段
             const int c0 = (lg0 + mi) * kCpl;
@@ -473,8 +470,7 @@ __device__ __forceinline__ void combine_push_pair(
         // [FIX-NSE] 写满本物理任务覆盖的全部逻辑 slice（merge 个），与
         // combine_mark_rows 同因：保证任意源 rank 按其 nslice_eff 等待都不漏槽。
         if (lane == 0) {
-            uint64_t* base = &c.rf_peers[src]
-                                  ->combine_sums[c.cycle][kk][stok]
+            uint64_t* base = &c.unk_peers[src]->rf.combine_sums[c.cycle][kk][stok]
                                   [c.slice * c.merge];
             for (int mi = 0; mi < c.merge; ++mi) __stwt(base + mi, c.epoch);
         }

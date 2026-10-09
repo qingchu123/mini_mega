@@ -103,8 +103,6 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.rwk = a.rwk;
     m.unk = a.unk;
     m.unk_peers = a.unk_peers;
-    m.rf_peers = a.rf_peers;
-    m.remote_peers = a.remote_peers;
     m.xrelease_idx = a.xrelease_idx;
     m.task_ready_idx = a.task_ready_idx;
     m.task_counter_idx = a.task_counter_idx;

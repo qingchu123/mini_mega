@@ -40,9 +40,6 @@ struct MegaArgs {
     rwk_data* rwk;                 // 本 rank 普通显存整块（lf + ld）
     unk_data* unk;                 // 本 rank FG 整块（rf + rd）
     unk_data* const* unk_peers;    // 各 rank unk 基址表（设备数组，含 self）
-    // 过渡：rf_peers/remote_peers 设备表仍保留（2b-B 统一到 unk_peers）
-    ranks_flags* const* rf_peers;  // 各 rank ranks_flags 基址表（设备数组，含 self）
-    ranks_data* const* remote_peers;  // 各 rank ranks_data 基址表
     int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
     int64_t slice_flags_idx, l1_prog_idx;
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
@@ -193,10 +190,10 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
             const int route_cycle =
                 (int)(a.rwk->lf.current_time[0][0] % M_CYCLE);
             route_build_body(a.topk_idx, a.self, &a.rwk->ld.route_slot_counts[0], a.rsc_off,
-                             a.remote_peers, route_cycle, a.R, a.rank,
+                             a.unk_peers, route_cycle, a.R, a.rank,
                              a.tokens, a.slot_capacity, 0, 0, ctr);
             if (kTick) a.rwk->lf.pre_ticks[0] = clock64();
-            publish_counts_body(a.self, &a.rwk->ld.route_slot_counts[0], a.rsc_off, a.remote_peers,
+            publish_counts_body(a.self, &a.rwk->ld.route_slot_counts[0], a.rsc_off, a.unk_peers,
                                 route_cycle, a.R, a.rank, a.publish_epoch,
                                 a.recv_stride, 0, ctr);
             if (kTick) a.rwk->lf.pre_ticks[1] = clock64();
@@ -212,7 +209,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
         if (threadIdx.x == 0) a.rwk->lf.current_time[blockIdx.x][0] += 1;
         __syncthreads();
     } else {
-        xbar_route_ready_body(&a.unk->rf, a.rf_peers, &a.rwk->lf, a.R, a.rank,
+        xbar_route_ready_body(&a.unk->rf, a.unk_peers, &a.rwk->lf, a.R, a.rank,
                               a.xrelease_idx, a.rwk->lf.dbg, a.max_spins, 0, ctr);
     }
     if (kTick) a.rwk->lf.pre_ticks[2] = clock64();
@@ -251,8 +248,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.ctx.weights =
                     reinterpret_cast<const float*>(a.self + a.w_off);
                 tail.ctx.peer_bases = a.peer_bases;
-                tail.ctx.remote_peers = a.remote_peers;
-                tail.ctx.rf_peers = a.rf_peers;
+                tail.ctx.unk_peers = a.unk_peers;
                 tail.ctx.rows_off = a.combine_rows_off;
                 tail.ctx.staging_cap = a.win_cap;
                 tail.ctx.block_idx = (int)blockIdx.x;
@@ -266,7 +262,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 tail.fuse.meta = tail.ctx.meta;
                 tail.fuse.weights = tail.ctx.weights;
                 tail.fuse.peer_bases = tail.ctx.peer_bases;
-                tail.fuse.remote_peers = a.remote_peers;
+                tail.fuse.unk_peers = a.unk_peers;
                 tail.fuse.cycle = cyc;
                 tail.fuse.rows_off = tail.ctx.rows_off;
                 tail.fuse.staging_cap = tail.ctx.staging_cap;

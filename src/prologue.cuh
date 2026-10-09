@@ -104,7 +104,7 @@
 // 骨架 bench:190-224 逐条移植（仅 block0 调用；tid_base/smem_off 供 WS 子集）。
 __device__ __forceinline__ void route_build_body(
         const int64_t* __restrict__ topk_idx, const uint8_t* self,
-        int* rsc_ptr, int64_t rsc_off, ranks_data* const* remote_peers,
+        int* rsc_ptr, int64_t rsc_off, unk_data* const* unk_peers,
         int cycle, int R, int rank, int tokens, int slot_capacity,
         int tid_base = 0, int smem_off = 0,
         unsigned long long* ctr = nullptr) {
@@ -155,7 +155,7 @@ __device__ __forceinline__ void route_build_body(
                 const int dst = e / kEPR;
                 const int le = e % kEPR;
                 uint32_t* dstpt =
-                    &remote_peers[dst]->src_index_table[cycle][le][rank][0];
+                    &unk_peers[dst]->rd.src_index_table[cycle][le][rank][0];
                 __stwt(dstpt + slot, (uint32_t)idx);
             }
             __threadfence_system();
@@ -175,7 +175,7 @@ __device__ __forceinline__ void route_build_body(
                 const int dst = e / kEPR;
                 const int le = e % kEPR;
                 uint32_t* dstpt =
-                    &remote_peers[dst]->src_index_table[cycle][le][rank][0];
+                    &unk_peers[dst]->rd.src_index_table[cycle][le][rank][0];
                 __stwt(dstpt + slot, (uint32_t)idx);
             }
         }
@@ -189,7 +189,7 @@ __device__ __forceinline__ void route_build_body(
             const int dst = e / kEPR;
             const int le = e % kEPR;
             uint32_t* dstpt =
-                &remote_peers[dst]->src_index_table[cycle][le][rank][0];
+                &unk_peers[dst]->rd.src_index_table[cycle][le][rank][0];
             __stwt(dstpt + slot, (uint32_t)idx);
         }
         __threadfence_system();
@@ -209,7 +209,7 @@ __device__ __forceinline__ void route_build_body(
 // 骨架 bench:229-255 逐条移植（仅 block0 调用；行宽 recv_stride 由调用方保证）。
 __device__ __forceinline__ void publish_counts_body(
         const uint8_t* self, const int* rsc_ptr, int64_t rsc_off,
-        ranks_data* const* remote_peers, int cycle, int R, int rank,
+        unk_data* const* unk_peers, int cycle, int R, int rank,
         unsigned epoch,
         int recv_stride = (int)((kEPR + 1 + 3) & ~3), int tid_base = 0,
         unsigned long long* ctr = nullptr) {
@@ -224,7 +224,7 @@ __device__ __forceinline__ void publish_counts_body(
     for (int e = tid; e < E; e += nthr) {
         const int dst = e / kEPR;
         const int le = e % kEPR;
-        uint32_t* dstp = &remote_peers[dst]->expert_recv_counts[cycle][rank][0];
+        uint32_t* dstp = &unk_peers[dst]->rd.expert_recv_counts[cycle][rank][0];
         // 跨 rank 写：__stwt（write-through）；peer 可见性由骨架 peer_visibility 验证
         __stwt(dstp + le, (uint32_t)rsc[e]);
     }
@@ -232,7 +232,7 @@ __device__ __forceinline__ void publish_counts_body(
         uint32_t csum = 0;
         for (int le = 0; le < kEPR; ++le)
             csum += (uint32_t)rsc[d * kEPR + le];
-        uint32_t* dstp = &remote_peers[d]->expert_recv_counts[cycle][rank][0];
+        uint32_t* dstp = &unk_peers[d]->rd.expert_recv_counts[cycle][rank][0];
         // 行尾校验槽：读者以 Σ+epoch==~csum 闭合远端写可见性
         __stwt(dstp + kEPR, ~(csum + epoch));
     }
