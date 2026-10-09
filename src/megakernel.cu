@@ -120,7 +120,6 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.max_spins = a.max_spins;
     m.publish_epoch = a.publish_epoch;
     m.recv_stride = a.recv_stride;
-    m.merge_grid = a.merge_grid;
     m.skip_prologue = a.skip_prologue;
     m.prefix_ptr = a.prefix_ptr;
     m.w1 = a.w1;

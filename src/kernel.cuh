@@ -51,9 +51,6 @@ struct MegaArgs {
     int max_spins;
     unsigned publish_epoch;   // publish 校验槽 epoch（阶段 1 = kPublishEpoch）
     int recv_stride;          // recv 行宽（word）= 12
-    // [LONGTAIL] 任务粗化 merge 的网格上限：0=用 gridDim.x（缺省，单波）；
-    // >0 且很大时 merge 恒为 1（不粗化）——不均衡长尾场景把大专家切成更多小任务。
-    int merge_grid;
     // [R38] 跨 graph 节点前序复用：同一 graph 内节点路由不变时，除首节点外
     //   跳过 ROUTE_BUILD/PUBLISH/XBAR（数据持久、node0 已建立跨 rank 可见性），
     //   仅推进 cycle 计数并重跑 TASK_SETUP（重臂 flag）。0=完整前序，1=复用。
@@ -150,8 +147,7 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
         a.l1_prog_idx, a.lf->out_processed, a.lf->dbg, a.max_spins, a.w1,
         a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.lf->l1_chk, a.w2,
         a.l2_out, a.l2_k_out, a.lf->l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
-        a.prefix_ptr, a.lf->pre_ticks, a_smem, b_smem, frag_a, frag2, ctr,
-        a.merge_grid);
+        a.prefix_ptr, a.lf->pre_ticks, a_smem, b_smem, frag_a, frag2, ctr);
 }
 
 // 主 kernel（单轮）。
