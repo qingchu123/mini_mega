@@ -41,6 +41,9 @@ _L1_BLOCK_N = 256
 _KERNEL_RING = 8        # kRing：每专家窗口槽数
 _KERNEL_M_TILE = 16     # kM：M tile 行数（win_cap 对齐粒度）
 _KERNEL_GRID = 32       # kGrid：grid 块数（缺省 merge 上限）
+# 自适应 win 下限：kernel 守卫（src/megakernel.cu）仅放行 win==slot 或
+# 16 的倍数且 48<=win<=slot；win<48 的小窗在 REDUCE/graph 上未验证。
+_WIN_ADAPT_MIN = 48
 
 # 物理窗口容量缺省：与调用方逻辑窗口解耦，按最大值分配（AUTO 表最大 80、
 # 长尾自适应最大 64）；可用 MXK_WIN_PHYS 覆盖（不超过 EXPERT_WINDOW_MAX）。
@@ -361,8 +364,13 @@ class SymmBuffer:
                 else:
                     tgt = min(48, max_expert)
                 tgt = ((tgt + _KERNEL_M_TILE - 1) // _KERNEL_M_TILE) * _KERNEL_M_TILE
-                win = max(EXPERT_WINDOW_MIN,
-                          min(int(self.win_phys), max(_KERNEL_M_TILE, tgt)))
+                # 对齐到 kernel 守卫放行区间：16 的倍数，且 48 <= win <= min(win_phys, slot)
+                hi = min(int(self.win_phys), int(self.num_max_tokens_per_rank))
+                hi = (hi // _KERNEL_M_TILE) * _KERNEL_M_TILE
+                win = max(_WIN_ADAPT_MIN, min(hi, tgt))
+                if win < _WIN_ADAPT_MIN or win > hi:
+                    self._launch_cfg = base
+                    return base   # 放行区间为空：回退 base，不伪造 win
                 # [TEST] merge=1（不粗化，多波）验证 GEN 代际修复。
                 #   MXK_MERGE1=0 可回退单波粗化做 A/B。
                 merge_g = (0x3FFFFFFF
