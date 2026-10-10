@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
     int rank = 0, R = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &R);
+    if (rank == 0 && std::getenv("MT_DUMP_RES")) fp8mega::dump_kernel_resources();
 
     Opts o;
     if (!parse_args(argc, argv, &o)) {

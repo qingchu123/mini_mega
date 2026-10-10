@@ -123,5 +123,7 @@ void launch_empty(int grid, int threads, int64_t smem, mcStream_t stream);
 // 设备侧生成 lane 序 packed 权重（16B/lane 配对布局）
 void fill_weights_lane(uint8_t* w, int n_rows, int k_cols, uint32_t seed,
                        mcStream_t stream);
+// [诊断] 打印内核寄存器/本地内存占用
+void dump_kernel_resources();
 
 }  // namespace fp8mega

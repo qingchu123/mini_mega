@@ -9,6 +9,7 @@
 #include "megakernel.h"
 
 #include <cstdlib>
+#include <cstdio>
 
 #include "common.cuh"
 #include "kernel.cuh"
@@ -191,4 +192,20 @@ void fill_weights_lane(uint8_t* w, int n_rows, int k_cols, uint32_t seed,
     fill_w_lane_kernel<<<256, 256, 0, stream>>>(w, n_rows, k_cols, seed);
 }
 
+void dump_kernel_resources() {
+    auto q = [](const char* n, const void* f) {
+        mcFuncAttributes at{};
+        if (mcFuncGetAttributes(&at, f) == mcSuccess)
+            std::printf("[RES] %-7s regs=%d local=%zu smem=%zu maxThr=%d\n", n,
+                        at.numRegs, at.localSizeBytes, at.sharedSizeBytes,
+                        at.maxThreadsPerBlock);
+        else
+            std::printf("[RES] %-7s <fail>\n", n);
+    };
+    q("kCap48", (const void*)mega_kernel<true, NoTaskTail, false, 48>);
+    q("kCap64", (const void*)mega_kernel<true, NoTaskTail, false, 64>);
+    q("full",   (const void*)mega_kernel<true>);
+    q("empty",  (const void*)mega_kernel<false>);
+}
 }  // namespace fp8mega
+
