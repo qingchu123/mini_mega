@@ -144,7 +144,7 @@ struct R29TailFuseSet<CombineTail> {
 // 计算链任务循环（tail 类型由调用点按运行期开关选择）
 // [FRAG-ALWAYS] 去掉 kFragCap：fragment（A/f2 4-line 快路径）分支恒编译。
 // [FRAG-INT] fragment 缓冲改为 kernel 内部（rwk->ld.frag_a/frag2），不再由 host 传入；
-//   运行期是否真走由 afrag_ok/frag_all 决定（见 compute.cuh 的 S.frag_all）。
+//   运行期是否真走由 S.frag_all 决定（见 compute.cuh 的 S.frag_all）。
 template <typename TaskTail, bool kSmallOnly = false, int kCap = 0>
 __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
                                                    TaskTail tail, int cycle,
@@ -186,18 +186,10 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
         if (blockIdx.x == 0) MX_CTR_ADD(ctr, kCtrKernelLaunch, 1);
         MX_CTR_ADD(ctr, kCtrKernelBlocks, 1);
     }
-    // [R24] A-smem 双缓冲（kernel 作用域，两类任务体共享同一块）
-    // [OPT-BSM] A-smem（r24 路径）与 L1 B 异步流水缓冲互斥使用（union 折叠，
-    //   静态 smem 上限 128KB）。b 布局 [kBR][kBatch][8][1024]，两种使用方各自
-    //   按 级数×批宽 取字节（中档 CM_BR×CM_L1_BATCH、小档 CM_SMALL_BR×
-    //   CM_SMALL_BATCH），取较大者。
-    //   a 布局 [2][R24_MT*R24_KS*512]。
+    // [R24] A-smem 双缓冲（kernel 作用域）；L1 B-smem 流水已删除。
+    // dispatch 参数中的 b_smem 暂保留，供调用边界兼容，但始终为 nullptr。
     union __align__(16) ABShared {
         uint8_t a[2][R24_MT * R24_KS * 512];
-        uint8_t b[(((CM_BR * 4) > (CM_SMALL_BR * CM_SMALL_BATCH))
-                       ? (CM_BR * 4)
-                       : (CM_SMALL_BR * CM_SMALL_BATCH)) *
-                  8 * 1024];
     };
     __shared__ ABShared s_ab;
     if (kTick) a.rwk->lf.pre_ticks[6] = clock64();
@@ -304,7 +296,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
             tail.ctr = ctr;
 #endif
             mega_dispatch_loop<CombineTail, kSmallOnly, kCap>(
-                a, tail, cyc, &s_ab.a[0][0], &s_ab.b[0],
+                a, tail, cyc, &s_ab.a[0][0], nullptr,
                 ctr);
         }
     }

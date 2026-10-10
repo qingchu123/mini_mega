@@ -287,29 +287,24 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
     std::vector<uint8_t> ffn_d((size_t)rows * kIntermediate);
     CHECK(mcMemcpy(ffn_d.data(), e.d.ffn + (size_t)pool_slot * win * kIntermediate,
                    ffn_d.size(), mcMemcpyDeviceToHost));
-    // L1 输出布局：行主序（ring 0）或 A-fragment 路径的 f2 布局（compute.cuh 的 f_slots /
-    // f2_slots 公式；compute_big.cuh 的 cm_store_ffn_frag 与 f2p 寻址）。
-    //   f_slots = ceil((k_in/32)*mt*512 / (win*I))，f2_slot = 1 + f_slots，
-    //   f2 槽 = e*ring + f2_slot，字节(row,col) = ((col>>5)*mt + (row>>4))*512 + (row&15)*32 + (col&31)。
+    // L1 输出布局：行主序（ffn_hidden 槽）或 fragment（local_data.frag2 的 e*ring+w%ring 槽）。
+    //   fragment 字节(row,col) = ((col>>5)*mt + (row>>4))*512 + (row&15)*32 + (col&31)，
+    //   mt = ceil(win/16)（cm_store_ffn_frag 写、此处解码）。
     {
         const int mt = (win + 15) >> 4;
-        const int64_t slot_bytes = (int64_t)win * kIntermediate;
-        const int64_t f_bytes = (int64_t)(kHidden / 32) * mt * 512;
-        const int f_slots = (int)((f_bytes + slot_bytes - 1) / slot_bytes);
-        const int f2_slot = 1 + f_slots;
         long long nz0 = 0;
         for (size_t i = 0; i < (size_t)rows * kIntermediate; ++i)
             if (ffn_d[i] != 0) ++nz0;
         if (nz0 < (long long)(rows * kIntermediate) / 2) {
+            const int slot = ex * kRing;   // 窗口 0 → frag2 槽 e*ring+0
             std::vector<uint8_t> f2((size_t)win * kIntermediate);
-            CHECK(mcMemcpy(f2.data(),
-                           e.d.ffn + ((size_t)ex * kRing + f2_slot) * win * kIntermediate,
+            CHECK(mcMemcpy(f2.data(), &e.d.ld->frag2[slot][0],
                            f2.size(), mcMemcpyDeviceToHost));
             for (int r = 0; r < rows; ++r)
                 for (int c = 0; c < kIntermediate; ++c)
                     ffn_d[(size_t)r * kIntermediate + c] =
                         f2[((size_t)(c >> 5) * mt + (r >> 4)) * 512 + (r & 15) * 32 + (c & 31)];
-            std::printf("    [L1/L2] 布局=A-fragment（f2 槽 e*ring+%d），已解码为行主序\n", f2_slot);
+            std::printf("    [L1/L2] 布局=fragment（local_data.frag2 槽 e*ring+%d）\n", slot);
         } else {
             std::printf("    [L1/L2] 布局=行主序（ring 0）\n");
         }

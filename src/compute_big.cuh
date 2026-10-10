@@ -31,11 +31,11 @@
 //   2) F_A：pull 阶段在池行主序之外，向本 expert 的 ffn_hidden 空槽
 //      （e*ring+1..3）写一份 A 的 [step][m][row][32B] 分块副本；L1 的 A 装载
 //      变为连续 512B/指令（4 line）。
-//   3) F2：L1 epilogue 同时按字节写 ffn_hidden 的 fragment 副本（e*ring+4 槽），
+//   3) F2：L1 epilogue 同时按字节写 local_data.frag2 的 fragment 副本（(e,w%ring) 槽），
 //      L2 的 A（ffn_hidden）装载同样变 4 line，消除 L2 的 warp 末尾 straggler
 //      （130µs → 16µs）。行主序 ffn_hidden 仅保留 slot0（bench 数值校验读取）。
-//   4) 仅在"单波 + 每 expert 单窗 + 空槽足够"时启用（afrag_ok），否则回退
-//      行主序路径（协议/数值等价）。L1 kPF 由 1 升 2（acc 128 下刚好容纳）。
+//   4) fragment 专用缓冲 = local_data.frag_a/frag2（恒存在，见 [FRAG-INT]）。
+//      L1 kPF 由 1 升 2（acc 128 下刚好容纳）。
 //   5) 结果（71 机同会话）：TPR=128 1405→1246µs（−11.3%）、TPR=64 727→666
 //      （−8.4%）、TPR=16 313→318.5（+1.7%）；正确性/数值全 PASS。
 //
@@ -59,7 +59,7 @@
 //   1) 归因：kAsync 原来要求 count%(MT*16)==0 且 win_cap%16==0 → 129/257/513
 //      整段掉非 async 回退（MT4/B4，权重 ceil(count/64) 遍）；且 F_A 槽位条件
 //      (win_cap&15)==0 使 win_cap 非整除时连 F 布局都不可用。
-//   2) 交付：F_A/F2 按 mt_total=ceil(win_cap/16) 布局、f2_slot 动态紧随 F；
+//   2) 交付：F_A/F2 按 mt_total=ceil(win_cap/16) 布局（槽 = local_data.frag_a/frag2）；
 //      r24_*_big 改行区间 [c0_begin,c0_end) + kMask 模板（整块无掩码快路径、
 //      尾块掩码）；权重遍数 = ceil(count/(MT*16))。尾块 ≤16 行走 MT1/KS16 小
 //      档（A/MMA 1/8、stage 同步减半）；count∈(16,32] 走小档 body（runtime M

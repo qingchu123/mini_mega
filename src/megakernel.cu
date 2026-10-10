@@ -153,7 +153,7 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
     // [MEGA_DEBUG=4] 采集 kernel（mega 之前；默认关，零开销）
     dbg_capture_launch(a, stream);
     // [FRAG-INT] fragment 缓冲为 kernel 内部（rwk->ld），host 不再传入。fragment
-    //   分支恒编译（[FRAG-ALWAYS]），运行期按 afrag_ok/几何自动启用。
+    //   分支恒编译（[FRAG-ALWAYS]），运行期按 frag_all/几何自动启用。
     // [OPT-TK-CAP] 按 win_cap 选编译期 count 上界实例（kCap=48/64）：不可达的重档
     //   （MT8 异步 / MT4 大 GEMM 兜底）被 if constexpr 删除，缩任务体寄存器/栈。
     if (a.win_cap <= 48)

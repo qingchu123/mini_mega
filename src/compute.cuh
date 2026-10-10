@@ -981,11 +981,9 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.pt = pt;
     // [R21] A fragment 副本（放在 ffn_hidden 的空槽）启用条件：
     //   单波（每 block 恰 1 任务，sibling 组固定）+ 每 expert 单窗（win_cap
-    //   覆盖全专家容量，e*ring+1 起槽位空闲）+ F 大小可容纳于 ring-1 个槽。
-    // [R34] F_A/F2 槽需求按 ceil(win_cap/16) 的 m 维计算（win_cap 允许非 16
-    //   整除：尾块由 row<cc 掩码，F 的尾 tile 折叠到最后一 tile 读取）：
-    //   F 占 (k_in/32)*mt_total*512 字节、F2 占 (l1_k_out/32)*mt_total*512 字节，
-    //   槽字节 = win_cap*l1_k_out。F 自 e*ring+1 起，F2 紧随其后（f2_slot）。
+    // [R34][FRAG-INT] fragment 的 m 维长度 = ceil(win_cap/16)（win_cap 允许非 16
+    //   整除：尾块由 row<cc 掩码，fragment 尾 tile 折叠到最后一 tile 读取）。
+    //   A/F2 fragment 槽 = local_data.frag_a/frag2[(e*ring + w%ring)]（恒存在）。
     const int mt_total = (win_cap + 15) >> 4;
     S.mt_total = mt_total;
     // [FRAG-INT] A/f2 fragment 专用缓冲恒存在（local_data.frag_a/frag2，非 host 传入）。
