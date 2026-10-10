@@ -254,6 +254,11 @@ inline void reset_dev(const Geo& g, const Dev& d, const Routes& routes, int toke
     CHECK(mcMemset(d.rd, 0, sizeof(ranks_data)));
     CHECK(mcMemset(d.ffn, 0, ffn_bytes(g)));
     CHECK(mcMemset(d.l2, 0, l2_bytes(g)));
+    // [FRAG] fragment 槽也清零，避免跨用例残留（L1 输出校验读 frag2）
+    if (d.ld) {
+        CHECK(mcMemset(&d.ld->frag_a[0][0], 0, sizeof(d.ld->frag_a)));
+        CHECK(mcMemset(&d.ld->frag2[0][0], 0, sizeof(d.ld->frag2)));
+    }
     // 清零必须在 device 上完成后才返回：调用方随后的 MPI_Barrier 只保证 host 侧
     // 对齐。若某 rank 的 rd（combine_rows）memset 晚于对端推送，对端已写入的
     // 数据会被清零，而 rf 标记（先于 rd 清零）仍在 => REDUCE 放行读到 0。
