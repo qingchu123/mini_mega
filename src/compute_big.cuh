@@ -1663,10 +1663,12 @@ __device__ R19_SMALL_ATTR void r19_small_task(
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, nullptr, out_col_base, S.l1_k_out);
         } else
-            l1_gemm_swiglu_body_paired<4, kNTilesPerWarp, 1, 2>(
-                pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
-                lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                out_col_base, S.l1_k_out, nullptr);
+            // [b] g_l1=2（NSLICE=8）几何：paired<4,kNT,1,2> → r19<1,2,2>，
+            //   彻底移除 small task 的 paired 实例（省其 PF4 预取环寄存器）
+            r19_l1_big<1, R19_L1_PF, 2>(
+                pool_w, nullptr, S.mt_total, S.w1, e, count, S.k_in,
+                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, nullptr, out_col_base, S.l1_k_out);
     }
     r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
     // ---- L2：小 count（与基线实例选择一致）----
