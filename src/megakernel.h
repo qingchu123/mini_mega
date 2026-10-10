@@ -55,17 +55,12 @@ struct MegaLaunchArgs {
     // ---- 前序 ----
     const int64_t* topk_idx = nullptr;   // 本 rank 输入路由
     const uint8_t* self = nullptr;       // 本 rank 对称区基址
-    int* rsc_ptr = nullptr;              // route_slot_counts（local_data）
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址表（设备数组）
     int R = 0, rank = 0;
     int tokens = 0;          // 实际 token 数
     int slot_capacity = 0;   // 专家 token 容量
-    int win_cap = 0;         // 窗口容量
-    int pool_stride = 0;     // pool 槽地址 stride
-    int tbl_cap = 0;         // src_index_table 行容量
-    int k_in = 0, topk = 0, ring = 0;
-    int64_t src_off = 0, rsc_off = 0, recv_off = 0, prefix_off = 0,
-            barrier_off = 0;
+    int win_cap = 0;         // 窗口容量（窗口划分 / pool / staging / ffn / l2 行 stride）
+    int64_t rsc_off = 0, prefix_off = 0;
     // [步骤2a] 结构体指针：rwk = 本 rank 普通显存整块（lf + ld）；
     //          unk = 本 rank FG 整块（rf + rd）；unk_peers = 各 rank unk 基址表。
     rwk_data* rwk = nullptr;
@@ -79,13 +74,11 @@ struct MegaLaunchArgs {
     // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）
     // 已迁入 local_flags（lf->...）。
     int max_spins = 0;
-    unsigned publish_epoch = 0;
-    int recv_stride = 0;
     int skip_prologue = 0;  // [R38] >0=复用前序（同 graph 非首节点；见 kernel.cuh）
     int* prefix_ptr = nullptr;
     // ---- 计算链 ----
     const uint8_t* w1 = nullptr;
-    int l1_n_total = 0, l1_block_n = 0, l1_k_out = 0;
+    int l1_k_out = 0;        // L1 输出隐藏维 I（l1_n_total/l1_block_n 为常量）
     uint8_t* ffn_hidden = nullptr;
     // [FRAG-INT] A/f2 fragment 缓冲为 kernel 内部（rwk->ld.frag_a/frag2），
     //   host 不再传入。
@@ -95,8 +88,6 @@ struct MegaLaunchArgs {
     // ---- 收尾 ----
     int64_t topk_idx_off = 0;    // REDUCE 用：self + topk_idx_off = topk_idx 基址
     int64_t combine_rows_off = -1;  // combine_rows（BF16）区偏移（留在 sym）
-    int combine_cap = 0;
-    int sums_stride = 0;
     // ---- REDUCE 输出 + 发射几何（host 侧，设备不读）----
     float* y = nullptr;
     int grid = 0;

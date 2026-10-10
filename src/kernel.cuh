@@ -24,48 +24,56 @@ __global__ void __launch_bounds__(1024) mega_empty_kernel() {}
 // ---------------------------------------------------------------- 主 kernel --
 // host -> device 参数（按值传结构体；全部为 POD）
 struct MegaArgs {
-    // ---- 前序 ----
-    const int64_t* topk_idx;   // 本 rank 输入路由（对称区内视图）
-    const uint8_t* self;       // 本 rank 对称区基址
-    uint8_t* const* peer_bases;  // 各 rank 对称区基址表（含 self，设备数组）
-    int R, rank;
-    int tokens;         // 实际 token 数（<= slot_capacity）
-    int slot_capacity;  // 专家 token 容量（= max_tokens）
-    int win_cap;        // 窗口容量（窗口划分/staging 行 stride）
-    int pool_stride;    // pool 槽地址 stride（= win_cap + win_pad）
-    int tbl_cap;        // src_index_table 行容量（= max_tokens）
-    int k_in, topk, ring;
-    int64_t rsc_off, prefix_off;
-    // [步骤2b-A] 结构体指针（替代 lf/rf/remote 等旧字段）
-    rwk_data* rwk;                 // 本 rank 普通显存整块（lf + ld）
-    unk_data* unk;                 // 本 rank FG 整块（rf + rd）
-    unk_data* const* unk_peers;    // 各 rank unk 基址表（设备数组，含 self）
+    // ============================================================ 维度 / 容量
+    int R, rank;               // rank 数 / 本 rank 号
+    int tokens;                // 实际 token 数（<= slot_capacity）
+    int slot_capacity;         // 专家 token 容量（= max_tokens；= src_index_table 行容量）
+    int win_cap;               // 窗口容量（窗口划分 / pool / staging / ffn / l2 行 stride）
+    // 已内联为常量的字段（原为运行期传参，本子集固定）：
+    //   k_in=kHidden、topk=kTopk、ring=kRing、l1_block_n=kL1BlockN、
+    //   l1_n_total=2*l1_k_out、tbl_cap=slot_capacity、pool_stride=win_cap、
+    //   publish_epoch=kPublishEpoch、recv_stride=kRecvStride
+
+    // ============================================================ 对称区 / 结构体
+    const uint8_t* self;          // 本 rank 对称区基址
+    uint8_t* const* peer_bases;   // 各 rank 对称区基址表（拉 x / weights；设备数组，含 self）
+    unk_data* unk;                // 本 rank FG 整块（rf + rd；= unk_peers[rank]）
+    unk_data* const* unk_peers;   // 各 rank unk 基址表（设备数组，含 self）
+    rwk_data* rwk;                // 本 rank 普通显存整块（lf + ld）
+
+    // ============================================================ 前序
+    const int64_t* topk_idx;      // 本 rank 输入路由（对称区内视图）
+    int64_t rsc_off, prefix_off;  // route_slot_counts / prefix_tbl 在 self 内的偏移
+
+    // ============================================================ flag 索引
+    // 由 layout 头经 host 传入（kernel 不 include 该布局头，见 flags.cuh 说明）
     int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
     int64_t slice_flags_idx, l1_prog_idx;
+
+    // ============================================================ 控制 / 复位
+    int max_spins;                // 各同步门的自旋上限
+    int skip_prologue;            // [R38] 前序复用：0 完整，1 复用（见 kernel.cuh 说明）
+    uint8_t* pool_ptr;            // [A-RWK] pool 独立缓冲基址（nullptr → self+pool_off）
+    int* prefix_ptr;              // 可选独立前缀表缓冲（nullptr → self+prefix_off）
+
+    // ============================================================ self / peer 偏移
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
-    uint8_t* pool_ptr;   // [A-RWK] pool 独立缓冲基址（nullptr → self+pool_off，可空语义保留）
-    // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）
-    // 已迁入 local_flags（lf->...），此处不再持有独立指针。
-    int max_spins;
-    unsigned publish_epoch;   // publish 校验槽 epoch（阶段 1 = kPublishEpoch）
-    int recv_stride;          // recv 行宽（word）= 12
-    // [R38] 跨 graph 节点前序复用：同一 graph 内节点路由不变时，除首节点外
-    //   跳过 ROUTE_BUILD/PUBLISH/XBAR（数据持久、node0 已建立跨 rank 可见性），
-    //   仅推进 cycle 计数并重跑 TASK_SETUP（重臂 flag）。0=完整前序，1=复用。
-    int skip_prologue;
-    int* prefix_ptr;          // 可选独立前缀表缓冲（nullptr = self+prefix_off，可空语义保留）
-    // ---- 计算链 ----
-    int l1_n_total, l1_block_n, l1_k_out;
-    int l2_k_out;
-    // [步骤2b-A 修订] 计算链缓冲由 host 决定来源（torch 按 win_alloc，mega_common 指向 rwk->ld）
-    const uint8_t* w1;        // [EPR][2I][H] lane 序 packed tile（gate/up 配对布局）
-    const uint8_t* w2;        // [EPR][H][I] lane 序 packed tile
-    uint8_t* ffn_hidden;      // [EPR][ring][win_cap][I] FP8
-    uint16_t* l2_out;         // [kGrid][win_cap][H] BF16
-    // ---- 收尾 ----
-    int64_t combine_rows_off;  // 目标 rank 的 combine_rows 区偏移（BF16，留在 sym）
-    // ---- [集71] 内部执行次数统计（编译期默认关：MX_DBG_COUNT=0）----
-    // 整块条件编译：关闭态 MegaArgs 的布局/大小与改造前**逐字节一致**
+
+    // ============================================================ 计算链
+    int l1_k_out;                 // L1 输出隐藏维 I（l1_n_total 由 2*l1_k_out 派生）
+    int l2_k_out;                 // L2 输出维 H
+    const uint8_t* w1;            // [EPR][2I][H] lane 序 packed tile（gate/up 配对布局）
+    const uint8_t* w2;            // [EPR][H][I] lane 序 packed tile
+    uint8_t* ffn_hidden;          // [EPR][ring][win_cap][I] FP8
+    uint16_t* l2_out;             // [kGrid][win_cap][H] BF16
+    // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）已迁入
+    //   local_flags（lf->...），此处不再持有独立指针。
+
+    // ============================================================ 收尾
+    int64_t combine_rows_off;     // 目标 rank combine_rows 区偏移（BF16，<0 关闭 COMBINE）
+
+    // ============================================================ 诊断（MX_DBG_COUNT）
+    // 条件编译：关闭态 MegaArgs 的布局/大小与改造前逐字节一致
     // （已用 .mc_fatbin md5 对比验证，见 test/71.kernel_exec_count/results.md）。
 #if MX_DBG_COUNT
     unsigned long long* exec_ctr;  // [kExecCtrSlots] 各计数槽（nullptr = 不统计）
@@ -138,12 +146,14 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
                                                    unsigned long long* ctr = nullptr) {
     dispatch_pull_body<TaskTail, kSmallOnly, kCap>(
         a.self, &a.unk->rd, cycle, a.peer_bases, a.R, a.rank, a.win_cap,
-        a.pool_stride, a.tbl_cap, a.k_in, a.topk, a.ring, a.prefix_off,
+        a.win_cap /*pool_stride*/, a.slot_capacity /*tbl_cap*/,
+        kHidden /*k_in*/, kTopk /*topk*/, kRing /*ring*/, a.prefix_off,
         a.x_off, a.weights_off, a.pool_off, a.w_off, a.meta_off,
         a.pool_ptr, a.rwk->lf.bar[cycle],
         a.task_counter_idx, a.l2_done_idx, a.task_ready_idx, a.slice_flags_idx,
         a.l1_prog_idx, a.rwk->lf.out_processed, a.rwk->lf.dbg, a.max_spins, a.w1,
-        a.l1_n_total, a.l1_block_n, a.l1_k_out, a.ffn_hidden, a.rwk->lf.l1_chk, a.w2,
+        2 * a.l1_k_out /*l1_n_total*/, kL1BlockN /*l1_block_n*/, a.l1_k_out,
+        a.ffn_hidden, a.rwk->lf.l1_chk, a.w2,
         a.l2_out, a.l2_k_out, a.rwk->lf.l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
         a.prefix_ptr, a.rwk->lf.pre_ticks, a_smem, b_smem,
         a.rwk->ld.frag_a[0], a.rwk->ld.frag2[0], ctr);
@@ -198,8 +208,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                              a.tokens, a.slot_capacity, 0, 0, ctr);
             if (kTick) a.rwk->lf.pre_ticks[0] = clock64();
             publish_counts_body(a.self, &a.rwk->ld.route_slot_counts[0], a.rsc_off, a.unk_peers,
-                                route_cycle, a.R, a.rank, a.publish_epoch,
-                                a.recv_stride, 0, ctr);
+                                route_cycle, a.R, a.rank, kPublishEpoch,
+                                kRecvStride, 0, ctr);
             if (kTick) a.rwk->lf.pre_ticks[1] = clock64();
         }
     } else {
@@ -228,7 +238,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                         a.prefix_off, &a.rwk->lf, a.task_ready_idx,
                         a.task_counter_idx, a.l2_done_idx,
                         a.rwk->lf.out_total, a.rwk->lf.dbg, a.max_spins,
-                        a.recv_stride, /*reset_ring=*/true, /*tid_base=*/0,
+                        kRecvStride, /*reset_ring=*/true, /*tid_base=*/0,
                         /*sb_cnt=*/nullptr, /*smem_off=*/0, a.prefix_ptr,
                         a.rwk->lf.ck_dbg, ctr);
     }

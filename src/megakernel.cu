@@ -92,11 +92,6 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.tokens = a.tokens;
     m.slot_capacity = a.slot_capacity;
     m.win_cap = a.win_cap;
-    m.pool_stride = a.pool_stride;
-    m.tbl_cap = a.tbl_cap;
-    m.k_in = a.k_in;
-    m.topk = a.topk;
-    m.ring = a.ring;
     m.rsc_off = a.rsc_off;
     m.prefix_off = a.prefix_off;
     // [步骤2b-A] kernel 直接使用结构体指针
@@ -116,12 +111,8 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.w_off = a.w_off;
     m.meta_off = a.meta_off;
     m.max_spins = a.max_spins;
-    m.publish_epoch = a.publish_epoch;
-    m.recv_stride = a.recv_stride;
     m.skip_prologue = a.skip_prologue;
     m.prefix_ptr = a.prefix_ptr;
-    m.l1_n_total = a.l1_n_total;
-    m.l1_block_n = a.l1_block_n;
     m.l1_k_out = a.l1_k_out;
     m.l2_k_out = a.l2_k_out;
     m.w1 = a.w1;
@@ -148,7 +139,7 @@ int stream_is_capturing(mcStream_t stream) {
 void dbg_capture_launch(const MegaLaunchArgs& a, mcStream_t stream) {
     if (!dbg_capture_enabled()) return;
     mxk_dbg_capture_kernel<<<1, 1, 0, stream>>>(
-        a.topk_idx, a.tokens, a.topk, a.rwk ? &a.rwk->lf : nullptr, a.rank,
+        a.topk_idx, a.tokens, kTopk, a.rwk ? &a.rwk->lf : nullptr, a.rank,
         stream_is_capturing(stream), nullptr);
 }
 

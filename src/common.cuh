@@ -30,6 +30,10 @@ constexpr int kNSlice = KNSLICE_OVERRIDE;  // 每窗口任务切片数（K 片 /
 constexpr int kRing = KRING_OVERRIDE;  // 专家窗口槽数（ring 复用）
 constexpr int kMaxWin = 8;  // 专家窗口槽数（ring 复用）
 constexpr int kM = 16;               // M tile 行数
+// L1 N tile 宽（生产 block_n；原 MegaArgs.l1_block_n 的固定值）
+constexpr int kL1BlockN = 256;
+// recv 行宽（word）：与 layout 的 ((EPR+1)+3)&~3 一致（原 MegaArgs.recv_stride）
+constexpr int kRecvStride = (kEPR + 1 + 3) & ~3;
 
 // 自旋上限（异常保护）：约 1s（4M 周期 @2GHz）
 constexpr long long kSpinLimit = 4000000LL;
