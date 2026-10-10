@@ -145,13 +145,14 @@ struct R29TailFuseSet<CombineTail> {
 // [FRAG-ALWAYS] 去掉 kFragCap：fragment（A/f2 4-line 快路径）分支恒编译。
 // [FRAG-INT] fragment 缓冲改为 kernel 内部（rwk->ld.frag_a/frag2），不再由 host 传入；
 //   运行期是否真走由 S.frag_all 决定（见 compute.cuh 的 S.frag_all）。
-template <typename TaskTail, bool kSmallOnly = false, int kCap = 0>
+template <typename TaskTail, bool kSmallOnly = false, int kCap = 0,
+          MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
                                                    TaskTail tail, int cycle,
                                                    uint8_t* a_smem = nullptr,
                                                    uint8_t* b_smem = nullptr,
                                                    unsigned long long* ctr = nullptr) {
-    dispatch_pull_body<TaskTail, kSmallOnly, kCap>(
+    dispatch_pull_body<TaskTail, kSmallOnly, kCap, kPhase>(
         a.self, &a.unk->rd, cycle, a.peer_bases, a.R, a.rank, a.win_cap,
         a.win_cap /*pool_stride*/, a.slot_capacity /*tbl_cap*/,
         kHidden /*k_in*/, kTopk /*topk*/, kRing /*ring*/, a.prefix_off,
@@ -169,8 +170,12 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
 // 主 kernel（单轮）。
 //   kWithCompute=false：只跑前序（M1 验证）；true：完整任务循环（M2/M3）；
 //   kWithCompute=true 且 combine_rows_off>=0：任务尾接 COMBINE（M3）
+// [L1L2-SPLIT] kPhase：Both=原合并；L1=只跑前序+DISPATCH+L1；L2=只跑 L2+tail
+//   （prologue 行为由 a.skip_prologue 驱动：L2 发射时 host 置 2 = 跳过
+//   route/publish/xbar、轻量 task_setup）。
 template <bool kWithCompute, typename TaskTail = NoTaskTail,
-          bool kSmallOnly = false, int kCap = 0>
+          bool kSmallOnly = false, int kCap = 0,
+          MegaPhase kPhase = MegaPhase::Both>
 __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     // 相位时间戳（block0 tid0；[6]=入口 [0]=route后 [1]=publish后 [2]=xbar后 [3]=setup后）
     const bool kTick = (blockIdx.x == 0) && (threadIdx.x == 0);
@@ -218,8 +223,12 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     // 2) XBAR_ROUTE_READY（全 grid，mode3：转置 + warp 并行发布）：每节点保留，
     //    既是 route/publish 可见性门，也是跨 rank 的每节点对齐（防漂移）。
     if (a.skip_prologue >= 2) {
-        // 诊断模式：连 xbar 也跳过，仅推进 xbar 相位计数
-        if (threadIdx.x == 0) a.rwk->lf.current_time[blockIdx.x][0] += 1;
+        // 诊断模式：连 xbar 也跳过，仅推进 xbar 相位计数。
+        // [L1L2-SPLIT] L2 阶段：xbar 相位计数不由 L2 推进 —— 每 round 仅 L1 前序
+        //   前进一次，使 ct0/ct1 单步同步（combine/REDUCE 的 cyc/epoch 对齐）。
+        if constexpr (kPhase != MegaPhase::L2) {
+            if (threadIdx.x == 0) a.rwk->lf.current_time[blockIdx.x][0] += 1;
+        }
         __syncthreads();
     } else {
         xbar_route_ready_body(&a.unk->rf, a.unk_peers, &a.rwk->lf, a.R, a.rank,
@@ -227,7 +236,12 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
     }
     if (kTick) a.rwk->lf.pre_ticks[2] = clock64();
     // 3) TASK_SETUP（block0 leader：checksum -> prefix -> 窗口表 -> task_ready）
-    if (a.skip_prologue) {
+    // [L1L2-SPLIT] L2 阶段：改用静态任务划分（见 dispatch_pull_body），
+    //   不重臂 task_counter/task_ready、不推进 current_time[1]（每 round 仅 L1
+    //   前序 +1）；prefix 由本 round L1 的 task_setup 持久化，L2 只读。
+    if constexpr (kPhase == MegaPhase::L2) {
+        if (kTick) a.rwk->lf.pre_ticks[3] = clock64();
+    } else if (a.skip_prologue) {
         // [R38] 复用前序：prefix/路由/计数持久，仅轻量重臂 flag（省 checksum
         //   轮询与 prefix 重建）。
         task_setup_light_body(&a.rwk->lf, a.task_ready_idx, a.task_counter_idx,
@@ -295,7 +309,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
 #if MX_DBG_COUNT
             tail.ctr = ctr;
 #endif
-            mega_dispatch_loop<CombineTail, kSmallOnly, kCap>(
+            mega_dispatch_loop<CombineTail, kSmallOnly, kCap, kPhase>(
                 a, tail, cyc, &s_ab.a[0][0], nullptr,
                 ctr);
         }

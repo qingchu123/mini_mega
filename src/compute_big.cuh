@@ -1048,6 +1048,12 @@ __device__ __forceinline__ void r24_l2_big(
 //   pull → 分片旗 → wait-all → l1_prog 发布/等待 → tail
 //   代码自 compute.cuh 基线逐字搬移，仅变量改经 R19Sched 传入。
 // ============================================================================
+// [L1L2-SPLIT] kPhase 拆分语义（pool_slot 参数 = 数据槽；旗槽在函数内按 ring 派生）：
+//   Both —— 与基线逐字一致（数据+staging+分片旗+wait-all 全做）；
+//   L1   —— 只做数据搬移（pool/frag）+ 分片旗 + wait-all，不写 wt/meta staging；
+//   L2   —— 只重算 wt/meta staging（COMBINE tail 消费；本 kernel 领号可能与 L1
+//           不同，必须按自己的任务重算），不碰 pool/frag/分片旗。
+template <MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void r19_pull_flags(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx) {
@@ -1056,6 +1062,9 @@ __device__ __forceinline__ void r19_pull_flags(
     const int lane = tid % 64;
     const int nwarps = (int)(blockDim.x / 64);
     const int s_row_off = w * S.win_cap;
+    // 旗槽：保持 ring 索引（旗区容量 EPR*ring*nslice=256 不变）；数据槽 pool_slot
+    //   在拆分下为 e*slot_win+w（每窗口独占，见 dispatch_pull_body）。
+    const int flag_slot = e * S.ring + (w % S.ring);
     // [GEN] 槽携带代际：pool_slot=e*ring+w%ring 会绕回复用；旗值改用单调代际
     //   epoch + w/ring（= 该槽第几次被用），wait 端用本窗算出的同一值等待，
     //   避免上一代窗口遗留的旗被误判就绪（多波 merge=1 陈旧读修复）。
@@ -1064,6 +1073,7 @@ __device__ __forceinline__ void r19_pull_flags(
 #else
     const unsigned gen = epoch + (unsigned)(w / (S.ring > 0 ? S.ring : 1));
 #endif
+    (void)flag_slot;
     // [R35] 物理任务覆盖 merge 个连续逻辑 slice：K 片为连续 merge 段
     const int u4_slice = (S.k_in / 16) / S.nslice_eff;   // 本任务 uint4 数
     const int u4_off = slice * u4_slice;
@@ -1083,9 +1093,9 @@ __device__ __forceinline__ void r19_pull_flags(
     const bool kSkipPool = false;   // 实测跳过 pool 写更慢，保留
     uint8_t* frag_base = nullptr;
     if (kAfrag) {
-        // 按 (expert, window-slot) 定位专用 A fragment（local_data.frag_a）
+        // 按 (expert, window) 数据槽定位专用 A fragment（local_data.frag_a）
         const size_t fsz = (size_t)(S.k_in / 32) * (size_t)S.mt_total * 512;
-        frag_base = S.frag_a + (size_t)(e * S.ring + (w % S.ring)) * fsz;
+        frag_base = S.frag_a + (size_t)pool_slot * fsz;
     }
     const int mt_total = S.mt_total;   // [R34] ceil(win_cap/16)
     // [R26] warp 独占一段连续行（= 同源 rank 段）：每个 warp 的 8 次迭代
@@ -1106,118 +1116,136 @@ __device__ __forceinline__ void r19_pull_flags(
         uint4* dstp = reinterpret_cast<uint4*>(
             pool + ((size_t)pool_slot * S.pool_stride + s2) * S.k_in);
         if (valid) {
-#ifdef PULL_LOCAL_DIAG
-            // [诊断] 远端读换成本 rank 本地读（同 volume/pattern），量化远端代价
-            const uint4* srcp = reinterpret_cast<const uint4*>(
-                                    S.self + S.x_off) +
-                                (size_t)(src_token % S.tbl_cap) *
-                                    (S.k_in / 16) + u4_off;
-#else
-            const uint4* srcp = reinterpret_cast<const uint4*>(
-                                    S.peer_bases[src] + S.x_off) +
-                                (size_t)src_token * (S.k_in / 16) + u4_off;
-#endif
             // [O2] 权重远端读先于整行搬运发出：与搬运 store 并行，
             // 避免原顺序（先搬运后读权重）把远端读延迟暴露在任务尾。
+            // [L1L2-SPLIT] wt/meta staging 仅 Both/L2 需要（L1 阶段跳过权重读）。
             float wv = 0.0f;
-            if (ll == 0)
-                wv = *(reinterpret_cast<const float*>(
-                           S.peer_bases[src] + S.weights_off) + encoded);
-            // [H2] 本场景 u4_slice=96（6144/16/4）：3 个远端装载先全量发出，
-            // 再连续 store，消除 load→store→load 的串行依赖（−1.7µs）。
-            if (u4_slice == 96) {
-                const uint4 v0 = srcp[ll];
-                const uint4 v1 = srcp[ll + 32];
-                const uint4 v2 = srcp[ll + 64];
-                if (!kSkipPool) {
-                    dstp[u4_off + ll] = v0;
-                    dstp[u4_off + ll + 32] = v1;
-                    dstp[u4_off + ll + 64] = v2;
-                }
-                if (kAfrag) {
-                    r19_store_a_frag(frag_base, s2, (u4_off + ll) * 16, v0,
-                                     mt_total);
-                    r19_store_a_frag(frag_base, s2, (u4_off + ll + 32) * 16, v1,
-                                     mt_total);
-                    r19_store_a_frag(frag_base, s2, (u4_off + ll + 64) * 16, v2,
-                                     mt_total);
-                }
-            } else {
-                for (int i = ll; i < u4_slice; i += 32) {
-                    const uint4 v = srcp[i];
-                    if (!kSkipPool) dstp[u4_off + i] = v;
-                    if (kAfrag)
-                        r19_store_a_frag(frag_base, s2, (u4_off + i) * 16, v,
+            if constexpr (kPhase != MegaPhase::L1) {
+                if (ll == 0)
+                    wv = *(reinterpret_cast<const float*>(
+                               S.peer_bases[src] + S.weights_off) + encoded);
+            }
+            // [L1L2-SPLIT] pool/frag 数据搬移仅 Both/L1（L2 阶段不碰输入缓冲）。
+            if constexpr (kPhase != MegaPhase::L2) {
+#ifdef PULL_LOCAL_DIAG
+                // [诊断] 远端读换成本 rank 本地读（同 volume/pattern），量化远端代价
+                const uint4* srcp = reinterpret_cast<const uint4*>(
+                                        S.self + S.x_off) +
+                                    (size_t)(src_token % S.tbl_cap) *
+                                        (S.k_in / 16) + u4_off;
+#else
+                const uint4* srcp = reinterpret_cast<const uint4*>(
+                                        S.peer_bases[src] + S.x_off) +
+                                    (size_t)src_token * (S.k_in / 16) + u4_off;
+#endif
+                // [H2] 本场景 u4_slice=96（6144/16/4）：3 个远端装载先全量发出，
+                // 再连续 store，消除 load→store→load 的串行依赖（−1.7µs）。
+                if (u4_slice == 96) {
+                    const uint4 v0 = srcp[ll];
+                    const uint4 v1 = srcp[ll + 32];
+                    const uint4 v2 = srcp[ll + 64];
+                    if (!kSkipPool) {
+                        dstp[u4_off + ll] = v0;
+                        dstp[u4_off + ll + 32] = v1;
+                        dstp[u4_off + ll + 64] = v2;
+                    }
+                    if (kAfrag) {
+                        r19_store_a_frag(frag_base, s2, (u4_off + ll) * 16, v0,
                                          mt_total);
+                        r19_store_a_frag(frag_base, s2, (u4_off + ll + 32) * 16, v1,
+                                         mt_total);
+                        r19_store_a_frag(frag_base, s2, (u4_off + ll + 64) * 16, v2,
+                                         mt_total);
+                    }
+                } else {
+                    for (int i = ll; i < u4_slice; i += 32) {
+                        const uint4 v = srcp[i];
+                        if (!kSkipPool) dstp[u4_off + i] = v;
+                        if (kAfrag)
+                            r19_store_a_frag(frag_base, s2, (u4_off + i) * 16, v,
+                                             mt_total);
+                    }
                 }
             }
-            if (ll == 0) {
-                wt[(size_t)blockIdx.x * S.win_cap + s2] = wv;
-                meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 0] = src;
-                meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 1] = src_token;
-                meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 2] =
-                    (int)(encoded % (uint32_t)S.topk);
+            if constexpr (kPhase != MegaPhase::L1) {
+                if (ll == 0) {
+                    wt[(size_t)blockIdx.x * S.win_cap + s2] = wv;
+                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 0] = src;
+                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 1] = src_token;
+                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 2] =
+                        (int)(encoded % (uint32_t)S.topk);
+                }
             }
         } else {
             // 非法行零填充（本 K 片 + staging），保证确定性与 COMBINE 跳过
-            const uint4 z4{0u, 0u, 0u, 0u};
-            for (int i = ll; i < u4_slice; i += 32) {
-                if (!kSkipPool) dstp[u4_off + i] = z4;
-                if (kAfrag)
-                    r19_store_a_frag(frag_base, s2, (u4_off + i) * 16, z4,
-                                     mt_total);
+            if constexpr (kPhase != MegaPhase::L2) {
+                const uint4 z4{0u, 0u, 0u, 0u};
+                for (int i = ll; i < u4_slice; i += 32) {
+                    if (!kSkipPool) dstp[u4_off + i] = z4;
+                    if (kAfrag)
+                        r19_store_a_frag(frag_base, s2, (u4_off + i) * 16, z4,
+                                         mt_total);
+                }
             }
-            if (ll == 0) {
-                wt[(size_t)blockIdx.x * S.win_cap + s2] = 0.0f;
-                meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 0] = 0;
-                meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 1] = 0;
-                meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 2] = 0;
-            }
-        }
-    }
-#ifndef PULL_FENCE_NONE
-    __threadfence();
-#endif
-    __syncthreads();
-    // ---- 分片就绪旗（本 slice 的 K 片已落 pool；L1 消费）----
-    if (tid == 0) {
-#ifndef PULL_FENCE_MIN
-        __threadfence();
-#endif
-        // 同设备分片旗：普通写 + fence（__stwt 在普通显存上不更新 L2）
-        // [R36b] flag 粒度=物理 slice（nslice_eff）：粗化后 stride≤4，区容量
-        //   EPR×ring×nslice_eff ≤ 256 恒成立（不再随 kNSlice 放大）；
-        //   kNSlice=16 因此无需改布局常量即可用。
-        *reinterpret_cast<volatile uint32_t*>(
-            S.bar_flags + S.slice_flags_idx +
-            (size_t)pool_slot * S.nslice_eff + slice) = gen;
-#ifndef PULL_FENCE_MIN
-        __threadfence();
-#endif
-    }
-    __syncthreads();
-    // 诊断：block0 首任务 DISPATCH 完成（分片旗已写）
-    if (kTick) S.pt[4] = clock64();
-    // ---- L1 入口 wait-all：一次等齐本窗全部分片就绪旗 ----
-    // 骨架结论：packed+配对下 wait-all 优于 K 循环内每步分片门；任务按窗口连续
-    // 编号，同窗全部 slice 旗由本窗 nslice_eff 个物理任务写满。
-    if (count > 0 && tid == 0) {
-        for (int s2 = 0; s2 < S.nslice_eff; ++s2) {
-            if (s2 == slice) continue;
-            long long spin = 0;
-            // [集71] wait-all（分片就绪旗）等待轮次
-            MX_CTR_ADD(S.ctr, kCtrWaitAllSlice, 1);
-            while (*(volatile const uint32_t*)(S.bar_flags + S.slice_flags_idx +
-                                               (size_t)pool_slot *
-                                                   S.nslice_eff +
-                                               s2) != gen) {
-                if (++spin > S.max_spins) {
-                    if (S.dbg != nullptr) atomicAdd(S.dbg + 4, 1);
-                    break;
+            if constexpr (kPhase != MegaPhase::L1) {
+                if (ll == 0) {
+                    wt[(size_t)blockIdx.x * S.win_cap + s2] = 0.0f;
+                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 0] = 0;
+                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 1] = 0;
+                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 2] = 0;
                 }
             }
         }
+    }
+    // [L1L2-SPLIT] 以下 flush/分片旗/wait-all 仅 Both/L1（L2 的输入齐备性由
+    //   kernel 边界保证：L1 kernel 全部完成后 L2 kernel 才启动）。
+    if constexpr (kPhase != MegaPhase::L2) {
+#ifndef PULL_FENCE_NONE
         __threadfence();
+#endif
+        __syncthreads();
+        // ---- 分片就绪旗（本 slice 的 K 片已落 pool；L1 消费）----
+        if (tid == 0) {
+#ifndef PULL_FENCE_MIN
+            __threadfence();
+#endif
+            // 同设备分片旗：普通写 + fence（__stwt 在普通显存上不更新 L2）
+            // [R36b] flag 粒度=物理 slice（nslice_eff）：粗化后 stride≤4，区容量
+            //   EPR×ring×nslice_eff ≤ 256 恒成立（不再随 kNSlice 放大）；
+            //   kNSlice=16 因此无需改布局常量即可用。
+            // [L1L2-SPLIT] 旗槽恒用 ring 索引（容量 256 不随数据槽扩容）。
+            *reinterpret_cast<volatile uint32_t*>(
+                S.bar_flags + S.slice_flags_idx +
+                (size_t)flag_slot * S.nslice_eff + slice) = gen;
+#ifndef PULL_FENCE_MIN
+            __threadfence();
+#endif
+        }
+        __syncthreads();
+        // 诊断：block0 首任务 DISPATCH 完成（分片旗已写）
+        if (kTick) S.pt[4] = clock64();
+        // ---- L1 入口 wait-all：一次等齐本窗全部分片就绪旗 ----
+        // 骨架结论：packed+配对下 wait-all 优于 K 循环内每步分片门；任务按窗口连续
+        // 编号，同窗全部 slice 旗由本窗 nslice_eff 个物理任务写满。
+        if (count > 0 && tid == 0) {
+            for (int s2 = 0; s2 < S.nslice_eff; ++s2) {
+                if (s2 == slice) continue;
+                long long spin = 0;
+                // [集71] wait-all（分片就绪旗）等待轮次
+                MX_CTR_ADD(S.ctr, kCtrWaitAllSlice, 1);
+                while (*(volatile const uint32_t*)(S.bar_flags +
+                                                   S.slice_flags_idx +
+                                                   (size_t)flag_slot *
+                                                       S.nslice_eff +
+                                                   s2) != gen) {
+                    if (++spin > S.max_spins) {
+                        if (S.dbg != nullptr) atomicAdd(S.dbg + 4, 1);
+                        break;
+                    }
+                }
+            }
+            __threadfence();
+        }
     }
     __syncthreads();
 }
@@ -1309,9 +1337,9 @@ __device__ R19_BIG_ATTR void r19_big_task(
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
     // [L1L2-SPLIT] L2 阶段不需要 fuse 上下文（R29 融合推送是 L2 段内的事，L1 不读）
     CombineFuseCtx fuse = R29TailFuse<TaskTail>::get(tail);
-    if constexpr (kPhase != MegaPhase::L2) {
-        r19_pull_flags(S, task, e, w, count, slice, epoch, pool_slot, pfx);
-    }
+    // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
+    //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
+    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx);
 #if R24_DIAG_PHASE
     const unsigned long long t_l1s = (tid == 0) ? clock64() : 0ull;
 #endif
@@ -1337,7 +1365,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 (size_t)(S.k_in / 32) * (size_t)S.mt_total * 512;
             const size_t f2sz =
                 (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
-            const size_t soff = (size_t)(e * S.ring + (w % S.ring));
+            const size_t soff = (size_t)pool_slot;   // [L1L2-SPLIT] 数据槽
             if (CM_FRAG_A) fbase = S.frag_a + soff * asz;
             if (CM_FRAG_L2 && CM_FRAG_F2) ffn2 = S.frag2 + soff * f2sz;
         }
@@ -1501,7 +1529,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
             const size_t f2sz =
                 (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
             if (CM_FRAG_A2)
-                f2 = S.frag2 + (size_t)(e * S.ring + (w % S.ring)) * f2sz;
+                f2 = S.frag2 + (size_t)pool_slot * f2sz;   // [L1L2-SPLIT] 数据槽
         }
         // [R24/R34] L2 A-smem 路径（同 L1：count>64 才走，≤64 保持回退）
         // [R35] 去掉 g_l2%R19_L2_BATCH==0 门控：奇数 g_l2（NSLICE=8 → 24/8=3）
@@ -1639,7 +1667,9 @@ __device__ R19_BIG_ATTR void r19_big_task(
         atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 1,
                   clock64() - t_l2s);
 #endif
-    r19_tail_common(S, tail, task, e, w, count, slice, epoch, pool_slot);
+    // [L1L2-SPLIT] COMBINE tail 依赖 L2 输出 → L1 阶段不执行
+    if constexpr (kPhase != MegaPhase::L1)
+        r19_tail_common(S, tail, task, e, w, count, slice, epoch, pool_slot);
 }
 // ============================================================================
 // 小 count（count<=kM）任务体：与基线逐字一致的热路径，独立 __noinline__
@@ -1655,9 +1685,9 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     const int warp = tid / 64;
     const int lane = tid % 64;
     (void)b_smem;
-    if constexpr (kPhase != MegaPhase::L2) {
-        r19_pull_flags(S, task, e, w, count, slice, epoch, pool_slot, pfx);
-    }
+    // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
+    //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
+    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx);
     // ---- L1：小 count 档位（与基线实例选择一致）----
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
@@ -1678,7 +1708,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         if (kFragNew) {
             const size_t asz = (size_t)(S.k_in / 32) * (size_t)S.mt_total * 512;
             const size_t f2sz = (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
-            const size_t soff = (size_t)(e * S.ring + (w % S.ring));
+            const size_t soff = (size_t)pool_slot;   // [L1L2-SPLIT] 数据槽
             if (CM_FRAG_A) fbase = S.frag_a + soff * asz;
             if (CM_FRAG_L2 && CM_FRAG_F2) ffn2 = S.frag2 + soff * f2sz;
         }
@@ -1723,7 +1753,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         if (CM_FRAG_L2 && S.frag_all && count > 0 && CM_FRAG_A2) {
             const size_t f2sz =
                 (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
-            f2 = S.frag2 + (size_t)(e * S.ring + (w % S.ring)) * f2sz;
+            f2 = S.frag2 + (size_t)pool_slot * f2sz;   // [L1L2-SPLIT] 数据槽
         }
 #define L2CALL(KB)                                                             \
     do {                                                                       \
@@ -1782,5 +1812,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     }
     }   // end if constexpr (kPhase != MegaPhase::L1)  —— L2 段（small）
     __syncthreads();
-    r19_tail_common(S, tail, task, e, w, count, slice, epoch, pool_slot);
+    // [L1L2-SPLIT] COMBINE tail 依赖 L2 输出 → L1 阶段不执行
+    if constexpr (kPhase != MegaPhase::L1)
+        r19_tail_common(S, tail, task, e, w, count, slice, epoch, pool_slot);
 }

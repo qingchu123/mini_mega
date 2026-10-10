@@ -638,3 +638,33 @@ torch 路径（cl_test，32 GPU）：未做性能测量，仅验证编译、建�
 - **top50**（TK 实录, win=128）：sum=**47497µs**，mean=**950µs**/launch。
 - L1 现状：大档 `r24<8,8,2>`；17–32 与 ≤16 用 `r19`（`89db243`/27f76f1）；全档 fragment（`27f76f1`）；生产 dispatch 无 paired（`e16637e`）。
 - 内核资源（`MT_DUMP_RES=1`）：**regs=256（顶格）、local≈2.5KB**（存在寄存器溢出；定位脚本见 `40136dc`）。降 acc 档位/预取对 regs/local 基本无影响；`__noinline__` 拆分反而增大 local。
+
+## [261010_2200] L1/L2 拆分 kernel（A/B 端到端）— 净回退，默认关闭
+
+> 动机：融合任务体 local≈2.5KB 溢出，猜想拆成「L1 kernel + L2 kernel」可让两段各自减负。
+> 实现：`MegaPhase{Both,L1,L2}` 模板，`MX_L1L2_SPLIT=1` 运行期切换（默认 0=原融合路径）。
+> L1 kernel = 完整前序(route/publish/xbar)+DISPATCH+L1；L2 kernel = 轻量前序(不 route/xbar/
+> task_setup)+静态任务划分+L2+COMBINE。每 round `current_time[0]`/`[1]` 各 +1（仅 L1 前序推进），
+> 数据槽改每窗口独占 `e*slot_win+w`（`slot_win=ceil(kMaxTPR/win_cap)`，缓冲复用现结构不加尺寸）。
+
+**正确性**（`check --smoke`，R=32）：两种模式均 **8/8 PASS**（eager + graph×1 + graph×50）。
+
+**性能 A/B**（`test/mybench`，R=32，nodes=20）：
+
+| 场景 | 融合基线 us_mean | 拆分 us_mean | 变化 |
+|---|---:|---:|---:|
+| 均衡 TPR=16 | 375.6 | 410.1 | +9.2% |
+| 均衡 TPR=32 | 669.7 | 725.5 | +8.3% |
+| 均衡 TPR=64 | 655.7 | 703.5 | +7.3% |
+| 均衡 TPR=128 | 1017.3 | 1094.8 | +7.6% |
+| 均衡 TPR=256 | 1888.6 | 2044.5 | +8.3% |
+| 均衡 TPR=512 | 3683.5 | 3932.2 | +6.8% |
+| TK top50 sum（2 次） | 113502 / 113524 | 116821 | +2.9% |
+
+**内核资源**（`MT_DUMP_RES=1`）：融合 `full` local=2544B；`L1full` local=1680B；`L2full`
+local=1984B —— 拆分确实降低了单核 local/栈，但两者仍 **regs=256** 且仍有溢出。
+
+**结论**：**拆分是净回退（均衡 +7~9%，TK +2.9%），已否决**。根因：融合的寄存器占用取 L1/L2
+较大者而非之和，local 下降不足以抵消「阶段间全局栅栏 → 失去窗口间 L1/L2 重叠 + 尾部等待」的损失。
+保留 `MX_L1L2_SPLIT` 仅作实验开关（默认关，零开销）。后续若再试，应先解决融合体溢出本身
+（如对齐 acc 生命周期），而非拆 kernel。

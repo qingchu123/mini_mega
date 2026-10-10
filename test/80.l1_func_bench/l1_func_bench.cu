@@ -154,6 +154,12 @@ __global__ void __launch_bounds__(512) k_disp(uint8_t* smem,const uint8_t* pool,
     else     dispatch_l1<false>(dyn,pool,w1,ffn,frag,count,mt_total,lane,warp,8);
     __syncthreads(); (void)smem;
 }
+// [R19 对照] r19_l1_big<4,2,4> 与 r24 同样经 dispatch 风格 kernel 启动（同 smem/同 launch）
+__global__ void __launch_bounds__(512) k_r19_disp(const uint8_t* pool,const uint8_t* frag,const uint8_t* w1,
+                                                  uint8_t* ffn,int mt_total,int count){
+    const int lane=threadIdx.x&63, warp=threadIdx.x>>6;
+    r19_l1_big<4,2,4>(pool,frag,mt_total,w1,0,count,kH,kN,kBN,lane,warp,8,nullptr,0,kGL1,ffn,nullptr,0,kI);
+}
 template<class F> static double timeit(F launch,int REP){
     mcStream_t st=nullptr; mcStreamCreate(&st);
     launch(st); mcStreamSynchronize(st);
@@ -173,13 +179,14 @@ int main(){
     mcMemset(pool,0x3c,poolB); mcMemset(w1,0x3c,w1B); mcMemset(frag,0x3c,fragB);
     const char* vn[9]={"paired<1>","paired<2>","r24<3,16>","r24<3,16>","r24<4,8>","r24<4,8>","r24<8,8>","r24<8,8>","r24<8,8>"};
     const int Ms[]={64,128,256,384,512};
-    printf("%-6s %-8s %-14s %-10s %-10s\n","M","mt","variant","frag","rowmajor");
+    printf("%-6s %-8s %-14s %-10s %-10s %-10s\n","M","mt","variant","frag","rowmajor","r19<4,2,4>");
     for(int M:Ms){int m=(M+15)/16;
       auto Lf=[&](mcStream_t st){ k_disp<<<32,512,65536,st>>>(nullptr,pool,w1,ffn,frag,M,mt,true);};
       auto Lb=[&](mcStream_t st){ if(M<256){k_r24_b1<16,4,8,2><<<32,512,69632,st>>>(frag,w1,M,mt,ffn);}
                                   else {k_r24_b1<16,4,16,2><<<32,512,69632,st>>>(frag,w1,M,mt,ffn);} };
       auto Lr=[&](mcStream_t st){ k_disp<<<32,512,65536,st>>>(nullptr,pool,w1,ffn,frag,M,mt,false);};
       int idx = M<=16?0 : M<=32?1 : M<=48?2 : M<=64?4 : 6;
-      printf("%-6d %-8d %-14s %-10.2f %-10.2f  b1(MT16,twopass)=%.2f\n",M,m,vn[idx],timeit(Lf,50),timeit(Lr,50),timeit(Lb,50));}
+      auto L19=[&](mcStream_t st){ k_r19_disp<<<32,512,0,st>>>(pool,frag,w1,ffn,mt,M);};
+      printf("%-6d %-8d %-14s %-10.2f %-10.2f %-10.2f  b1(MT16,twopass)=%.2f\n",M,m,vn[idx],timeit(Lf,50),timeit(Lr,50),timeit(L19,50),timeit(Lb,50));}
     return 0;
 }
