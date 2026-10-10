@@ -1326,7 +1326,8 @@ __device__ __forceinline__ void r19_tail_common(
 //   → L2（M 档位）→ tail。调用者（dispatch_pull_body 循环）只做领号/解码与
 //   任务尾 l2_done/processed 计数（与基线逐字一致）。
 // ============================================================================
-template <typename TaskTail, bool kFragCap = false, int kCap = 0>
+// [FRAG-ALWAYS] 去掉 kFragCap：fragment 分支恒编译（运行期按 frag_a/frag_all 决定）
+template <typename TaskTail, int kCap = 0>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,
@@ -1364,7 +1365,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
         // [R34] count<=32 不用 F/F2（小档 runtime M 裁剪，行主序直接算）
         const bool kFragOld = S.afrag_ok && count > 32 &&
                               S.ffn_hidden != nullptr;
-        const bool kFragNew = kFragCap && S.frag_all && count > 0;
+        const bool kFragNew = S.frag_all && count > 0;
         const uint8_t* fbase = nullptr;
         uint8_t* ffn2 = nullptr;
         if (kFragOld) {
@@ -1401,28 +1402,20 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk, g0_l1,
                 g_l1, ffn_slot, out_col_base, S.l1_k_out);
 #else
-            if constexpr (kFragCap) {
-                if (fbase != nullptr)
-                    l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 2,
-                                               CM_L1_BATCH, true>(
-                        pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
-                        S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                        g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
-                        fbase, S.mt_total, ffn2);
-                else
-                    l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 2,
-                                               CM_L1_BATCH, false>(
-                        pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
-                        S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                        g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
-                        nullptr, 0, ffn2);
-            } else {
+            if (fbase != nullptr)
+                l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 2,
+                                           CM_L1_BATCH, true>(
+                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                    S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                    g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
+                    fbase, S.mt_total, ffn2);
+            else
                 l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 2,
                                            CM_L1_BATCH, false>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
-                    lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                    out_col_base, S.l1_k_out, nullptr, nullptr, 0, ffn2);
-            }
+                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                    S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                    g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
+                    nullptr, 0, ffn2);
 #endif
         } else if (count <= 32 && g_l1 % 2 == 0 && g_l1 >= 2) {
             // [R35] NSLICE=8 等 g_l1=2 几何：单批 2 组小档（A 装载一遍、MT2
@@ -1454,28 +1447,20 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk, g0_l1,
                 g_l1, ffn_slot, out_col_base, S.l1_k_out);
 #else
-            if constexpr (kFragCap) {
-                if (fbase != nullptr)
-                    l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3,
-                                               CM_L1_BATCH, true>(
-                        pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
-                        S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                        g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
-                        fbase, S.mt_total, ffn2);
-                else
-                    l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3,
-                                               CM_L1_BATCH, false>(
-                        pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
-                        S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                        g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
-                        nullptr, 0, ffn2);
-            } else {
+            if (fbase != nullptr)
+                l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3,
+                                           CM_L1_BATCH, true>(
+                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                    S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                    g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
+                    fbase, S.mt_total, ffn2);
+            else
                 l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3,
                                            CM_L1_BATCH, false>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
-                    lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                    out_col_base, S.l1_k_out, nullptr, nullptr, 0, ffn2);
-            }
+                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
+                    S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                    g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
+                    nullptr, 0, ffn2);
 #endif
             }
         } else if (count <= 48 && g_l1 % 2 == 0 && g_l1 >= 2) {
@@ -1607,18 +1592,12 @@ __device__ R19_BIG_ATTR void r19_big_task(
         if (count <= 32 && g_l2 % 6 == 0) {
             // [R34] 同 L1：小档单批（A 只装一遍，B 一遍）
 #if CM_FRAG_L2
-            if constexpr (kFragCap) {
-                if (f2 != nullptr)
-                    l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, true>(
-                        ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
-                        S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
-                        g0_l2, g_l2, out_slot, S.l2_k_out, f2, S.mt_total);
-                else
-                    l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, false>(
-                        ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
-                        S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
-                        g0_l2, g_l2, out_slot, S.l2_k_out, nullptr, 0);
-            } else
+            if (f2 != nullptr)
+                l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, true>(
+                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
+                    S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
+                    g0_l2, g_l2, out_slot, S.l2_k_out, f2, S.mt_total);
+            else
 #endif
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, false>(
                     ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
@@ -1646,18 +1625,12 @@ __device__ R19_BIG_ATTR void r19_big_task(
 #endif
             if (!med_r24) {
 #if CM_FRAG_L2
-            if constexpr (kFragCap) {
-                if (f2 != nullptr)
-                    l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, true>(
-                        ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
-                        S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
-                        g0_l2, g_l2, out_slot, S.l2_k_out, f2, S.mt_total);
-                else
-                    l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, false>(
-                        ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
-                        S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
-                        g0_l2, g_l2, out_slot, S.l2_k_out, nullptr, 0);
-            } else
+            if (f2 != nullptr)
+                l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, true>(
+                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
+                    S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
+                    g0_l2, g_l2, out_slot, S.l2_k_out, f2, S.mt_total);
+            else
 #endif
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, false>(
                     ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
@@ -1738,7 +1711,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
 // 小 count（count<=kM）任务体：与基线逐字一致的热路径，独立 __noinline__
 // 声明以隔离大任务的寄存器分配（探针：空体调用点对 TPR=16 中性）。
 // ============================================================================
-template <typename TaskTail, bool kFragCap = false>
+template <typename TaskTail>
 __device__ R19_SMALL_ATTR void r19_small_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,

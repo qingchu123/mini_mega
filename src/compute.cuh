@@ -886,7 +886,7 @@ struct NoTaskTail {
 //   test/31.tpr16_regress/results.md）。由 host 在 slot_capacity<=kM 时选择该实例；
 //   语义要求 win_cap<=slot_capacity<=kM（此时 count>kM 分支恒不可达，协议不变）。
 template <typename TaskTail = NoTaskTail, bool kSmallOnly = false,
-          bool kFragCap = false, int kCap = 0>
+          int kCap = 0>
 __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* self, const ranks_data* remote, int cycle,
         uint8_t* const* peer_bases, int R, int rank,
@@ -1034,10 +1034,12 @@ __device__ __forceinline__ void dispatch_pull_body(
 #endif
     // [OPT-AFRAG] 多窗口 fragment：afrag_ok 不成立但 host 提供专用缓冲时启用，
     //   使 A/f2 装载走 4-line fragment 布局（替换多窗口的行主序散射装载）。
+    //   [FRAG-ALWAYS] 不再由 kFragCap 门控（fragment 分支恒编译），
+    //   仅按运行期缓冲/几何决定是否真走。
 #if defined(CM_NO_FRAGALL) || defined(NO_AFRAG)
     S.frag_all = false;
 #else
-    S.frag_all = kFragCap && (frag_a != nullptr) && (frag2 != nullptr) &&
+    S.frag_all = (frag_a != nullptr) && (frag2 != nullptr) &&
                  !S.afrag_ok && (l1_k_out > 0) && (mt_total > 0) &&
                  (win_cap > 0);
 #endif
@@ -1090,15 +1092,15 @@ __device__ __forceinline__ void dispatch_pull_body(
         // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
         // [R31] kSmallOnly 实例：大任务体不实例化（小核专用路径）
         if constexpr (kSmallOnly) {
-            r19_small_task<TaskTail, kFragCap>(S, task, e, w, count, slice,
+            r19_small_task<TaskTail>(S, task, e, w, count, slice,
                                                epoch, pool_slot, pfx, tail,
                                                a_smem, b_smem);
         } else if (count > kM) {
-            r19_big_task<TaskTail, kFragCap, kCap>(S, task, e, w, count, slice,
+            r19_big_task<TaskTail, kCap>(S, task, e, w, count, slice,
                                                      epoch, pool_slot, pfx, tail,
                                                      a_smem, b_smem);
         } else {
-            r19_small_task<TaskTail, kFragCap>(S, task, e, w, count, slice,
+            r19_small_task<TaskTail>(S, task, e, w, count, slice,
                                                epoch, pool_slot, pfx, tail,
                                                a_smem, b_smem);
         }

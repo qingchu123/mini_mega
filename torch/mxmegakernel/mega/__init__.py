@@ -194,7 +194,7 @@ class SymmBuffer:
         self.grid_num_tokens = int(grid_num_tokens if grid_num_tokens is not None
                                    else num_max_tokens_per_rank)
         self.launch_count = 0
-        # 逐 launch 配置缓存 (win_cap, use_frag)：eager 阶段按真实
+        # 逐 launch 配置缓存 (win_cap)：eager 阶段按真实
         # 路由计算，capture 阶段复用（graph 内无法做 host 同步）。
         self._launch_cfg = None
         self._capture_node = 0
@@ -297,16 +297,18 @@ class SymmBuffer:
 
     # ---------------------------------------------------------- 自适应发射配置
     def _select_adaptive_cfg(self, num_tokens: int):
-        """按真实路由选择本次 launch 的 (win_cap, use_frag)。
+        """按真实路由选择本次 launch 的 win_cap。
 
         与 C++ bench 的 tk 长尾判据逐式一致：
           imbalanced = max_expert >= 3 * max(1, median(nonzero counts))
           imbalanced: med>=32 → win=ceil(max/RING) else min(48, max)，
-                      再按 M tile 对齐；merge 不粗化；启用 A/f2 fragment。
-          否则：保持 AUTO 逻辑窗口 + 缺省粗化 + 不用 frag。
+                      再按 M tile 对齐；merge 不粗化。
+          否则：保持 AUTO 逻辑窗口 + 缺省粗化。
         只在非 capture 路径做 host 同步；capture 用缓存值（无则回退缺省）。
+
+        注：A/f2 fragment 缓冲已是 kernel 内部（rwk->ld），host 不再决策 use_frag。
         """
-        base = (int(self.expert_window), False)
+        base = int(self.expert_window)
         if num_tokens <= 0 or self.group is None or self.world_size <= 1:
             return base
         if os.environ.get("MXK_ADAPTIVE", "1") == "0":
@@ -343,26 +345,26 @@ class SymmBuffer:
                 if win < _WIN_ADAPT_MIN or win > hi:
                     self._launch_cfg = base
                     return base   # 放行区间为空：回退 base，不伪造 win
-                cfg = (win, True)
-                self._launch_cfg = cfg
-                return cfg
+                self._launch_cfg = win
+                return win
         except Exception:  # noqa: BLE001
             return base
         self._launch_cfg = base
         return base
 
     def launch_config(self, num_tokens: int):
-        """当前应使用的 (win_cap, use_frag, skip_prologue)。"""
+        """当前应使用的 (win_cap, skip_prologue)。"""
         capturing = _is_stream_capturing()
-        # 配置元组为 (win_cap, use_frag)；skip_prologue 由 capture 节点号决定。
+        # win_cap 每 launch 自适应（capture 复用缓存）；skip_prologue 由 capture 节点号决定。
         if capturing:
-            cfg = self._launch_cfg or (int(self.expert_window), False)
+            win = self._launch_cfg if self._launch_cfg is not None \
+                else int(self.expert_window)
             skip = 2 if (self.prologue_reuse and self._capture_node > 0) else 0
             self._capture_node += 1
-            return cfg[0], cfg[1], skip
+            return win, skip
         self._capture_node = 0
-        cfg = self._select_adaptive_cfg(int(num_tokens))
-        return cfg[0], cfg[1], 0
+        win = self._select_adaptive_cfg(int(num_tokens))
+        return win, 0
 
     def destroy(self):
         # C++ 统一释放 sym/rwk/unk/计算链缓冲，并关闭全部远端 IPC 句柄。
@@ -509,7 +511,7 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
                 f"expert_window={ew} 超出 [8, {sym_buffer.win_phys}]")
         sym_buffer.expert_window = ew
     # 逐 launch 配置：eager 按路由自适应，capture 复用缓存。
-    win_cap, use_frag, skip = sym_buffer.launch_config(num_tokens)
+    win_cap, skip = sym_buffer.launch_config(num_tokens)
     # 首次 launch 兜底预热（建档预热失败时）：捕获中禁止，避免捕获流阻塞。
     if not getattr(sym_buffer, "_mega_moe_warmed", False):
         sym_buffer._mega_moe_warmed = True
@@ -518,11 +520,11 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
                 _C.fp8_mega_moe(
                     sym_buffer._y_fp32, l1_weights.view(torch.uint8),
                     l2_weights.view(torch.uint8), sym_buffer._impl, num_tokens,
-                    clamp, int(sym_buffer.expert_window), False, 0)
+                    clamp, int(sym_buffer.expert_window), 0)
                 torch.cuda.synchronize()
     _C.fp8_mega_moe(sym_buffer._y_fp32, l1_weights.view(torch.uint8),
                     l2_weights.view(torch.uint8), sym_buffer._impl, num_tokens,
-                    clamp, win_cap, use_frag, skip)
+                    clamp, win_cap, skip)
     sym_buffer.launch_count += 1
     if num_tokens > 0:
         y.copy_(sym_buffer._y_fp32[:num_tokens].to(torch.bfloat16))

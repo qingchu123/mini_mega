@@ -87,10 +87,8 @@ struct MegaLaunchArgs {
     const uint8_t* w1 = nullptr;
     int l1_n_total = 0, l1_block_n = 0, l1_k_out = 0;
     uint8_t* ffn_hidden = nullptr;
-    // [OPT-AFRAG] 多窗口 A/f2 fragment 专用缓冲（[EPR*ring] 槽；每槽字节由
-    //   运行期 mt_total 决定）。nullptr = 关闭（回退行主序池路径）。
-    uint8_t* frag_a = nullptr;   // A 输入 fragment：[slot][(k_in/32)*mt_total*512]
-    uint8_t* frag2 = nullptr;    // L1 输出 fragment：[slot][(l1_k_out/32)*mt_total*512]
+    // [FRAG-INT] A/f2 fragment 缓冲为 kernel 内部（rwk->ld.frag_a/frag2），
+    //   host 不再传入。
     const uint8_t* w2 = nullptr;
     uint16_t* l2_out = nullptr;
     int l2_k_out = 0;

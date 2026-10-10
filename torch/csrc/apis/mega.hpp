@@ -26,7 +26,8 @@ namespace mxk {
 //   sym    ：对称区 FG（跨 rank 写），布局见 compute_symm_layout；
 //   rwk    ：本 rank 普通显存整块（rwk_data：lf + 内部 ld，kernel 读 lf/ld.route_slot_counts/prefix_tbl）；
 //   unk    ：本 rank FG 整块（unk_data：rf + rd，跨 rank 写；FG 失败回退普通显存）；
-//   ffn_hidden / l2_out / frag_a / frag2：计算链缓冲，按物理容量 win_alloc 分配（普通显存）。
+//   ffn_hidden / l2_out：计算链缓冲，按物理容量 win_alloc 分配（普通显存）。
+//   A/f2 fragment 缓冲改为 kernel 内部（rwk->ld），不在此分配。
 // 远端：export_ipc_handles() 产出 sym/unk 句柄；import_peers() 打开远端句柄并构造
 //   peer_bases（d_base_ptrs）与 unk_peers（d_unk_ptrs）设备表。
 // 生命周期：destroy_symm_buffer() 显式释放（不使用 take_ownership，避免 double free）。
@@ -48,10 +49,7 @@ struct SymmBuffer {
   int64_t ffn_hidden_bytes = 0;
   int64_t l2_out_bytes = 0;
 
-  // [OPT-AFRAG] 多窗口 A/f2 fragment 专用缓冲（[EPR*ring] 槽；win=物理容量）。
-  uint8_t* frag_a = nullptr;
-  uint8_t* frag2 = nullptr;
-
+  // [FRAG-INT] A/f2 fragment 缓冲为 kernel 内部（rwk->ld），torch 不再分配。
   int64_t launch_count = 0;
 };
 
@@ -66,8 +64,6 @@ inline void release_symm_buffer(SymmBuffer* b) {
     if (p) mcIpcCloseMemHandle(reinterpret_cast<void*>(p));
   }
   b->remote_ptrs.clear();
-  if (b->frag_a) mcFree(b->frag_a);
-  if (b->frag2) mcFree(b->frag2);
   if (b->l2_out) mcFree(b->l2_out);
   if (b->ffn_hidden) mcFree(b->ffn_hidden);
   if (b->d_unk_ptrs) mcFree(b->d_unk_ptrs);
@@ -75,7 +71,6 @@ inline void release_symm_buffer(SymmBuffer* b) {
   if (b->unk) mcFree(b->unk);
   if (b->rwk) mcFree(b->rwk);
   if (b->sym) mcFree(b->sym);
-  b->frag_a = b->frag2 = nullptr;
   b->l2_out = nullptr;
   b->ffn_hidden = nullptr;
   b->d_unk_ptrs = nullptr;
@@ -154,15 +149,7 @@ inline SymmBuffer* create_symm_buffer_owned(
         mcMemset(b->l2_out, 0, (size_t)b->l2_out_bytes) != mcSuccess) {
       throw std::runtime_error("create_symm_buffer: l2_out 分配失败");
     }
-    const int64_t mt_total = (win_alloc + 15) / 16;
-    const int64_t slots = b->epr * kMegaRing();
-    const int64_t a_bytes = (hidden / 32) * mt_total * 512;
-    const int64_t f2_bytes = (intermediate_hidden / 32) * mt_total * 512;
-    if (mt_total > 0 && slots > 0 &&
-        (mcMalloc((void**)&b->frag_a, (size_t)(slots * a_bytes)) != mcSuccess ||
-         mcMalloc((void**)&b->frag2, (size_t)(slots * f2_bytes)) != mcSuccess)) {
-      throw std::runtime_error("create_symm_buffer: frag 缓冲分配失败");
-    }
+    // [FRAG-INT] A/f2 fragment 缓冲改由 kernel 内部 rwk->ld 持有，torch 不再分配。
   } catch (...) {
     release_symm_buffer(b);
     delete b;
@@ -222,20 +209,18 @@ inline void destroy_symm_buffer(SymmBuffer* b) {
 
 
 // 用当前 SymmBuffer 构造一次发射入参（逐字段对齐 bench make_mega_args）。
-// win_cap/use_frag/skip_prologue 是逐 launch 决策（Python 侧自适应
+// win_cap/skip_prologue 是逐 launch 决策（Python 侧自适应
 // 或调用方显式指定）：win_cap=0 表示用物理容量 b.win；
-// 缺省粗化到单波（kMegaGrid）；use_frag 需要 frag 缓冲已分配。
+// 缺省粗化到单波（kMegaGrid）。
 inline fp8mega::MegaLaunchArgs make_mega_args(
     const SymmBuffer& b, float* y, int64_t num_tokens, const uint8_t* w1,
-    const uint8_t* w2, int64_t win_cap = 0,
-    bool use_frag = false, int64_t skip_prologue = 0) {
+    const uint8_t* w2, int64_t win_cap = 0, int64_t skip_prologue = 0) {
   namespace L = deep_gemm::layout;
   const int64_t wc = (win_cap > 0) ? win_cap : b.win;
   if (wc < 8 || wc > b.win || wc > 128) {
     throw std::runtime_error(
         "make_mega_args: win_cap 必须落在 [8, min(物理容量,128)]");
   }
-  const bool frag_ok = use_frag && b.frag_a != nullptr && b.frag2 != nullptr;
   fp8mega::MegaLaunchArgs a{};
   a.topk_idx = reinterpret_cast<const int64_t*>(b.sym + b.L.topk_idx_off);
   a.topk_idx_off = b.L.topk_idx_off;
@@ -280,8 +265,6 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
   a.l1_block_n = (int)kMegaBlockN();
   a.l1_k_out = (int)b.intermediate_hidden;
   a.ffn_hidden = b.ffn_hidden;
-  a.frag_a = frag_ok ? b.frag_a : nullptr;
-  a.frag2 = frag_ok ? b.frag2 : nullptr;
   a.w2 = w2;
   a.l2_out = b.l2_out;
   a.l2_k_out = (int)b.hidden;
@@ -298,7 +281,6 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
 inline void launch_fp8_mega_moe(SymmBuffer* b, float* y, const uint8_t* w1,
                                 const uint8_t* w2, int64_t num_tokens,
                                 void* stream, int64_t win_cap = 0,
-                                bool use_frag = false,
                                 int64_t skip_prologue = 0) {
   if (b == nullptr || y == nullptr || w1 == nullptr || w2 == nullptr) {
     throw std::runtime_error("launch_fp8_mega_moe: 入参为空");
@@ -307,8 +289,7 @@ inline void launch_fp8_mega_moe(SymmBuffer* b, float* y, const uint8_t* w1,
     throw std::runtime_error("launch_fp8_mega_moe: num_tokens 越界");
   }
   fp8mega::MegaLaunchArgs a =
-      make_mega_args(*b, y, num_tokens, w1, w2, win_cap, use_frag,
-                     skip_prologue);
+      make_mega_args(*b, y, num_tokens, w1, w2, win_cap, skip_prologue);
   mcStream_t st = reinterpret_cast<mcStream_t>(stream);
   if (num_tokens > 0) {
     fp8mega::launch_full(a, st);

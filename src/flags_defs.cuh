@@ -108,8 +108,11 @@ struct alignas(256) local_data {
     alignas(256) uint8_t w2[kEPR][kHidden][kIntermediate];
     alignas(256) uint8_t ffn_hidden[kEPR * kRing][kMaxTPR][kIntermediate];
     alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
-    // [冗余，暂注释] alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden/32) * ((kMaxTPR + 15) / 16) * 512];
-    // [冗余，暂注释] alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate/32) * ((kMaxTPR + 15) / 16) * 512];
+    // [FRAG-INT] A/f2 fragment 缓冲，纯 kernel 内部：由本结构体持有，kernel 从
+    //   rwk->ld 直接取基址，host/torch 不再传入。尺寸按 kMaxTPR 静态定（容量
+    //   上界，运行期实际用 ceil(win_cap/16) 列，只会更小）。
+    alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden / 32) * ((kMaxTPR + 15) / 16) * 512];
+    alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate / 32) * ((kMaxTPR + 15) / 16) * 512];
     alignas(256) float y[kMaxTPR][kHidden];
     // [冗余，暂注释] alignas(256) float ynode[kMaxTPR][kHidden];  // mega_common 另行分配 d.ynode
 };

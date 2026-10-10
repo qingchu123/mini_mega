@@ -184,7 +184,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp8_mega_moe",
         [](torch::Tensor y_fp32, torch::Tensor l1, torch::Tensor l2,
            mxk::SymmBuffer* buf, int64_t num_tokens, double activation_clamp,
-           int64_t win_cap, bool use_frag, int64_t skip_prologue) {
+           int64_t win_cap, int64_t skip_prologue) {
           TORCH_CHECK(y_fp32.is_cuda() &&
                           y_fp32.scalar_type() == torch::kFloat32,
                       "y_fp32 must be a CUDA float32 tensor");
@@ -198,12 +198,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           mxk::launch_fp8_mega_moe(buf, y_fp32.data_ptr<float>(),
                                    l1.data_ptr<uint8_t>(), l2.data_ptr<uint8_t>(),
                                    num_tokens, current_stream(), win_cap,
-                                   use_frag, skip_prologue);
+                                   skip_prologue);
         },
         py::arg("y_fp32"), py::arg("l1_weights"), py::arg("l2_weights"),
         py::arg("sym_buffer"), py::arg("num_tokens"),
         py::arg("activation_clamp") = 1e30, py::arg("win_cap") = 0,
-        py::arg("use_frag") = false,
         py::arg("skip_prologue") = 0);
 
   // ---------------- mini_mega kernel 探针 ----------------
