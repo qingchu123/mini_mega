@@ -158,14 +158,6 @@ constexpr int kNTilesPerWarp = 2;
 #ifndef CM_L2_PF
 #define CM_L2_PF 2
 #endif
-// [OPT-BSM] B 的 smem 异步流水级数（gvmcnt 最多 4 级；默认 2 保持静态 smem 不变）
-#ifndef CM_BR
-#define CM_BR 2
-#endif
-// [OPT-BSM] 开关：L1/L2 小任务体是否改走 B 的 smem 异步流水
-#ifndef CM_USE_BSM
-#define CM_USE_BSM 0
-#endif
 // [OPT-BPTR] B 装载指针强度削减：每次 k step 只 +1024B，去掉 64 位乘移
 #ifndef CM_BPTR
 #define CM_BPTR 1
@@ -173,18 +165,6 @@ constexpr int kNTilesPerWarp = 2;
 // [OPT-BPTR-L2] L2 的 B k=0 基址预计算（省去每次装载的 64bit 乘加寻址）
 #ifndef CM_BPTR_L2
 #define CM_BPTR_L2 0
-#endif
-// [OPT-SMALL-BSM] 小档 L1 的 B 走 smem 异步分级流水（kBR 级）
-#ifndef CM_SMALL_BSM
-#define CM_SMALL_BSM 0
-#endif
-#ifndef CM_SMALL_BR
-#define CM_SMALL_BR 2
-#endif
-// 小档 B 流水的 N 组批宽（stage 大小 = CM_SMALL_BATCH*8KB；须与 kernel.cuh 的
-// b 缓冲表达式中的 4 一致，改动时同步）
-#ifndef CM_SMALL_BATCH
-#define CM_SMALL_BATCH 4
 #endif
 // [OPT-AFRAG] 子开关（诊断用）
 #ifndef CM_FRAG_A
@@ -472,15 +452,16 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
 }
 
 // ============================================================================
-// [OPT-BSM] L1 B 经 smem 异步分级流水（kBR 级）：B 用 ldg_b128_bsm 深流水搬入
-//   smem，MMA 时 LDS 读取。消除寄存器预取深度限制（在飞 B 装载 = kBR*kBatch
-//   个 8KB stage），把权重 DRAM 延迟藏到 MMA 之后。A 仍直装。
-//   sbuf 布局：[kBR][kBatch][8 个 n-tile][1024B]；每题消费一 stage 后补发下一。
+// L2：N 组批量共享 A + lane 序 B，BF16 输出（K=I、N=H）
+//   A = ffn_hidden（L1 输出，FP8 行主序 [count][k_in]）、B = W2（lane 序 tile）。
+//   kBatch 个 N 组共享一份 a_pipe：A 装载次数 = kBatch 分之一。
 // ============================================================================
 // [微基准结论 · 261006] arrive(64+N) 的计数单位 = 每条 warp 级异步访存指令
 //   （bsm 拷贝与普通 ldg 共用该在飞计数，FIFO 完成）。N=0 全排空；N=k 允许 k 条
 //   在飞。bit6=0 的参数（如 4096）不构成等待。因此分级等待必须
 //   N = 当前 stage 之后的 stage 数 × 每 stage 的 bsm 指令条数（= kBatch）。
+// BSM L1 实现已移除：统一使用 paired/r24 路径。
+#if 0
 template <int kBatch>
 __device__ __forceinline__ void cm_bsm_wait(int stages_ahead) {
     switch (stages_ahead) {
@@ -709,6 +690,8 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_bsm(
         atomicAdd(prof, (unsigned long long)wsum);
 #endif
 }
+
+#endif
 
 // ============================================================================
 // L2：N 组批量共享 A + lane 序 B，BF16 输出（K=I、N=H）
@@ -1004,44 +987,14 @@ __device__ __forceinline__ void dispatch_pull_body(
     //   F 占 (k_in/32)*mt_total*512 字节、F2 占 (l1_k_out/32)*mt_total*512 字节，
     //   槽字节 = win_cap*l1_k_out。F 自 e*ring+1 起，F2 紧随其后（f2_slot）。
     const int mt_total = (win_cap + 15) >> 4;
-    const int64_t slot_bytes = (int64_t)win_cap * l1_k_out;
-    const int64_t f_bytes = (int64_t)(k_in / 32) * mt_total * 512;
-    const int64_t f2_bytes = (int64_t)(l1_k_out / 32) * mt_total * 512;
-    const int f_slots = (slot_bytes > 0)
-        ? (int)((f_bytes + slot_bytes - 1) / slot_bytes) : 0;
-    const int f2_slots = (slot_bytes > 0)
-        ? (int)((f2_bytes + slot_bytes - 1) / slot_bytes) : 0;
-    const bool afrag_fit = (l1_k_out > 0) && (slot_bytes > 0) &&
-                           (1 + f_slots + f2_slots <= ring);
     S.mt_total = mt_total;
-    S.f2_slot = 1 + f_slots;
-    // [R35] F_A/F2 启用条件放宽：原条件含"单波（total_tasks<=gridDim.x）"，
-    //   但 F 槽（e*ring+1 起）真正依赖的是"每 expert 恰好一窗"——与波数无关。
-    //   s_cum[kEPR]==kEPR 即每专家 ceil(count/win_cap)==1（单窗）。
-    //   多波安全性论证：
-    //   a) 任务号经 blockIdx/atomicAdd 连续递增发放 → 同窗 NS 个 slice 的 task id
-    //      连续，必被成组发放（先发满一窗再发下一窗），wait-all 不跨波悬挂 → 无死锁；
-    //   b) 各 expert 的 F 区互不重叠（e*ring+1），单窗下同 expert 无第二窗复用；
-    //   c) 同窗内 NS 个 slice 按 K 切片协作写同一 expert 的 F，wait-all 保证全部
-    //      K 片就绪后才消费。
-    //   放宽后 kNSlice*EPR>gridDim.x 的多波场景（如 NS=8：8 窗×8 片=64>32）也能走
-    //   A-fragment + async 快路径，不再回退 MT4 行主序慢路径。
-    const bool one_window_per_expert = (s_cum[kEPR] == kEPR);
-    S.afrag_ok = (ffn_hidden != nullptr) && (total_tasks <= (int)gridDim.x) &&
-                 one_window_per_expert && afrag_fit;
-#ifdef NO_AFRAG
-    S.afrag_ok = false;   // [诊断] 关闭 ffn_hidden 槽 A-fragment（L1 回行主序）
-#endif
-    // [OPT-AFRAG] 多窗口 fragment：afrag_ok 不成立但 host 提供专用缓冲时启用，
-    //   使 A/f2 装载走 4-line fragment 布局（替换多窗口的行主序散射装载）。
-    //   [FRAG-ALWAYS] 不再由 kFragCap 门控（fragment 分支恒编译），
-    //   仅按运行期缓冲/几何决定是否真走。
-#if defined(CM_NO_FRAGALL) || defined(NO_AFRAG)
+    // [FRAG-INT] A/f2 fragment 专用缓冲恒存在（local_data.frag_a/frag2，非 host 传入）。
+    //   取消 afrag_ok（借 ffn_hidden 空槽）路径：一律走专用缓冲，不再有 launch 级分支。
+#if defined(CM_NO_FRAGALL)
     S.frag_all = false;
 #else
     S.frag_all = (frag_a != nullptr) && (frag2 != nullptr) &&
-                 !S.afrag_ok && (l1_k_out > 0) && (mt_total > 0) &&
-                 (win_cap > 0);
+                 (l1_k_out > 0) && (mt_total > 0) && (win_cap > 0);
 #endif
     S.merge = merge;
     S.nslice_eff = nslice_eff;
