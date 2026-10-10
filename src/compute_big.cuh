@@ -134,6 +134,11 @@ struct R29TailFuseSet {
     static __device__ __forceinline__ void on(T&, const CombineFuseCtx&) {}
 };
 
+// [L1L2-SPLIT] 任务体阶段：拆成两个 kernel 时，L1 kernel 只跑 DISPATCH+L1，
+//   L2 kernel 只跑 L2+tail。kPhaseBoth = 原合并路径（行为逐字不变）。
+//   阶段判断全部用 if constexpr，编译期消除另一段 → 两 kernel 寄存器/栈独立。
+enum class MegaPhase : int { Both = 0, L1 = 1, L2 = 2 };
+
 // 大路径函数属性：默认 __noinline__（独立寄存器分配）；可用宏切换实验。
 #ifndef R19_BIG_ATTR
 #define R19_BIG_ATTR __noinline__
@@ -1284,7 +1289,9 @@ __device__ __forceinline__ void r19_tail_common(
 //   任务尾 l2_done/processed 计数（与基线逐字一致）。
 // ============================================================================
 // [FRAG-ALWAYS] 去掉 kFragCap：fragment 分支恒编译（运行期按 frag_a/frag_all 决定）
-template <typename TaskTail, int kCap = 0>
+// [L1L2-SPLIT] kPhase：Both=原合并任务体；L1=只跑 DISPATCH+L1（L2/tail 编译期
+//   消除）；L2=只跑 L2+tail（DISPATCH/pull/L1 编译期消除）。
+template <typename TaskTail, int kCap = 0, MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,
@@ -1300,13 +1307,16 @@ __device__ R19_BIG_ATTR void r19_big_task(
     //   count<=64、寄存器预算有裕量；均衡大档（kCap=0）保持 2，避免 TPR=256 回退。
     constexpr int kR24BPF = (kCap > 0) ? 4 : R24_BPF;
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
-    // [R29] 融合推送上下文（capable=tail 支持；on 在本任务 L2 段按条件激活）
+    // [L1L2-SPLIT] L2 阶段不需要 fuse 上下文（R29 融合推送是 L2 段内的事，L1 不读）
     CombineFuseCtx fuse = R29TailFuse<TaskTail>::get(tail);
-    r19_pull_flags(S, task, e, w, count, slice, epoch, pool_slot, pfx);
+    if constexpr (kPhase != MegaPhase::L2) {
+        r19_pull_flags(S, task, e, w, count, slice, epoch, pool_slot, pfx);
+    }
 #if R24_DIAG_PHASE
     const unsigned long long t_l1s = (tid == 0) ? clock64() : 0ull;
 #endif
     // ---- L1：M 档位（kMT 个 16 行 tile 共享 B 一遍）----
+    if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
     const uint8_t* pool_w = pool + (size_t)pool_slot * S.pool_stride * S.k_in;
     const int g_l1 = (S.l1_n_total / S.l1_block_n) / S.nslice_eff;
@@ -1455,17 +1465,23 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
-    }
+    }   // end if (CM_L1_GATE)
+    }   // end if constexpr (kPhase != MegaPhase::L2)  —— L1 段
 #if R24_DIAG_PHASE
     if (tid == 0)
         atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8,
                   clock64() - t_l1s);
 #endif
-    r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
+    // [L1L2-SPLIT] l1_prog 发布+等待是合并路径内的 L1→L2 依赖。拆分后由
+    //   L1 kernel 的 slice_flags + kernel 边界保证 → 编译期跳过。
+    if constexpr (kPhase == MegaPhase::Both) {
+        r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
+    }   // end if constexpr (kPhase == MegaPhase::Both)
 #if R24_DIAG_PHASE
     const unsigned long long t_l2s = (tid == 0) ? clock64() : 0ull;
 #endif
     // ---- L2：M 档位（K=I、N=H），BF16 写每块 staging 槽 ----
+    if constexpr (kPhase != MegaPhase::L1) {
     const int g_l2 = (S.l2_k_out / S.l1_block_n) / S.nslice_eff;
     const int g0_l2 = slice * g_l2;
     // [集71] L2 阶段执行次数（count>0 的任务，tid0 计一次）
@@ -1615,7 +1631,8 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 ffn_slot, f2, S.mt_total, w2_e, count, S.l1_k_out,
                 S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
                 g0_l2, g_l2, out_slot, S.l2_k_out);
-    }
+    }   // end if (CM_L2_GATE)
+    }   // end if constexpr (kPhase != MegaPhase::L1)  —— L2 段
     __syncthreads();
 #if R24_DIAG_PHASE
     if (tid == 0)
@@ -1624,12 +1641,12 @@ __device__ R19_BIG_ATTR void r19_big_task(
 #endif
     r19_tail_common(S, tail, task, e, w, count, slice, epoch, pool_slot);
 }
-
 // ============================================================================
 // 小 count（count<=kM）任务体：与基线逐字一致的热路径，独立 __noinline__
 // 声明以隔离大任务的寄存器分配（探针：空体调用点对 TPR=16 中性）。
 // ============================================================================
-template <typename TaskTail>
+// [L1L2-SPLIT] 同 r19_big_task：kPhase 控制任务体的阶段范围（Both/L1/L2）。
+template <typename TaskTail, MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_SMALL_ATTR void r19_small_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,
@@ -1638,8 +1655,11 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     const int warp = tid / 64;
     const int lane = tid % 64;
     (void)b_smem;
-    r19_pull_flags(S, task, e, w, count, slice, epoch, pool_slot, pfx);
+    if constexpr (kPhase != MegaPhase::L2) {
+        r19_pull_flags(S, task, e, w, count, slice, epoch, pool_slot, pfx);
+    }
     // ---- L1：小 count 档位（与基线实例选择一致）----
+    if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
     const uint8_t* pool_w = pool + (size_t)pool_slot * S.pool_stride * S.k_in;
     const int g_l1 = (S.l1_n_total / S.l1_block_n) / S.nslice_eff;
@@ -1678,9 +1698,13 @@ __device__ R19_SMALL_ATTR void r19_small_task(
                 pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
-    }
-    r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
+    }   // end if (CM_L1_GATE)
+    }   // end if constexpr (kPhase != MegaPhase::L2)  —— L1 段（small）
+    if constexpr (kPhase == MegaPhase::Both) {
+        r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
+    }   // end if constexpr (kPhase == MegaPhase::Both)
     // ---- L2：小 count（与基线实例选择一致）----
+    if constexpr (kPhase != MegaPhase::L1) {
     const int g_l2 = (S.l2_k_out / S.l1_block_n) / S.nslice_eff;
     const int g0_l2 = slice * g_l2;
     // [集71] L2 阶段执行次数（count>0 的任务，tid0 计一次）
@@ -1756,6 +1780,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         }
 #undef L2CALL
     }
+    }   // end if constexpr (kPhase != MegaPhase::L1)  —— L2 段（small）
     __syncthreads();
     r19_tail_common(S, tail, task, e, w, count, slice, epoch, pool_slot);
 }
