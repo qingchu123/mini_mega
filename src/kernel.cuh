@@ -24,57 +24,64 @@ __global__ void __launch_bounds__(1024) mega_empty_kernel() {}
 // ---------------------------------------------------------------- 主 kernel --
 // host -> device 参数（按值传结构体；全部为 POD）
 struct MegaArgs {
-    // ============================================================ 维度 / 容量
+    // ======================================================================
+    // [1] grid 规划：决定 block/任务划分与行 stride 的几何量
+    // ======================================================================
     int R, rank;               // rank 数 / 本 rank 号
     int tokens;                // 实际 token 数（<= slot_capacity）
     int slot_capacity;         // 专家 token 容量（= max_tokens；= src_index_table 行容量）
     int win_cap;               // 窗口容量（窗口划分 / pool / staging / ffn / l2 行 stride）
-    // 已内联为常量的字段（原为运行期传参，本子集固定）：
+    // 已内联常量（原运行期传参，本子集固定）：
     //   k_in=kHidden、topk=kTopk、ring=kRing、l1_block_n=kL1BlockN、
     //   l1_n_total=2*l1_k_out、tbl_cap=slot_capacity、pool_stride=win_cap、
     //   publish_epoch=kPublishEpoch、recv_stride=kRecvStride
 
-    // ============================================================ 对称区 / 结构体
-    const uint8_t* self;          // 本 rank 对称区基址
-    uint8_t* const* peer_bases;   // 各 rank 对称区基址表（拉 x / weights；设备数组，含 self）
+    // ======================================================================
+    // [2] 调用入参：结构体/缓冲指针、偏移、flag 索引
+    // ======================================================================
+    // -- 结构体指针 --
+    rwk_data* rwk;                // 本 rank 普通显存整块（lf + ld）
     unk_data* unk;                // 本 rank FG 整块（rf + rd；= unk_peers[rank]）
     unk_data* const* unk_peers;   // 各 rank unk 基址表（设备数组，含 self）
-    rwk_data* rwk;                // 本 rank 普通显存整块（lf + ld）
-
-    // ============================================================ 前序
+    // -- 对称区 / 输入 --
+    const uint8_t* self;          // 本 rank 对称区基址
+    uint8_t* const* peer_bases;   // 各 rank 对称区基址表（拉 x / weights）
     const int64_t* topk_idx;      // 本 rank 输入路由（对称区内视图）
-    int64_t rsc_off, prefix_off;  // route_slot_counts / prefix_tbl 在 self 内的偏移
-
-    // ============================================================ flag 索引
-    // 由 layout 头经 host 传入（kernel 不 include 该布局头，见 flags.cuh 说明）
-    int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
-    int64_t slice_flags_idx, l1_prog_idx;
-
-    // ============================================================ 控制 / 复位
-    int max_spins;                // 各同步门的自旋上限
-    int skip_prologue;            // [R38] 前序复用：0 完整，1 复用（见 kernel.cuh 说明）
-    uint8_t* pool_ptr;            // [A-RWK] pool 独立缓冲基址（nullptr → self+pool_off）
-    int* prefix_ptr;              // 可选独立前缀表缓冲（nullptr → self+prefix_off）
-
-    // ============================================================ self / peer 偏移
+    // -- 可选独立缓冲（nullptr → self 内对应偏移）--
+    uint8_t* pool_ptr;            // [A-RWK] pool 缓冲（→ Self+pool_off）
+    int* prefix_ptr;              // 前缀表缓冲（→ self+prefix_off）
+    // -- 前序 / 收尾偏移（self 内）--
+    int64_t rsc_off, prefix_off;  // route_slot_counts / prefix_tbl
+    // -- 数据缓冲偏移（self / peer sym 内）--
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
-
-    // ============================================================ 计算链
+    int64_t combine_rows_off;     // 目标 rank combine_rows（BF16，<0 关闭 COMBINE）
+    // -- 计算链缓冲 --
     int l1_k_out;                 // L1 输出隐藏维 I（l1_n_total 由 2*l1_k_out 派生）
     int l2_k_out;                 // L2 输出维 H
-    const uint8_t* w1;            // [EPR][2I][H] lane 序 packed tile（gate/up 配对布局）
+    const uint8_t* w1;            // [EPR][2I][H] lane 序 packed tile（gate/up 配对）
     const uint8_t* w2;            // [EPR][H][I] lane 序 packed tile
     uint8_t* ffn_hidden;          // [EPR][ring][win_cap][I] FP8
     uint16_t* l2_out;             // [kGrid][win_cap][H] BF16
-    // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）已迁入
-    //   local_flags（lf->...），此处不再持有独立指针。
+    // -- flag 索引（layout 头经 host 传入；kernel 不 include 该头）--
+    int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
+    int64_t slice_flags_idx, l1_prog_idx;
 
-    // ============================================================ 收尾
-    int64_t combine_rows_off;     // 目标 rank combine_rows 区偏移（BF16，<0 关闭 COMBINE）
+    // ======================================================================
+    // [3] 输出
+    // ======================================================================
+    // 本 kernel（mega_kernel）不写最终 y；y 由 REDUCE 经 host 侧指针写出。
 
-    // ============================================================ 诊断（MX_DBG_COUNT）
-    // 条件编译：关闭态 MegaArgs 的布局/大小与改造前逐字节一致
-    // （已用 .mc_fatbin md5 对比验证，见 test/71.kernel_exec_count/results.md）。
+    // ======================================================================
+    // [4] 性能调优参数
+    // ======================================================================
+    int max_spins;                // 各同步门的自旋上限
+    int skip_prologue;            // [R38] 前序复用：0 完整，>0 复用（见 kernel.cuh 说明）
+
+    // ======================================================================
+    // [5] 调试 / debug（MX_DBG_COUNT，编译期默认关）
+    // ======================================================================
+    // （控制/诊断状态 out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk
+    //   已迁入 local_flags（lf->...），不在此结构体。）
 #if MX_DBG_COUNT
     unsigned long long* exec_ctr;  // [kExecCtrSlots] 各计数槽（nullptr = 不统计）
     int dbg_count;                 // 运行期开关（host 读 env MXKERNEL_COUNT 填入）

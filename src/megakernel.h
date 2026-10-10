@@ -52,47 +52,62 @@ namespace fp8mega {
 // 一次 launch 的全部 host 入参（POD）。字段与 kernel 侧 MegaArgs 一一对应；
 // 额外带 grid/threads/smem（发射几何，host_layout 计算）与 y（REDUCE 输出）。
 struct MegaLaunchArgs {
-    // ---- 前序 ----
-    const int64_t* topk_idx = nullptr;   // 本 rank 输入路由
-    const uint8_t* self = nullptr;       // 本 rank 对称区基址
+    // ======================================================================
+    // [1] grid 规划：发射几何（grid/threads/smem）与任务划分量
+    // ======================================================================
+    int R = 0, rank = 0;         // rank 数 / 本 rank 号
+    int tokens = 0;              // 实际 token 数
+    int slot_capacity = 0;       // 专家 token 容量（= max_tokens）
+    int win_cap = 0;             // 窗口容量（窗口划分 / pool / staging / ffn / l2 行 stride）
+    int grid = 0, threads = 0;   // 发射几何（host 侧，设备不读）
+    int64_t smem = 0;
+
+    // ======================================================================
+    // [2] 调用入参：结构体/缓冲指针、偏移、flag 索引
+    // ======================================================================
+    // -- 结构体指针 --
+    rwk_data* rwk = nullptr;               // 本 rank 普通显存整块（lf + ld）
+    unk_data* unk = nullptr;               // 本 rank FG 整块（rf + rd）
+    unk_data* const* unk_peers = nullptr;  // 各 rank unk 基址表（设备数组）
+    // -- 对称区 / 输入 --
+    const uint8_t* self = nullptr;         // 本 rank 对称区基址
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址表（设备数组）
-    int R = 0, rank = 0;
-    int tokens = 0;          // 实际 token 数
-    int slot_capacity = 0;   // 专家 token 容量
-    int win_cap = 0;         // 窗口容量（窗口划分 / pool / staging / ffn / l2 行 stride）
+    const int64_t* topk_idx = nullptr;     // 本 rank 输入路由
+    // -- 可选独立缓冲（nullptr → self 内对应偏移）--
+    uint8_t* pool_ptr = nullptr;           // [A-RWK] pool 缓冲
+    int* prefix_ptr = nullptr;             // 前缀表缓冲
+    // -- 前序 / REDUCE 偏移（self 内）--
     int64_t rsc_off = 0, prefix_off = 0;
-    // [步骤2a] 结构体指针：rwk = 本 rank 普通显存整块（lf + ld）；
-    //          unk = 本 rank FG 整块（rf + rd）；unk_peers = 各 rank unk 基址表。
-    rwk_data* rwk = nullptr;
-    unk_data* unk = nullptr;
-    unk_data* const* unk_peers = nullptr;
+    int64_t topk_idx_off = 0;              // REDUCE：self + topk_idx_off = topk_idx 基址
+    // -- 数据缓冲偏移（self / peer sym 内）--
+    int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;
+    int64_t combine_rows_off = -1;         // combine_rows（BF16）；<0 关闭 COMBINE
+    // -- 计算链缓冲 --
+    const uint8_t* w1 = nullptr;
+    const uint8_t* w2 = nullptr;
+    uint8_t* ffn_hidden = nullptr;         // [FRAG-INT] frag 缓冲为 kernel 内部（rwk->ld）
+    uint16_t* l2_out = nullptr;
+    int l1_k_out = 0;                      // L1 输出隐藏维 I（l1_n_total/l1_block_n 为常量）
+    int l2_k_out = 0;                      // L2 输出维 H
+    // -- flag 索引（layout 头）--
     int64_t xrelease_idx = 0, task_ready_idx = 0, task_counter_idx = 0,
             l2_done_idx = 0, slice_flags_idx = 0, l1_prog_idx = 0;
-    int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;
-    // [A-RWK] pool 独立缓冲（普通显存 mcMalloc）；nullptr → 仍用 sym+pool_off
-    uint8_t* pool_ptr = nullptr;
-    // 控制/诊断（out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk）
-    // 已迁入 local_flags（lf->...）。
-    int max_spins = 0;
-    int skip_prologue = 0;  // [R38] >0=复用前序（同 graph 非首节点；见 kernel.cuh）
-    int* prefix_ptr = nullptr;
-    // ---- 计算链 ----
-    const uint8_t* w1 = nullptr;
-    int l1_k_out = 0;        // L1 输出隐藏维 I（l1_n_total/l1_block_n 为常量）
-    uint8_t* ffn_hidden = nullptr;
-    // [FRAG-INT] A/f2 fragment 缓冲为 kernel 内部（rwk->ld.frag_a/frag2），
-    //   host 不再传入。
-    const uint8_t* w2 = nullptr;
-    uint16_t* l2_out = nullptr;
-    int l2_k_out = 0;
-    // ---- 收尾 ----
-    int64_t topk_idx_off = 0;    // REDUCE 用：self + topk_idx_off = topk_idx 基址
-    int64_t combine_rows_off = -1;  // combine_rows（BF16）区偏移（留在 sym）
-    // ---- REDUCE 输出 + 发射几何（host 侧，设备不读）----
-    float* y = nullptr;
-    int grid = 0;
-    int threads = 0;
-    int64_t smem = 0;
+
+    // ======================================================================
+    // [3] 输出
+    // ======================================================================
+    float* y = nullptr;          // [tokens][kHidden] FP32（REDUCE 写）
+
+    // ======================================================================
+    // [4] 性能调优参数
+    // ======================================================================
+    int max_spins = 0;           // 各同步门的自旋上限
+    int skip_prologue = 0;       // [R38] >0=复用前序（同 graph 非首节点；见 kernel.cuh）
+
+    // ======================================================================
+    // [5] 调试 / debug
+    // ======================================================================
+    // （当前无专用字段；运行期计数缓冲经 MegaArgs 的 MX_DBG_COUNT 通道。）
 };
 
 // 仅前序（mega_kernel<false, NoTaskTail>）
