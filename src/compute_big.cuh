@@ -1657,10 +1657,11 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         // 均衡场景 g_l1=4：一次 K 循环处理全部 4 组（A 装载减半）；
         // kPrefetch=2 是为把 32 个 B fragment 槽控制在寄存器预算内。
         if (g_l1 % 4 == 0) {
-            l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 1, CM_L1_BATCH>(
-                pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
-                lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                out_col_base, S.l1_k_out, nullptr);
+            // count<=16（热路径）档切 r19<1,2,4>：与 17-32 的 r19 统一，实测中性
+            r19_l1_big<1, R19_L1_PF, 4>(
+                pool_w, nullptr, S.mt_total, S.w1, e, count, S.k_in,
+                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, nullptr, out_col_base, S.l1_k_out);
         } else
             l1_gemm_swiglu_body_paired<4, kNTilesPerWarp, 1, 2>(
                 pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
