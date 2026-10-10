@@ -1352,16 +1352,10 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // [R35] NSLICE=8 等 g_l1=2 几何：单批 2 组小档（A 装载一遍、MT2
             //   runtime 裁剪），与 NSLICE=4 的 <2,kNT,2,4> 同构按比例缩小；
             //   避免落入 r19_l1_big<4,...> 的 MT4 档（A 读 2× + M 空转）。
-            if (fbase != nullptr)
-                l1_gemm_swiglu_body_paired<2, kNTilesPerWarp, 2, 2, true>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
-                    lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                    out_col_base, S.l1_k_out, nullptr, fbase, S.mt_total, ffn2);
-            else
-                l1_gemm_swiglu_body_paired<2, kNTilesPerWarp, 2, 2, false>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
-                    lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                    out_col_base, S.l1_k_out, nullptr);
+            r19_l1_big<4, R19_L1_PF, 2>(
+                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
+                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
         } else if (count <= 48 && g_l1 % 4 == 0) {
             // [OPT-33] 33..48 档：MT3（恰好 ceil(count/16)=3 个 tile），acc 比
             //   MT4 小（[4][3][2] → [4][3][2] 不变，但省 1 个 M tile 的寄存器/
@@ -1378,34 +1372,18 @@ __device__ R19_BIG_ATTR void r19_big_task(
             }
 #endif
             if (!med_r24) {
-            if (fbase != nullptr)
-                l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3,
-                                           CM_L1_BATCH, true>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
-                    S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                    g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
-                    fbase, S.mt_total, ffn2);
-            else
-                l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3,
-                                           CM_L1_BATCH, false>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
-                    S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                    g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
-                    nullptr, 0, ffn2);
+                r19_l1_big<3, R19_L1_PF, 4>(
+                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
+                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
             }
         } else if (count <= 48 && g_l1 % 2 == 0 && g_l1 >= 2) {
             // [OPT-NS8] NSLICE=8 时 g_l1=2：33..48 档用 MT3/B2（A 装一遍、
             //   runtime M 裁剪），避免落入 r19_l1_big<4,...> 的 MT4 慢档。
-            if (fbase != nullptr)
-                l1_gemm_swiglu_body_paired<2, kNTilesPerWarp, 3, 2, true>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
-                    lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                    out_col_base, S.l1_k_out, nullptr, fbase, S.mt_total, ffn2);
-            else
-                l1_gemm_swiglu_body_paired<2, kNTilesPerWarp, 3, 2, false>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n,
-                    lane, warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                    out_col_base, S.l1_k_out, nullptr);
+            r19_l1_big<3, R19_L1_PF, 2>(
+                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
+                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
         } else if (count > 48 && count <= 64 && fbase != nullptr &&
                    (count % (4 * kM) == 0) &&
                    ((S.k_in / 32) % R24_KS == 0)) {
@@ -1419,11 +1397,10 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // [OPT-TK-CAP48] win_cap<=48：count<=48，上述小/中档分支对生产
             //   g_l1 几何恒命中；此处仅为兜底（保持正确），用已实例化的 paired
             //   MT3 替换 r19_l1_big<4> 重档 → 不实例化大 GEMM（省寄存器/栈）。
-            l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 3, CM_L1_BATCH,
-                                       false>(
-                pool_w, S.w1, e, count, S.k_in, S.l1_n_total, S.l1_block_n, lane,
-                warp, kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot,
-                out_col_base, S.l1_k_out, nullptr, nullptr, 0, ffn2);
+            r19_l1_big<3, R19_L1_PF, 4>(
+                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
+                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
         } else if constexpr (kCap64) {
             // [OPT-TK-CAP64] cap64 变体：count<=64，MT8 异步档不可达 → 直接
             //   走固定 MT4 回退；if constexpr 保证不实例化 MT8 模板（不占栈）。
