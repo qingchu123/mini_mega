@@ -7,6 +7,9 @@
 /test/check
 /test/mybench
 /test/megakernel.so
+# 微基准/实验二进制
+/test/78.l1_mma_micro/l1_mma_micro
+/test/79.l1_gemm_best/l1_gemm_best
 .opencode/
 .deep-copilot/
 
