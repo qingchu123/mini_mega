@@ -170,8 +170,13 @@ int main(int argc, char** argv) {
     int max_tokens = o.max_tokens;
     for (const auto& s : specs) max_tokens = std::max(max_tokens, s.tokens);
     int win_global = 0;
+    // [实验] MT_FORCE_WIN=N：强制所有用例的窗口容量为 N（扫固定 win 用）。
+    const char* fwin = std::getenv("MT_FORCE_WIN");
+    const int fwin_val = fwin ? std::atoi(fwin) : 0;
     for (auto& s : specs) {
-        s.win = mt::choose_win_cap_counts(s.per_expert, max_tokens);
+        s.win = (fwin_val > 0)
+                    ? fwin_val
+                    : mt::choose_win_cap_counts(s.per_expert, max_tokens);
         win_global = std::max(win_global, s.win);
     }
     const mt::Geo geo = mt::make_geo(R, max_tokens, win_global);
