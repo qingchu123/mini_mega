@@ -297,8 +297,11 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
             if (ffn_d[i] != 0) ++nz0;
         if (nz0 < (long long)(rows * kIntermediate) / 2) {
             const int slot = ex * kRing;   // 窗口 0 → frag2 槽 e*ring+0
+            // frag2 槽字节 = (kIntermediate/32)*mt*512（mt=ceil(win/16)），与内核 f2sz 一致；
+            // 不能用 frag2[slot]（其 stride 基于 kMaxTPR=512，win<512 时会错位）。
+            const size_t f2sz = (size_t)(kIntermediate / 32) * (size_t)mt * 512;
             std::vector<uint8_t> f2((size_t)win * kIntermediate);
-            CHECK(mcMemcpy(f2.data(), &e.d.ld->frag2[slot][0],
+            CHECK(mcMemcpy(f2.data(), &e.d.ld->frag2[0][0] + (size_t)slot * f2sz,
                            f2.size(), mcMemcpyDeviceToHost));
             for (int r = 0; r < rows; ++r)
                 for (int c = 0; c < kIntermediate; ++c)
@@ -818,6 +821,7 @@ int main(int argc, char** argv) {
         plan.push_back({mt::tk_spec(*c0), Flags{true, true, 1}});
         plan.push_back({mt::tk_spec(*c0), Flags{false, true, graph_nodes}});
         plan.push_back({mt::balanced_spec(R, 16), Flags{false, true, graph_nodes}});
+        plan.push_back({mt::balanced_spec(R, 128), Flags{false, true, graph_nodes}});
     }
     if (all) {
         // --tprs 子集：仍自动包含 TPR=512，保证 max_tokens=512 的全局布局与全量一致
