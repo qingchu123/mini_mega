@@ -6,18 +6,17 @@
 // empty_kernel_bench.cu 的对应实现（行号见各函数注释），仅做参数化适配。
 //
 // 导出函数签名与语义：
-//   1) void route_build_body(const int64_t* __restrict__ topk_idx,
-//                            uint8_t* const* peer_bases, int R, int rank,
-//                            int tokens, int slot_capacity, int64_t src_off,
-//                            int64_t rsc_off, int tid_base = 0, int smem_off = 0);
+//   1) void route_build_body(const int64_t* __restrict__ topk_idx, int* rsc_ptr,
+//                            unk_data* const* unk_peers, int cycle, int R,
+//                            int rank, int tokens, int slot_capacity,
+//                            int tid_base = 0, int smem_off = 0);
 //      ROUTE_BUILD（仅 block0，bench:190-224）：smem 占槽（atomicAdd）后逐 pair
 //      4B __stwt 远端散写 src_index_table[le][rank][slot]（encoded = idx，
 //      即 token*topk + k）；非法 ID/超容量丢弃；本地 route_slot_counts[e] =
 //      min(slots[e], slot_capacity)。[P8]：生产路径写收敛到 warp0，尾 fence 由
 //      xbar 的 release fence 承接（见下）；tid_base≠0 保留原全线程 + 尾 fence。
-//   2) void publish_counts_body(const uint8_t* self, uint8_t* const* peer_bases,
-//                               int R, int rank, int64_t rsc_off,
-//                               int64_t recv_off, unsigned epoch,
+//   2) void publish_counts_body(const int* rsc_ptr, unk_data* const* unk_peers,
+//                               int cycle, int R, int rank, unsigned epoch,
 //                               int recv_stride = 12, int tid_base = 0);
 //      PUBLISH_COUNTS（仅 block0，bench:229-255）：把本 rank 每专家发送计数
 //      __stwt 到目标 rank 的 expert_recv_counts[rank][le]（行=源 rank，宽 12 word）；
@@ -103,8 +102,8 @@
 // ---------------------------------------------------------------- ROUTE_BUILD --
 // 骨架 bench:190-224 逐条移植（仅 block0 调用；tid_base/smem_off 供 WS 子集）。
 __device__ __forceinline__ void route_build_body(
-        const int64_t* __restrict__ topk_idx, const uint8_t* self,
-        int* rsc_ptr, int64_t rsc_off, unk_data* const* unk_peers,
+        const int64_t* __restrict__ topk_idx,
+        int* rsc_ptr, unk_data* const* unk_peers,
         int cycle, int R, int rank, int tokens, int slot_capacity,
         int tid_base = 0, int smem_off = 0,
         unsigned long long* ctr = nullptr) {
@@ -195,9 +194,8 @@ __device__ __forceinline__ void route_build_body(
         __threadfence_system();
     }
     __syncthreads();
-    int* rsc = (rsc_ptr != nullptr)
-                   ? rsc_ptr
-                   : reinterpret_cast<int*>(const_cast<uint8_t*>(self) + rsc_off);
+    // rsc_ptr 必为非空（调用方传 &rwk->ld.route_slot_counts[0]）
+    int* rsc = rsc_ptr;
     for (int e = tid; e < E; e += nthr) {
         const int c = slots[e];
         rsc[e] = c > slot_capacity ? slot_capacity : c;
@@ -208,8 +206,7 @@ __device__ __forceinline__ void route_build_body(
 // ------------------------------------------------------------ PUBLISH_COUNTS --
 // 骨架 bench:229-255 逐条移植（仅 block0 调用；行宽 recv_stride 由调用方保证）。
 __device__ __forceinline__ void publish_counts_body(
-        const uint8_t* self, const int* rsc_ptr, int64_t rsc_off,
-        unk_data* const* unk_peers, int cycle, int R, int rank,
+        const int* rsc_ptr, unk_data* const* unk_peers, int cycle, int R, int rank,
         unsigned epoch,
         int recv_stride = (int)((kEPR + 1 + 3) & ~3), int tid_base = 0,
         unsigned long long* ctr = nullptr) {
@@ -218,9 +215,7 @@ __device__ __forceinline__ void publish_counts_body(
     const int nthr = (tid_base != 0) ? 128 : (int)blockDim.x;
     // [集71] PUBLISH_COUNTS 执行次数（tid0 计一次）
     if (tid == 0) MX_CTR_ADD(ctr, kCtrPhasePublish, 1);
-    const int* rsc = (rsc_ptr != nullptr)
-                         ? rsc_ptr
-                         : reinterpret_cast<const int*>(self + rsc_off);
+    const int* rsc = rsc_ptr;   // 必为非空
     for (int e = tid; e < E; e += nthr) {
         const int dst = e / kEPR;
         const int le = e % kEPR;

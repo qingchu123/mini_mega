@@ -92,7 +92,6 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.tokens = a.tokens;
     m.slot_capacity = a.slot_capacity;
     m.win_cap = a.win_cap;
-    m.rsc_off = a.rsc_off;
     m.prefix_off = a.prefix_off;
     // [步骤2b-A] kernel 直接使用结构体指针
     m.rwk = a.rwk;

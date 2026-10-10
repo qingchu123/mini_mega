@@ -276,7 +276,6 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.tokens = tokens;
     a.slot_capacity = g.max_tokens;
     a.win_cap = win;
-    a.rsc_off = L.route_slot_counts_off;
     a.prefix_off = L.prefix_tbl_off;
     a.rwk = d.rwk;
     a.unk = d.unk;

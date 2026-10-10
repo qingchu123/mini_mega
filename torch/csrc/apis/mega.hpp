@@ -231,7 +231,6 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
   a.tokens = (int)num_tokens;
   a.slot_capacity = (int)b.cap;
   a.win_cap = (int)wc;
-  a.rsc_off = b.L.route_slot_counts_off;
   a.prefix_off = b.L.prefix_tbl_off;
   a.rwk = b.rwk;
   a.unk = b.unk;

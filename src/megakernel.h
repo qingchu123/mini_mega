@@ -77,7 +77,7 @@ struct MegaLaunchArgs {
     uint8_t* pool_ptr = nullptr;           // [A-RWK] pool 缓冲
     int* prefix_ptr = nullptr;             // 前缀表缓冲
     // -- 前序 / REDUCE 偏移（self 内）--
-    int64_t rsc_off = 0, prefix_off = 0;
+    int64_t prefix_off = 0;                // prefix_tbl（prefix_ptr 为空时用）
     int64_t topk_idx_off = 0;              // REDUCE：self + topk_idx_off = topk_idx 基址
     // -- 数据缓冲偏移（self / peer sym 内）--
     int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;

@@ -51,7 +51,7 @@ struct MegaArgs {
     uint8_t* pool_ptr;            // [A-RWK] pool 缓冲（→ Self+pool_off）
     int* prefix_ptr;              // 前缀表缓冲（→ self+prefix_off）
     // -- 前序 / 收尾偏移（self 内）--
-    int64_t rsc_off, prefix_off;  // route_slot_counts / prefix_tbl
+    int64_t prefix_off;           // prefix_tbl 在 self 内偏移（prefix_ptr 为空时用）
     // -- 数据缓冲偏移（self / peer sym 内）--
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
     int64_t combine_rows_off;     // 目标 rank combine_rows（BF16，<0 关闭 COMBINE）
@@ -210,11 +210,11 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
         if (blockIdx.x == 0) {
             const int route_cycle =
                 (int)(a.rwk->lf.current_time[0][0] % M_CYCLE);
-            route_build_body(a.topk_idx, a.self, &a.rwk->ld.route_slot_counts[0], a.rsc_off,
+            route_build_body(a.topk_idx, &a.rwk->ld.route_slot_counts[0],
                              a.unk_peers, route_cycle, a.R, a.rank,
                              a.tokens, a.slot_capacity, 0, 0, ctr);
             if (kTick) a.rwk->lf.pre_ticks[0] = clock64();
-            publish_counts_body(a.self, &a.rwk->ld.route_slot_counts[0], a.rsc_off, a.unk_peers,
+            publish_counts_body(&a.rwk->ld.route_slot_counts[0], a.unk_peers,
                                 route_cycle, a.R, a.rank, kPublishEpoch,
                                 kRecvStride, 0, ctr);
             if (kTick) a.rwk->lf.pre_ticks[1] = clock64();
