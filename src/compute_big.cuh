@@ -1343,23 +1343,11 @@ __device__ R19_BIG_ATTR void r19_big_task(
                             ((S.k_in / 32) % R24_KS == 0) &&
                             (g_l1 % R19_L1_BATCH == 0);
         if (count <= 32 && g_l1 % 4 == 0) {
-            // [R34] count∈(kM,32]：小档同构（runtime M 裁剪，空 tile 不参与
-            //   MMA/A 装载；单批 N 组）。旧 MT4/B4 对 17 行空转 4 tile(64 行)
-            //   且 L2 三批 A，是 TPR=17 L1/L2 各近翻倍的主因。
-            if (fbase != nullptr)
-                l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 2,
-                                           CM_L1_BATCH, true>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
-                    S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                    g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
-                    fbase, S.mt_total, ffn2);
-            else
-                l1_gemm_swiglu_body_paired<CM_L1_PF, kNTilesPerWarp, 2,
-                                           CM_L1_BATCH, false>(
-                    pool_w, S.w1, e, count, S.k_in, S.l1_n_total,
-                    S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                    g0_l1, g_l1, ffn_slot, out_col_base, S.l1_k_out, nullptr,
-                    nullptr, 0, ffn2);
+            // [A/B] TPR 17..32 档：r19<4,2,4>（MT4 权重复用）替代 paired<2,2,2,4>
+            r19_l1_big<4, R19_L1_PF, 4>(
+                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
+                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
         } else if (count <= 32 && g_l1 % 2 == 0 && g_l1 >= 2) {
             // [R35] NSLICE=8 等 g_l1=2 几何：单批 2 组小档（A 装载一遍、MT2
             //   runtime 裁剪），与 NSLICE=4 的 <2,kNT,2,4> 同构按比例缩小；

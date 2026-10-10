@@ -822,6 +822,8 @@ int main(int argc, char** argv) {
         plan.push_back({mt::tk_spec(*c0), Flags{false, true, graph_nodes}});
         plan.push_back({mt::balanced_spec(R, 16), Flags{false, true, graph_nodes}});
         plan.push_back({mt::balanced_spec(R, 128), Flags{false, true, graph_nodes}});
+        plan.push_back({mt::balanced_spec(R, 24), Flags{false, true, graph_nodes}});
+        plan.push_back({mt::balanced_spec(R, 32), Flags{false, true, graph_nodes}});
     }
     if (all) {
         // --tprs 子集：仍自动包含 TPR=512，保证 max_tokens=512 的全局布局与全量一致
