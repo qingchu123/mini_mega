@@ -684,14 +684,11 @@ __device__ __forceinline__ void l2_gemm_body(
 //   两者独立寄存器分配，互不污染；协议语义（wait-all、分片旗、l1_prog、
 //   l2_done、checksum、REDUCE epoch、任务编号）与集14 基线逐字一致。
 // ============================================================================
-// [R31] kSmallOnly=true：编译期删除大 count（M 档位）任务体分支 → 生成的 kernel
-//   不含重型 GEMM 实例（246 MTregs vs 256），TPR=16 恢复 ~24µs（见
-//   test/31.tpr16_regress/results.md）。由 host 在 slot_capacity<=kM 时选择该实例；
-//   语义要求 win_cap<=slot_capacity<=kM（此时 count>kM 分支恒不可达，协议不变）。
+// [R31] kSmallOnly 已移除（无 any 实例化点，恒 false → 死模板参）。
 // [L1L2-SPLIT] kPhase：Both=原合并路径；L1=只跑 DISPATCH+L1；L2=只跑 L2+tail。
 //   拆分下数据槽 e*slot_win+w 每窗口独占（ring 门/l2_done 不再需要）；旗槽
 //   （slice_flags/l1_prog/l2_done）保持 ring 索引不变（旗区容量 256 不动）。
-template <bool kSmallOnly = false, MegaPhase kPhase = MegaPhase::Both>
+template <MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void dispatch_pull_body(
         const MegaArgs* a, int cycle, uint8_t* a_smem = nullptr,
         uint8_t* b_smem = nullptr, unsigned long long* ctr = nullptr) {
@@ -906,12 +903,8 @@ __device__ __forceinline__ void dispatch_pull_body(
             (kPhase == MegaPhase::Both) ? pool_slot : (e * slot_win + w);
         const int* pfx = s_prefix + e * (R + 1);
         // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
-        // [R31] kSmallOnly 实例：大任务体不实例化（小核专用路径）
-        if constexpr (kSmallOnly) {
-            r19_small_task<kPhase>(S, task, e, w, count, slice,
-                                             epoch, data_slot, pfx,
-                                             a_smem, b_smem);
-        } else if (count > kM) {
+        // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
+        if (count > kM) {
             r19_big_task<kPhase>(S, task, e, w, count, slice,
                                                  epoch, data_slot, pfx,
                                                  a_smem, b_smem);

@@ -46,7 +46,6 @@ common.cuh                     场景常量、CM_* 宏默认值、计数器枚�
 | 参数 | 作用 | 取值与影响 |
 |---|---|---|
 | `kWithCompute` | 是否进入任务循环 | `false`：只跑前序；`true`：前序 + 计算链 + COMBINE |
-| `kSmallOnly` | 编译期删除大 count 任务体 | **当前无任何实例化点**，属未使用模板分支（§6） |
 
 > `[OPT-KCAP-REMOVE]` 原 `kCap` 编译期 count 上界模板参已删除（重档隔离改走
 > `R19_GEMM_ATTR=__noinline__`，见 §3 注）。
@@ -78,10 +77,9 @@ common.cuh                     场景常量、CM_* 宏默认值、计数器枚�
 
 ## 5. 任务循环内的分派
 
-### 5.1 任务级分派（compute.cuh:1092-1104）
+### 5.1 任务级分派（compute.cuh:905-920）
 
 ```
-kSmallOnly ?              → r19_small_task
 count > kM (16) ?         → r19_big_task
 否则                      → r19_small_task
 ```
@@ -191,7 +189,7 @@ small 路径**不走 fragment，也不设置 `fuse.on`**，因此任务尾恒为
 
 | 项目 | 状态 | 依据 |
 |---|---|---|
-| `kSmallOnly = true` | **无实例化点**，模板分支不会生成 | 全仓库仅 `compute.cuh:884/1092` 出现 |
+| `kSmallOnly` | **已删除**（无实例化点、恒 false） | `compute.cuh`/`kernel.cuh` |
 | `NoTaskTail`（`mega_kernel` 的参数） | 被 `kernel.cuh:249` 的局部 `CombineTail tail` 遮蔽，运行期不执行 | kernel.cuh:249 |
 | `kFragCap` | **已删除**（[FRAG-ALWAYS]）：fragment 分支恒编译 | kernel.cuh:132、compute_big.cuh:1329 |
 | `subset_barrier_n` | 无调用方 | flags.cuh:118 |

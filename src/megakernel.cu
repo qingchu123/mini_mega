@@ -125,6 +125,10 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.ffn_hidden = a.ffn_hidden;
     m.l2_out = a.l2_out;
     m.combine_rows_off = a.combine_rows_off;
+    // [诊断] MX_SKIP_COMBINE=1：禁用任务尾 COMBINE（combine_rows_off<0 → 空操作）
+    if (const char* s = std::getenv("MX_SKIP_COMBINE");
+        s != nullptr && std::atoi(s) != 0)
+        m.combine_rows_off = -1;
     return m;
 }
 
@@ -168,7 +172,7 @@ void launch_phase_impl(const MegaLaunchArgs& a, mcStream_t stream,
                        int skip_override) {
     MegaLaunchArgs b = a;
     if (skip_override >= 0) b.skip_prologue = skip_override;
-    mega_kernel<true, false, ph>
+    mega_kernel<true, ph>
         <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b));
 }
 #endif  // CM_L1L2_SPLIT
@@ -224,6 +228,10 @@ void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
 
 void launch_full(const MegaLaunchArgs& a, mcStream_t stream) {
     launch_compute(a, stream);
+    // [诊断] MX_SKIP_REDUCE=1：不发射 REDUCE kernel（仅测 compute 段）
+    if (const char* s = std::getenv("MX_SKIP_REDUCE");
+        s != nullptr && std::atoi(s) != 0)
+        return;
     launch_reduce(a, stream);
 }
 
