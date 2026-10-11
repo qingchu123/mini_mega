@@ -171,19 +171,11 @@ __device__ __forceinline__ float combine_bf16_to_float(uint16_t h) {
 //   on     ：本任务实际融合（任务体仅在 r24 L2 路径 + staging 有效时置位）。
 // ---------------------------------------------------------------------------
 struct CombineFuseCtx {
-    bool capable = false;            // tail 具备融合能力（kernel 侧置位）
-    bool on = false;                 // 本任务实际激活融合（任务体置位）
-    const uint8_t* out_base = nullptr;  // ffn_out staging 全区基址（BF16）
-    const int* meta = nullptr;       // staging 元数据视图
-    const float* weights = nullptr;  // staging 权重视图（无效行 = 0）
-    uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址（含 self）
-    unk_data* const* unk_peers = nullptr;  // 各 rank unk（含 self）
-    int cycle = 0;                   // [M_CYCLE] combine_rows 片
-    long long rows_off = -1;         // 目标 rank combine_rows 区偏移（BF16）
-    int staging_cap = 0;             // staging 行容量（= win_capacity）
-    int block_idx = 0;               // staging 块号（= blockIdx.x）
+    bool capable = false;
+    bool on = false;
+    const CombineCtx* c = nullptr;
+    const uint8_t* out_base = nullptr;
 };
-
 // 融合推送：把 f.out_base（staging 全区基址）的行 [row_lo,row_hi)、列
 //   [col_lo,col_hi)（全局 H 维坐标；列范围 = 某 g 批次的列块）推送到目标
 //   rank 的 combine_rows 对应行。不写完成标记（由任务尾 combine_mark_rows
@@ -193,14 +185,14 @@ struct CombineFuseCtx {
 __device__ __forceinline__ void combine_push_one_row(
         const CombineFuseCtx& f, const uint16_t* out_h, int nu4, int s2,
         int col_lo, int lane) {
-    const size_t stag = (size_t)f.block_idx * f.staging_cap + s2;
-    if (f.weights[stag] == 0.0f) return;   // 无效行（dispatch 零填充）
-    const int* m = f.meta + stag * 3;
+    const size_t stag = (size_t)f.c->block_idx * f.c->staging_cap + s2;
+    if (f.c->weights[stag] == 0.0f) return;   // 无效行（dispatch 零填充）
+    const int* m = f.c->meta + stag * 3;
     const int src = m[0];
     const int stok = m[1];
     const int kk = m[2];
     const uint16_t* srow = out_h + stag * kHidden + col_lo;
-    uint16_t* drow_h = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src, f.cycle) +
+    uint16_t* drow_h = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src, f.c->cycle) +
         ((size_t)kk * kMaxTPR + stok) * kHidden + col_lo;
     for (int i = lane; i < nu4; i += 64) {
 #if R30_DIAG_NOREAD
@@ -242,18 +234,18 @@ __device__ __forceinline__ void combine_push_chunk_rows(
     const int r1 = (s2 + wrun < row_hi) ? (s2 + wrun) : row_hi;
     for (; s2 + 4 <= r1; s2 += 4) {
 #endif
-        const size_t stag = (size_t)f.block_idx * f.staging_cap + s2;
+        const size_t stag = (size_t)f.c->block_idx * f.c->staging_cap + s2;
 #if R30_PUSHSTRIDE
         const size_t st1 = stag + nwarps;
         const size_t st2 = stag + 2 * nwarps;
         const size_t st3 = stag + 3 * nwarps;
-        const int* m0 = f.meta + stag * 3;
-        const int* m1 = f.meta + st1 * 3;
-        const int* m2 = f.meta + st2 * 3;
-        const int* m3 = f.meta + st3 * 3;
+        const int* m0 = f.c->meta + stag * 3;
+        const int* m1 = f.c->meta + st1 * 3;
+        const int* m2 = f.c->meta + st2 * 3;
+        const int* m3 = f.c->meta + st3 * 3;
 #else
         const size_t st1 = stag + 1, st2 = stag + 2, st3 = stag + 3;
-        const int* m0 = f.meta + stag * 3;
+        const int* m0 = f.c->meta + stag * 3;
         const int* m1 = m0 + 3;
         const int* m2 = m0 + 6;
         const int* m3 = m0 + 9;
@@ -261,22 +253,22 @@ __device__ __forceinline__ void combine_push_chunk_rows(
 #if R30_DIAG_NOWEIGHT
         const float w0 = 1.0f, w1 = 1.0f, w2 = 1.0f, w3 = 1.0f;
 #else
-        const float w0 = f.weights[stag];
-        const float w1 = f.weights[st1];
-        const float w2 = f.weights[st2];
-        const float w3 = f.weights[st3];
+        const float w0 = f.c->weights[stag];
+        const float w1 = f.c->weights[st1];
+        const float w2 = f.c->weights[st2];
+        const float w3 = f.c->weights[st3];
 #endif
         const int src0 = m0[0], stok0 = m0[1], kk0 = m0[2];
         const int src1 = m1[0], stok1 = m1[1], kk1 = m1[2];
         const int src2 = m2[0], stok2 = m2[1], kk2 = m2[2];
         const int src3 = m3[0], stok3 = m3[1], kk3 = m3[2];
-        uint16_t* d0 = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src0, f.cycle) +
+        uint16_t* d0 = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src0, f.c->cycle) +
             ((size_t)kk0 * kMaxTPR + stok0) * kHidden + col_lo;
-        uint16_t* d1 = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src1, f.cycle) +
+        uint16_t* d1 = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src1, f.c->cycle) +
             ((size_t)kk1 * kMaxTPR + stok1) * kHidden + col_lo;
-        uint16_t* d2 = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src2, f.cycle) +
+        uint16_t* d2 = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src2, f.c->cycle) +
             ((size_t)kk2 * kMaxTPR + stok2) * kHidden + col_lo;
-        uint16_t* d3 = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, src3, f.cycle) +
+        uint16_t* d3 = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src3, f.c->cycle) +
             ((size_t)kk3 * kMaxTPR + stok3) * kHidden + col_lo;
         const uint16_t* s0 = out_h + stag * kHidden + col_lo;
 #if R30_PUSHSTRIDE
@@ -358,11 +350,11 @@ __device__ __forceinline__ void combine_push_warp_cols(
     for (int r0 = row_lo; r0 < row_hi; r0 += rstep) {
         const int r = r0 + dr;
         if (r >= row_hi) continue;
-        const size_t stag = (size_t)f.block_idx * f.staging_cap + r;
-        if (f.weights[stag] == 0.0f) continue;
-        const int* m = f.meta + stag * 3;
+        const size_t stag = (size_t)f.c->block_idx * f.c->staging_cap + r;
+        if (f.c->weights[stag] == 0.0f) continue;
+        const int* m = f.c->meta + stag * 3;
         const uint16_t* srow = out_h + stag * kHidden;
-        uint16_t* drow = cmb_rows_compat(f.unk_peers, f.peer_bases, f.rows_off, m[0], f.cycle) +
+        uint16_t* drow = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, m[0], f.c->cycle) +
             ((size_t)m[2] * kMaxTPR + m[1]) * kHidden;
         for (int q = 0; q < nb; ++q) {
             const int col = (g0 + q) * block_n + warp * n_per_warp + j * 8;

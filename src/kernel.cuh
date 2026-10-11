@@ -129,7 +129,9 @@ struct CombineTail {
 template <>
 struct R29TailFuse<CombineTail> {
     static __device__ __forceinline__ CombineFuseCtx get(const CombineTail& t) {
-        return t.fuse;
+        CombineFuseCtx f = t.fuse;
+        f.c = &t.ctx;
+        return f;
     }
 };
 // [R29] 任务尾回写实际融合状态（供 CombineTail 选择只写标记路径）
@@ -138,6 +140,7 @@ struct R29TailFuseSet<CombineTail> {
     static __device__ __forceinline__ void on(CombineTail& t,
                                               const CombineFuseCtx& f) {
         t.fuse = f;
+        t.fuse.c = &t.ctx;
     }
 };
 
@@ -286,14 +289,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
                 // [R29] 融合推送能力 + 上下文（on 由任务体在 r24 L2 路径激活）
                 tail.fuse.capable = true;
                 tail.fuse.out_base = tail.out_base;
-                tail.fuse.meta = tail.ctx.meta;
-                tail.fuse.weights = tail.ctx.weights;
-                tail.fuse.peer_bases = tail.ctx.peer_bases;
-                tail.fuse.unk_peers = a.unk_peers;
-                tail.fuse.cycle = cyc;
-                tail.fuse.rows_off = tail.ctx.rows_off;
-                tail.fuse.staging_cap = tail.ctx.staging_cap;
-                tail.fuse.block_idx = tail.ctx.block_idx;
+                tail.fuse.c = &tail.ctx;
             } else {
                 // [集33] combine 关闭：同一 tail 实例走空操作（rows_off<0）
                 tail.ctx.rows_off = a.combine_rows_off;
