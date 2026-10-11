@@ -107,6 +107,15 @@ struct MegaArgs {
 #ifndef CM_SKIP_L2
 #define CM_SKIP_L2 0
 #endif
+// [BLOCK-LPT] 代价感知的块级 LPT（默认 0 = 关闭，行为逐字不变）：
+//   FCFS 仅均衡任务「个数」；同 rank 内各 block 的窗口行数（代价）差异可达
+//   2.19×。开启后 tid0 在建立任务表后，按代价 = min(c_e-w*win_cap, win_cap)
+//   （N/K 固定 → ∝ 行数）对 raw_tasks 个任务做降序稳定计数排序，写入 smem
+//   s_order；领号仍用现有 atomicAdd(task_counter)，但取 task = s_order[counter]，
+//   降序发放 + 动态领取 ≈ LPT；解码 (e,w,slice)/pool_slot/ring 门/协议不变。
+#ifndef R19_BLOCK_LPT
+#define R19_BLOCK_LPT 0
+#endif
 #if CM_SKIP_GEMM || CM_SKIP_L1
 #define CM_L1_GATE (false)
 #else
@@ -667,6 +676,54 @@ __device__ __forceinline__ void dispatch_pull_body(
     const int merge = 1;
     const int nslice_eff = kNSlice / merge;
     const int total_tasks = raw_tasks / merge;
+#if R19_BLOCK_LPT
+    // [BLOCK-LPT] 建排序表：s_order[raw_tasks]（任务 id 降序按代价）+ 临时 s_cost
+    //   与 s_hist。紧凑放在 s_prefix 之后；smem 不足则 lpt_ok=false 回退基线。
+    const int kLptHeadInts = kEPR + (kEPR + 1) + kEPR * (R + 1);
+    constexpr int kLptMaxTasks = 640;   // 任务数上界（EPR*ceil(512/32)*kNSlice=512）
+    constexpr int kLptSmemInts = 2048;  // prod_smem(~8448B)/4 的保守下界
+    int* s_order = s_prefix + kEPR * (R + 1);
+    int* s_cost = s_order + kLptMaxTasks;
+    int* s_hist = s_cost + kLptMaxTasks;
+    const bool lpt_ok = (raw_tasks > 0) && (raw_tasks <= kLptMaxTasks) &&
+                        (win_cap >= 0) &&
+                        (kLptHeadInts + 2 * kLptMaxTasks + (win_cap + 1) <=
+                         kLptSmemInts);
+    if constexpr (kPhase != MegaPhase::L2) {
+        if (lpt_ok) {
+            // 1) 每任务代价 = min(count_e - w*win_cap, win_cap)（∝ L1/L2 行数）
+            for (int i = tid; i < raw_tasks; i += (int)blockDim.x) {
+                const int tw = i / nslice_eff;
+                int lo = 0, hi = kEPR - 1;
+                while (lo < hi) {
+                    const int mid = (lo + hi) >> 1;
+                    if (s_cum[mid + 1] <= tw) lo = mid + 1;
+                    else hi = mid;
+                }
+                const int wv = tw - s_cum[lo];
+                const int remain = s_count[lo] - wv * win_cap;
+                s_cost[i] = remain < win_cap ? remain : win_cap;
+            }
+            __syncthreads();
+            // 2) 降序稳定计数排序（相等代价保持 task id 升序 → 保持 ring 窗口关系）
+            if (tid == 0) {
+                for (int c = 0; c <= win_cap; ++c) s_hist[c] = 0;
+                for (int i = 0; i < raw_tasks; ++i) ++s_hist[s_cost[i]];
+                int acc = 0;
+                for (int c = win_cap; c >= 0; --c) {
+                    const int h = s_hist[c];
+                    s_hist[c] = acc;
+                    acc += h;
+                }
+                for (int i = 0; i < raw_tasks; ++i)
+                    s_order[s_hist[s_cost[i]]++] = i;
+            }
+            __syncthreads();
+        }
+    }
+#else
+    (void)0;
+#endif
     // [集71] 任务循环进入 block 数
     // [L1L2-SPLIT] 循环统计只在 L2/Both 记（L1 阶段另跑一遍会重复计数）
     if (tid == 0 && kPhase != MegaPhase::L1)
@@ -718,11 +775,20 @@ __device__ __forceinline__ void dispatch_pull_body(
                        ? (int)blockIdx.x
                        : atomicAdd(reinterpret_cast<int*>(
                                        bar_flags + task_counter_idx), 1));
+#if R19_BLOCK_LPT
+            // [BLOCK-LPT] 领到的号 counter 映射为降序排序后的任务 id（仅非 L2 路径）。
+            const int task_lpt = (kPhase != MegaPhase::L2 && lpt_ok &&
+                                  task < total_tasks)
+                                     ? s_order[task]
+                                     : task;
+            s_task = task_lpt;
+#else
             s_task = task;
-            if (task < total_tasks) {
+#endif
+            if (s_task < total_tasks) {
                 // [R35] 物理任务 → 窗号/物理 slice（每任务覆盖 merge 个逻辑 slice）
-                const int tw = task / nslice_eff;
-                const int slice = task % nslice_eff;
+                const int tw = s_task / nslice_eff;
+                const int slice = s_task % nslice_eff;
                 s_slice = slice;
                 int lo = 0, hi = kEPR - 1;
                 while (lo < hi) {
