@@ -1,113 +1,25 @@
 // ============================================================================
-// compute.cuh — fp8xfp8 MoE Mega Kernel 计算链（T2：DISPATCH pull + L1+SwiGLU + L2）
+// compute.cuh — fp8xfp8 MoE Mega Kernel 计算链
 //
-// 依赖：common.cuh（场景常量）、flags.cuh（T1 冻结接口：SliceGate /
-//       slice_gate_wait / l2_gate_wait / l1_progress_publish）。
-// 参考骨架（移植+适配）：empty_kernel_bench.cu
-//   dispatch_pull_body            bench:1573-1939
-//   l1_gemm_swiglu_body_paired    bench:850-980
-//   l2_gemm_body                  bench:1052-1168
+// 依赖：common.cuh（场景常量）、flags.cuh（门/旗接口）。
 //
-// ---------------------------------------------------------------- 导出函数 --
-// 1) dispatch_pull_body(...)  —— 任务循环驱动（每 block 调用一次），每个任务：
-//      领号（首波 task=blockIdx，其后 atomicAdd(task_counter)）
-//      → 解码 (e, w, slice) → ring 门（l2_gate_wait）
-//      → 行均分 K 片 pull（peer x 视图 → 本 rank pool 槽）+ staging weights/meta
-//      → 非法行零填充 → 分片就绪旗（本 slice）
-//      → L1（l1_gemm_swiglu_body_paired，4 warp）
-//      → 块同步 → l1_progress_publish → 等本窗全部 NSLICE 个 l1_prog 旗
-//      → L2（l2_gemm_body，4 warp）→ 块同步
-//      → tail(TaskDesc)（T3 COMBINE 钩子）→ 任务尾 l2_done 递增。
-//    参数（按骨架顺序，已裁剪实验开关）：
-//      self/peer_bases/R/rank     对称区与 peer 视图
-//      win_cap                    逻辑窗口容量（窗口划分/行数/staging 行 stride）
-//      pool_stride                pool 槽地址 stride（= win_cap + win_pad）
-//      tbl_cap                    src_index_table 行容量（= max_tokens；非法行判据）
-//      k_in/topk/ring             K（H）/ topk / 窗口 ring 槽数
-//      *_off                      prefix/src/x/weights/pool/w/meta 在对称区内偏移
-//      bar_flags + *_idx          task_counter/l2_done/task_ready/slice_flags/l1_prog
-//      out_processed/dbg/max_spins 诊断与自旋保护
-//      w1/l1_n_total/l1_block_n/l1_k_out/ffn_hidden/l1_chk   L1 通路
-//      w2/l2_out/l2_k_out/l2_chk                            L2 通路
-//      rep/n_reps                 轮次（单轮 rep=0, n_reps=1；多轮时 ring 门每轮等）
-//      tail                       任务尾钩子（T3 COMBINE；默认 NoTaskTail 空钩子）
-//      prefix_ptr                 可选独立前缀表缓冲（与 task_setup_body 的
-//                                 prefix_ptr 对齐；nullptr 时用 self+prefix_off）
-// 2) l1_gemm_swiglu_body_paired<pf, nt, mt, nb>(pool, w1, expert, count, k_hidden,
-//      n_total, block_n, lane, warp, nwarps, checksum, n_group_begin,
-//      n_group_count, ffn_out, out_col_base, k_out, gate)
-//    —— N 组批量（nb 组共享 A）FP8 GEMM + SwiGLU + FP8 量化回写 ffn_hidden；
-//       K 循环按 K 片边界调 slice_gate_wait（仅首组）。调用者保证：
-//       n_group_count 为 nb 的整数倍（组对 = (gate, up)），ffn_out 非空时写行 < count。
-// 3) l2_gemm_body<pf, nt, mt, nb>(a_pool, w2, count, k_in, n_total, block_n, lane,
-//      warp, nwarps, checksum, n_group_begin, n_group_count, out, k_out)
-//    —— FP8 GEMM（K=I、N=H），N 组批量（nb 组共享 A），BF16 输出到每块 staging 槽。
+// 导出：
+//   dispatch_pull_body —— 任务循环驱动（每 block 一次）：领号/解码 → ring 门 →
+//     K 片 pull（peer x → 本 rank pool）+ staging weights/meta → 零填充 → 分片旗
+//     → L1+SwiGLU → l1_prog 发布+等本窗全切片 → L2 → tail(COMBINE) → l2_done。
+//     任务体按 count 分派到 compute_big.cuh 的 r19_small_task/r19_big_task。
+//   l1_gemm_swiglu_body_paired<pf,nt,mt,nb> —— N 组批量 FP8 GEMM + SwiGLU + FP8 量化。
+//   l2_gemm_body<pf,nt,mt,nb> —— FP8 GEMM（K=I、N=H），BF16 输出。
 //
-// ------------------------------------------------------- 权重 / 地址契约 --
-// * 权重 16B/lane 配对 packed tile（零 shuffle，layout16b）：
-//       supertile 基址 = W + ((out_col/32) * kIters + (k/32)) * 1024，
-//       kIters = K/32；supertile 内 64 lane × 16B 即两个 native fragment：
-//       lane L 低 8B 覆盖逻辑行 (out_col/32)*32 + L%16、K 段 [(L/16)*8, +8)，
-//       高 8B 覆盖同 K 段的逻辑行 +16（即 t=0/t=1 两个 N16 tile）。
-//       一次 16B 装载直接得到两个 fragment，免 shuffle/重分发。
-// * W1 [EPR][2I][H] 的 gate/up 配对布局（host 必须按此打包）：
-//       组 g 对应 2I 行空间的 [g*256, (g+1)*256)；配对 (2p, 2p+1) 产出隐藏列
-//       [p*256, (p+1)*256)，即 gate 行 = (h/256)*512 + h%256、up 行 = +256。
-// * W2 [EPR][H][I]：expert stride = H*I 字节。
-// * 地址/容量三元组分离：窗口划分用 win_cap；pool 行地址用 pool_stride；
-//   src_index_table 索引与非法行判据用 tbl_cap；staging 行 stride = win_cap
-//   （token_route_weights / token_src_meta / ffn_hidden / l2_out）。
-// * 本文件使用动态 smem 头部 EPR + (EPR+1) + EPR*(R+1) 个 int
-//   （前两块与骨架 dispatch 一致；第三块为全 experts 的 src 前缀一次性预载，
-//    见下方"本轮优化"；task_setup 已完成后再进入本函数）。
-//
-// ------------------------------------------------------------- 本轮优化 --
-// O1) src 前缀整体预载：启动时把 prefix[EPR][R+1] 一次性搬入 smem，省去每任务
-//     的 global 重读与紧随其后的一次 __syncthreads（原 s_prefix 仅 R+1 大）。
-// O2) 权重远端读前移：pull 每行先发 weights 远端读再搬运整行，使读延迟与行
-//     搬运的 store 重叠（原顺序先搬运后读，延迟暴露在任务尾 fence 前）。
-// O3) L2 N 组两批由 4+2 改 3+3（g_l2 为 3 的倍数时，本场景 g_l2=6）：两批
-//     规模对称，第二批不再退化为 kBatch=2 的小 ring（A 装载次数不变）。
-// 集14) hot/mixed-invalid 路由专项（test/14.hot_perf/）：大 count（>kM）路径
-//      由"M4 单实例（kMTiles=4）"改为"M1 分块循环（每块 16 行，单一
-//      <2,2,1,2> 实例）"。根因：M4 实例使整 kernel 顶格 256 MTregs 且栈帧
-//      2032B（spill 到 local），污染全部路径（wc16 的 M1 任务 L1/L2 各慢
-//      ~10%）；去掉后栈帧 176B，graph 链三形态 -18~26%（同会话背靠背）。
-//      数值等价（行独立 GEMM 分块），并顺带修正原 M4 对 count>64 的
-//      m_tiles 截断（原语义只算前 64 行）。协议/同步/标志/checksum 全部未动。
-// 集19) TPR=128 专项（test/19.mtile_big/）：任务级编译隔离 + M 档位：
-//      - 调度循环只做领号/解码/ring 门，任务体按 count 分派到 compute_big.cuh
-//        的两个 __noinline__ 独立函数（r19_small_task / r19_big_task）；
-//        探针证明"空体 noinline 调用点"对 TPR=16 中性（298.6 vs 297.8µs），
-//        回归只来自大任务体的寄存器需求，任务级隔离后 TPR=16 +8.3%（71 机）。
-//      - 大 count 走 M 档位（L1 kMT=4/kBatch=4、L2 kMT=4/kBatch=3、kPF=1）：
-//        外层 c0 按 kMT*16 行分组、组内 B 在 M tile 间共享 → 权重读 8 遍→2 遍。
-//      - 结果（71 机同会话）：TPR=128 2453→1406µs（−42.7%），TPR=64 −40.7%。
-// 集21) A fragment 布局专项（test/21.mtile_big2/）：见 compute_big.cuh 头部。
-//      大 count 任务在单波/单窗条件下把 A（池）与 L2 的 A（ffn_hidden）各写一份
-//      [step][m][row][32B] 分块副本（放 ffn_hidden 空槽），使 L1/L2 的 A 装载从
-//      16 line/指令降到 4 line/指令，并消除 L2 的 warp 末尾 straggler；L1 kPF=2。
-//      71 机同会话：TPR=128 1405→1246µs，TPR=64 727→666，TPR=16 +1.7%。
-// 说明：O1~O3、集14、集19、集21 均不改变同步/标志协议（wait-all、slice 旗、
-//      l1_prog、l2_done、checksum、REDUCE epoch）；仅调整数据搬运顺序、
-//      GEMM 批次切分与 A 的本地副本布局。
-//
-// ---------------------------------------------------------------- 与骨架差异 --
-// a) 4 warp 计算：nwarps=4、每 warp 4 个 N16 tile（kNTilesPerWarp=4）。
-//    骨架 kL1Paired 路径用 8 warp×2 tile，4 warp 变体在其非配对路径实测最优；
-//    此处组合"配对 + 4 warp"（block_n 固定 256 = 4 warp × 4 tile × 16）。
-// b) L1→L2 依赖等本窗全部 NSLICE 个 l1_prog 旗（骨架末版只等本 slice）。
-//    L2 的 K = I 覆盖 ffn_hidden 全部隐藏列，只等本 slice 会读到未完成输出；
-//    results.md §7.8 的已验证实现即为"等全部旗"，本文件沿用。
-// c) 非法行零填充：pool 本 K 片写零 + staging weight=0/meta=0（骨架遗留旧值）。
-// d) W2 expert stride 取 e*H*I（骨架 dispatch 路径误用 e*l2_k_out）。
-// e) M 档位：count<=16 走单档 M1 路径；count>16 走 compute_big.cuh 的 M 档位
-//    任务体（[集19]，见"本轮优化"；集14 的 M1 分块循环已被其取代）。
-// f) COMBINE 不在本模块：任务尾通过 tail 钩子交给 T3。
-// g) 分片流水门固定启用（production 口径）：pull 后即时发布分片旗，L1 首组
-//    的 K 片边界调 slice_gate_wait（自 slice 立即通过）。SliceGate 的 T1 扩展
-//    字段 seq/dbg/max_spins 由本模块填充（seq=本窗 epoch，否则门恒关闭）。
-// h) 补 prefix_ptr 可选参数，与 T1 task_setup_body 的独立前缀表路径对齐。
+// 权重契约（layout16b，host 须按此打包）：16B/lane 配对 tile，
+//   supertile = W + ((out_col/32)*kIters + (k/32))*1024，一次 16B 得两个 N16 fragment；
+//   W1 gate/up 配对：组 g 占 2I 行 [g*256,(g+1)*256)，配对 (2p,2p+1) 产出隐藏列
+//   [p*256,(p+1)*256)；W2 expert stride = H*I。
+// 地址/容量：窗口划分用 win_cap；pool 行地址用 pool_stride；src_index_table 用
+//   tbl_cap；staging 行 stride = win_cap。
+// 动态 smem 头部：EPR + (EPR+1) + EPR*(R+1) 个 int（全 experts src 前缀一次预载）。
+// A 走 fragment（4-line）恒编译；协议（wait-all/分片旗/l1_prog/l2_done/checksum）
+//   与基线一致。优化沿革与档位见 docs/12、docs/13、perf.md。
 // ============================================================================
 #pragma once
 
@@ -315,14 +227,10 @@ __device__ __forceinline__ void cm_store_ffn_frag(
 }
 
 // ============================================================================
-// L1：N 组批量共享 A（kBatch 组一个 K 循环）+ SwiGLU + FP8 量化回写
-//
-// 组对 (g, g+1) = (gate, up)：kBatch 个 N 组在同一 K 循环内共享 A（a_pipe 仅
-// 一份），B 每步 kBatch × kNTiles；A 装载次数由 kBatch 决定（kBatch=4 时每个
-// warp 每 k-step 只读一次 A，是 kBatch=2 的一半）。K 循环 kPrefetch 槽预取；
-// 首组按 K 片边界等分片旗。
-// 累加器 lane 布局：row = m*16 + (lane>>4)*4 + i，
-//                  col = warp*n_per_warp + t*16 + (lane&15)。
+// L1：N 组批量共享 A（kBatch 组一个 K 循环）+ SwiGLU + FP8 量化回写。
+//   组对 (g,g+1)=(gate,up)：kBatch 组共享 A（a_pipe 仅一份），A 装载次数 = 1/kBatch。
+//   K 循环 kPrefetch 槽预取，首组按 K 片边界等分片旗。
+//   acc lane 布局：row = m*16+(lane>>4)*4+i，col = warp*n_per_warp+t*16+(lane&15)。
 // ============================================================================
 template <int kPrefetch = 4, int kNTiles = kNTilesPerWarp, int kMTiles = 1,
           int kBatch = 4, bool kUseFrag = false>
@@ -676,18 +584,11 @@ __device__ __forceinline__ void l2_gemm_body(
 #include "compute_big.cuh"
 
 // ============================================================================
-// DISPATCH：任务循环驱动（领号/解码 + ring 门 + 任务体分派）
-//   任务体（pull → 分片旗 → wait-all → L1 → l1_prog → L2 → tail）按 count
-//   分派到 compute_big.cuh 的两个 __noinline__ 独立函数：
-//     count <= kM → r19_small_task（热路径，与基线逐字一致）
-//     count >  kM → r19_big_task（M 档位，B 在 M tile 间共享）
-//   两者独立寄存器分配，互不污染；协议语义（wait-all、分片旗、l1_prog、
-//   l2_done、checksum、REDUCE epoch、任务编号）与集14 基线逐字一致。
+// DISPATCH：任务循环驱动（领号/解码 + ring 门 + 任务体分派）。
+//   按 count 分派：count<=kM → r19_small_task；count>kM → r19_big_task（均
+//   __noinline__，寄存器互不污染）。协议与基线一致。
+//   [L1L2-SPLIT] kPhase：Both/L1/L2 由 if constexpr 编译期消除另一段。
 // ============================================================================
-// [R31] kSmallOnly 已移除（无 any 实例化点，恒 false → 死模板参）。
-// [L1L2-SPLIT] kPhase：Both=原合并路径；L1=只跑 DISPATCH+L1；L2=只跑 L2+tail。
-//   拆分下数据槽 e*slot_win+w 每窗口独占（ring 门/l2_done 不再需要）；旗槽
-//   （slice_flags/l1_prog/l2_done）保持 ring 索引不变（旗区容量 256 不动）。
 template <MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void dispatch_pull_body(
         const MegaArgs* a, int cycle, uint8_t* a_smem = nullptr,
@@ -740,16 +641,8 @@ __device__ __forceinline__ void dispatch_pull_body(
         }
     }
     __syncthreads();
-    // [R35] 波量化自适应粗化：逻辑任务数（窗数×kNSlice）超过 grid 时，按
-    //   merge（2 的幂，整除 kNSlice）个逻辑 slice 合并为一个物理任务，
-    //   使物理任务数 ≤ grid（单波）。收益：
-    //   a) A 读总量 ∝ 物理任务数，粗化后不再随 NSLICE 放大；
-    //   b) 消除第二波串行与跨波 wait-all 悬挂；
-    //   c) 合并任务内 K/N 范围连续（u4 连续、列连续），不破坏任何 flag 协议
-    //      （slice_flags/l1_prog 仍逐逻辑 slice 写满，wait-all 仍遍历 kNSlice）。
-    //   任务数 ≤ grid 时 merge=1，行为与改动前逐字一致（NSLICE=4 不受影响）。
     const int raw_tasks = s_cum[kEPR] * kNSlice;
-    // [步骤20a] 去掉 merge 机制：固定 merge=1（不粗化），nslice_eff=kNSlice。
+    // merge 机制已去除：固定 merge=1（不粗化），nslice_eff=kNSlice。
     const int merge = 1;
     const int nslice_eff = kNSlice / merge;
     const int total_tasks = raw_tasks / merge;

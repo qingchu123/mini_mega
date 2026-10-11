@@ -1,89 +1,18 @@
 // ============================================================================
-// compute_big.cuh — 大 count（>kM）任务独立编译单元（集19 / 子 agent R）
+// compute_big.cuh — 大 count（>kM）任务独立编译单元
 //
-// 背景（test/17、test/18 结论）：
-//   基线的 M1 分块循环（16 行/块）在 TPR=128 时把权重读 8 遍，是绝对主成本
-//   （诊断：删 A+B 后全链 653.6µs，B 单独≈901µs）；唯一结构性杠杆是 M 档位
-//   （B 在 kMT 个 M tile 间共享，权重读 TPR/(kMT*16) 遍）。
-//   但 M 档位加入同一全内联大函数会扰动 count=16 热路径的寄存器分配/调度
-//   （P: +33%、Q: +45%）。
-//
-// 本文件方案（R19）：
-//   1) 任务级编译隔离：把"大 count 任务"的整体（pull + 分片旗 + L1 M 档位 +
-//      l1_prog + L2 M 档位 + tail）放进 __noinline__ 独立函数 r19_big_task；
-//      count=16 热路径任务走 compute.cuh 的 r19_small_task（同样 __noinline__，
-//      彼此不共享寄存器分配）。两项经探针验证：仅"空体调用点"对 TPR=16 中性
-//      （298.6µs vs 基线 297.8µs）。
-//   2) M 档位结构：外层 c0 按 kMT*16 行分组；组内 K 循环外层、M 块内层，
-//      B fragment 在 kMT 个 M tile 间共享（B 只读一遍/组）。
-//      参考 test/17 骨架/生产同构实现：`acc[kBatch][kMT][kNT]` 常驻，
-//      `a_pipe[kPF][kMT]`、`b_pair[kPF][kBatch]` 预取环。
-//   3) 档位可配：R19_L1_MT/PF/BATCH、R19_L2_MT/PF/BATCH（-D 扫描）。
-//
-// 协议语义：与集14 基线逐字一致（wait-all、分片旗、l1_prog、l2_done、
-//   checksum、REDUCE epoch、任务编号）；pull/staging/零填充代码自 compute.cuh
-//   原样搬移，仅变量改经 R19Sched 传入。
-//
-// 集21（R21，test/21.mtile_big2）：A 装载 fragment 布局专项
-//   1) 归因：诊断证明 A 的 327µs 成本几乎全在"16 行×32B/指令（16 line）"
-//      的散射装载 + 由此引发的 L2 A 装载 straggler（末位 warp 落后 ~120µs），
-//      与字节量无关（固定地址/L1 常驻即消失）。
-//   2) F_A：pull 阶段在池行主序之外，向本 expert 的 ffn_hidden 空槽
-//      （e*ring+1..3）写一份 A 的 [step][m][row][32B] 分块副本；L1 的 A 装载
-//      变为连续 512B/指令（4 line）。
-//   3) F2：L1 epilogue 同时按字节写 local_data.frag2 的 fragment 副本（(e,w%ring) 槽），
-//      L2 的 A（ffn_hidden）装载同样变 4 line，消除 L2 的 warp 末尾 straggler
-//      （130µs → 16µs）。行主序 ffn_hidden 仅保留 slot0（bench 数值校验读取）。
-//   4) fragment 专用缓冲 = local_data.frag_a/frag2（恒存在，见 [FRAG-INT]）。
-//      L1 kPF 由 1 升 2（acc 128 下刚好容纳）。
-//   5) 结果（71 机同会话）：TPR=128 1405→1246µs（−11.3%）、TPR=64 727→666
-//      （−8.4%）、TPR=16 313→318.5（+1.7%）；正确性/数值全 PASS。
-//
-// 集27（R27，test/27.tpr256_calc）：TPR=256 权重遍数专项
-//   1) 归因（本地 TPR=256 诊断）：B（权重）占 L1 约 700µs / L2 约 260µs，
-//      是 compute 主成本；B 字节 = count/(kMT*16) × 切片列数 × K，即 M 遍数。
-//      count=256 时 MT4 → 4 遍（L1 25.2MB/block、L2 12.6MB/block）。
-//   2) 交付：大 count 档位升为 L1 MT8/B2、L2 MT8/B2（acc 仍 128 floats/线程
-//      顶格：kBatch*kMT*kNT*4=2*8*2*4），R24_KS 16→8 保持 A smem 64KB 双缓冲；
-//      非 async 回退固定 MT4（避免双份大 acc 实例抬高栈）。B 遍数减半
-//      （L1/L2 各减 50% 权重读）。
-//   3) 结果（71 机同会话配对 ×2）：R=8 TPR=256 full 1921→1839µs（−4.3%），
-//      L1 909→713µs（−22%）；TPR=128 +2.8%、TPR=16 +0.5%（≤5% 容忍内）；
-//      正确性三形态 + 三行数值 PASS（bit-exact 不变）。
-//   4) 未达 <1600：task-loop 已由 1972→1470µs（本地），但 wall 被 COMBINE
-//      出/入向 fabric 排空（每 rank ~25MB，~60GB/s 级）+ REDUCE 行旗等待
-//      串死（节点内 full−chain ~340µs，nodes=1 同样存在）——该部分在
-//      combine.cuh/协议侧，compute 两文件内无杠杆（早推实验见 results.md）。
-//
-// 集34（R34，test/40.nondiv_opt）：非整除 TPR 回退路径专项
-//   1) 归因：kAsync 原来要求 count%(MT*16)==0 且 win_cap%16==0 → 129/257/513
-//      整段掉非 async 回退（MT4/B4，权重 ceil(count/64) 遍）；且 F_A 槽位条件
-//      (win_cap&15)==0 使 win_cap 非整除时连 F 布局都不可用。
-//   2) 交付：F_A/F2 按 mt_total=ceil(win_cap/16) 布局（槽 = local_data.frag_a/frag2）；
-//      r24_*_big 改行区间 [c0_begin,c0_end) + kMask 模板（整块无掩码快路径、
-//      尾块掩码）；权重遍数 = ceil(count/(MT*16))。尾块 ≤16 行走 MT1/KS16 小
-//      档（A/MMA 1/8、stage 同步减半）；count∈(16,32] 走小档 body（runtime M
-//      裁剪 + 单批 N）；count>64 才启用 async（≤64 时 async 无权重收益且更慢）。
-//   3) 结果（本机同会话背靠背）：R=32 129 2038.6→1293.9、257 3850.9→2153.2、
-//      513 7715.1→3848.2；R=8 129 1925.8→1195.3、257 3563.0→1924.7、
-//      513 7177.4→3440.7；整除档全面 −4%（尾块掩码谓词在旧快路径的消除）。
-//      正确性三形态 + 数值三行 PASS，bit-exact 不变。
-//
-// 集29（R29，test/29.combine_reduce）：COMBINE×L2 融合推送（尾排空隐匿）
-//   1) 归因（诊断 nodata：保留完成标记、只删数据推送）：R=8 TPR=256
-//      full 1843→1426、R=32 2189→1742 —— 数据推送的「任务尾串行 + 内核退出
-//      前 fabric 排空」共 ~420-450µs，是尾段绝对主成本。
-//   2) 交付：L2 的 r24 路径每算完一个 (c0 行块, g 列批) 就 __stwt 推送该列块
-//      （combine.cuh 的 CombineFuseCtx/combine_push_chunk），任务尾只写完成
-//      标记（combine_mark_rows，保留 fence→sync→lane0 发布序）。协议语义
-//      （每 slice 列范围/标记值 epoch/REDUCE 放行）逐字不变。
-//   3) 结果（71 机同会话）：R=8 TPR=256 1843→1726µs（−6.5%）；TPR=128
-//      981→922（−6.0%）；R=32 TPR=256 2189→1996µs（−8.9%）；正确性/数值
-//      （R=8 256/128/16、R=32 256）全 PASS（bit-exact 不变）。
-//   4) 剩余瓶颈（R=32 <1900 未达，差 ~95µs）：nodata 地板 1743µs 与融合后
-//      1996 之差 ≈ 253µs 是「推送带宽在 L2 内存忙期内只有 ~100GB/s 边际」
-//      + L2 相 ~+70µs 挤出；而 full−chain ≈ 210µs 与 nodata 地板同值，
-//      为 rank 8~31 的固有偏斜（Y 归因驱动/仲裁层，非 COMBINE 可动）。
+// 任务隔离：大 count 整体（pull + 分片旗 + L1 M 档位 + l1_prog + L2 M 档位 +
+//   tail）放进 __noinline__ 的 r19_big_task；count<=kM 走 compute.cuh 的
+//   r19_small_task（同 __noinline__），两者寄存器/栈互不污染。
+// M 档位：外层 c0 按 kMT*16 行分组，组内 B 在 kMT 个 M-tile 间共享（权重遍数
+//   = ceil(count/(kMT*16))）；acc[kBatch][kMT][kNT] 常驻，a_pipe/b_pair 预取环。
+// A 布局：[R21] pool 行主序 + fragment 副本（local_data.frag_a/frag2），4-line
+//   连续装载（消除 16-line 散射与 L2 straggler）。
+// A-smem：[R24/R34] r24_*_big 走 A-smem 双缓冲（bsm 异步）+ 行区间 [c0_begin,
+//   c0_end) + kMask 尾块掩码；MT8/B2（acc 128 顶格），KS=8 保 smem 64KB。
+// 融合推送：[R29] L2 r24 每算完一个 (c0,g) 列块即 __stwt 推送，任务尾只写标记。
+// 协议语义与基线逐字一致（wait-all、分片旗、l1_prog、l2_done、checksum、epoch）。
+// 各优化专项（R21/R24/R27/R29/R34…）的实验与标定见 docs/ 与 perf.md。
 // ============================================================================
 #pragma once
 
@@ -207,14 +136,9 @@ __device__ __forceinline__ R19Frag2 r19_load_b16z(
 #endif
 
 // ============================================================================
-// [R21] A fragment 布局（消除 A 装载的 16-line/指令 散射）：
-//   池中 A 仍按行主序写（保持 bench 数值校验 dump 不变），另在本 expert 的
-//   ffn_hidden 空槽（e*ring+1 起）写一份 A 的 K-step×M-tile 分块副本：
-//       F[step][m][row_in_tile][k_in_step]   step=k/32, m=row/16
-//   地址 = ((step*mt_total + m)*16 + (row&15))*32 + (k&31)，共 win_cap*k_in 字节。
-//   L1 一次 warp 装载的 64 lane 落在连续 512B（4 line）而非 16 行×32B（16 line）。
-//   安全性：仅在"单波（每 block 1 任务）+ 每 expert 单窗（win_cap>=tbl_cap）"
-//   时启用，此时 e*ring+1..ring-1 槽空闲（F 占 3 槽），L2 输出槽不受影响。
+// [R21] A fragment 布局：pool 仍行主序，另写一份 A 的 K-step×M-tile 分块副本到
+//   local_data.frag_a/frag2（F[step][m][row][k]，step=k/32、m=row/16），使 L1/L2
+//   的 A 装载落连续 512B（4-line），消除 16-line 散射与 L2 warp 末尾 straggler。
 // ============================================================================
 // F 装载：一步的 A fragment（lane 布局与 r19_load_a 完全一致）
 __device__ __forceinline__ R19Frag r19_load_a_frag(
@@ -451,23 +375,13 @@ __device__ __forceinline__ void r19_l1_big(
 }
 
 // ============================================================================
-// [R24] L1 的 A 走 smem：warp 协作 bsm 异步搬运（__builtin_mxc_ldg_b128_bsm）
-//   - 每个 stage = kKS 个 K step（kKS*32B/行）× kMT 个 M-tile（kMT*16 行）
-//   - smem 布局与 F_A 逐字一致：[j][m][row][32B]，LDS 直接读 native fragment
-//   - 双缓冲：stage st 消费时，stage st+1 的 bsm 在飞；arrive_gvmcnt(0) +
-//     __syncthreads 发布当前 buffer
-//   - B 仍直装（ldg 16B/lane），预取环 2 槽跨 stage 连续
-//   - [R34] 支持任意 count（行区间 [c0_begin,c0_end)）：整块 kMask=false 无
-//     掩码快路径，尾块 kMask=true（F tile 越界折叠 + row<cc 掩码）；k_iters
-//     仍须为 kKS 整数倍，否则调用点回退 r19_l1_big
+// [R24] L1 的 A 走 smem：warp 协作 bsm 异步搬运（__builtin_mxc_ldg_b128_bsm）。
+//   每 stage = kKS 个 K step × kMT 个 M-tile；smem 布局同 F_A [j][m][row][32B]，
+//   双缓冲（stage st 消费时 st+1 在飞）；B 直装 + 预取环 kBPF。[R34] 支持任意
+//   count（行区间 [c0_begin,c0_end)：整块无掩码 + 尾块 kMask 掩码）；k_iters 须为
+//   kKS 整数倍，否则回退 r19_l1_big。[R27] KS=8 使 MT8 双缓冲保持 64KB。
+//   [OPT-KCAP-REMOVE] MT8 大档寄存器/栈由 R19_GEMM_ATTR=__noinline__ 隔离。
 // ============================================================================
-// [R27·delivered] A-smem 阶段步长由 16 降为 8：MT8 下 smem 双缓冲保持
-//   2*8*8*512=64KB（KS=16 会到 128KB，加动态 smem 后超设备 131072B/block
-//   上限，实测启动失败）。KS=8 在 71 机与 KS=16 中性，本地略优。
-// [OPT-KCAP-REMOVE] MT8 大档 acc（kBatch*kMT*kNT*4）会把 r19_big_task 的寄存器/
-//   栈顶高，拖慢同函数内 count<=64 的小/中档路径。原用编译期 kCap=48/64 实例删除
-//   重档（见旧 [OPT-TK-CAP64]，前 50 launch ~-4%）；现改由 r24_*_big 的
-//   R19_GEMM_ATTR=__noinline__ 独立寄存器/栈隔离达成同等效果（运行期按 win_cap 选档）。
 #ifndef R24_KS
 #define R24_KS 8
 #endif
@@ -1303,12 +1217,8 @@ __device__ R19_BIG_ATTR void r19_big_task(
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
-    // [OPT-KCAP-REMOVE] 去掉编译期 count 上界模板参：改由运行期档选择（count 分支
-    //   本已是运行期 if）。重型 GEMM 档（r24_*）用 R19_GEMM_ATTR=__noinline__ 独立
-    //   编译单元隔离寄存器/栈，因此不再需要 if constexpr 删除不可达档。
-    // [R38] tk/长尾（win_cap<=64）用更深 B 预取环（R24_BPF_HAVE_HEADROOM=4）：这些
-    //   场景 count<=64、寄存器预算有裕量；均衡大档（win_cap>64）保持 R24_BPF(2)，
-    //   避免 TPR=256 回退。运行期按 S.a->win_cap 选择（见各 r24 调用点）。
+    // 档位运行期选（无编译期 kCap）；重型 r24_* 用 R19_GEMM_ATTR=__noinline__ 隔离。
+    // [R38] win_cap<=64（tk/长尾）r24 用更深 B 预取环(4)，均衡大档保持 R24_BPF(2)。
     constexpr int kR24BPF = R24_BPF;
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
     // [tail 内联] ctx/fuse 由 S 现构造（CombineTail 已去除）

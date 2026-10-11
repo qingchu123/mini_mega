@@ -489,7 +489,6 @@ __device__ __forceinline__ void reduce_body(
     // （block0 为 leader，每 launch 恰自增一次），故 (ct-1)%M_CYCLE = L%M_CYCLE，
     // 与本轮 mega 的 bar / combine_sums 片一致。用 device 计数派生，graph 安全。
     const int cyc = (int)((lf->current_time[0][1] - 1) % M_CYCLE);
-    const uint32_t* bar_flags = lf->bar[cyc];
     int* dbg = lf->dbg;
     // [集71] REDUCE 启动次数（block0 tid0）+ 参与 block 数（tid0）
     if (threadIdx.x == 0) {
