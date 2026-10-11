@@ -116,8 +116,11 @@ void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream);
 void launch_compute(const MegaLaunchArgs& a, mcStream_t stream);
 // [L1L2-SPLIT] 拆分阶段入口：L1 = 前序+DISPATCH+L1；L2 = 轻量前序+L2+COMBINE。
 //   正常路径经 launch_compute + env MX_L1L2_SPLIT=1 自动拆分，一般无需直接调用。
+//   [CM_L1L2_SPLIT=0 默认不编译]
+#if CM_L1L2_SPLIT
 void launch_l1(const MegaLaunchArgs& a, mcStream_t stream);
 void launch_l2(const MegaLaunchArgs& a, mcStream_t stream);
+#endif
 // 仅 REDUCE（mega_reduce_kernel，grid=2*tokens）
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream);
 // 全链（同 stream：mega_kernel<true> + REDUCE）

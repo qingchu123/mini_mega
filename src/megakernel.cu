@@ -14,6 +14,11 @@
 #include "common.cuh"
 #include "kernel.cuh"
 
+// [L1L2-SPLIT] 编开关：默认 0=不编译 L1/L2 拆分路径（launch_l1/l2/phase）。
+#ifndef CM_L1L2_SPLIT
+#define CM_L1L2_SPLIT 0
+#endif
+
 namespace fp8mega {
 
 // ============================================================================
@@ -146,6 +151,7 @@ void dbg_capture_launch(const MegaLaunchArgs& a, mcStream_t stream) {
 // [L1L2-SPLIT] 运行期开关：MX_L1L2_SPLIT=1 时 launch_compute 拆成
 //   L1/L2 两个 kernel（同 stream 顺序）。首次调用读 env 定型（graph capture
 //   期间只读 env、无设备操作，合法）。
+#if CM_L1L2_SPLIT
 int mx_l1l2_split() {
     static const int v = [] {
         const char* e = std::getenv("MX_L1L2_SPLIT");
@@ -172,6 +178,7 @@ void launch_phase_impl(const MegaLaunchArgs& a, mcStream_t stream,
         mega_kernel<true, false, 0, ph>
             <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b));
 }
+#endif  // CM_L1L2_SPLIT
 
 }  // namespace
 
@@ -180,6 +187,7 @@ void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream) {
         to_mega_args(a));
 }
 
+#if CM_L1L2_SPLIT
 void launch_l1(const MegaLaunchArgs& a, mcStream_t stream) {
     dbg_capture_launch(a, stream);
     launch_phase_impl<MegaPhase::L1>(a, stream, /*skip_override=*/-1);
@@ -191,17 +199,20 @@ void launch_l2(const MegaLaunchArgs& a, mcStream_t stream) {
     //   （combine/REDUCE 的 cyc/epoch 均由此派生，见 combine.cuh:496-508）。
     launch_phase_impl<MegaPhase::L2>(a, stream, /*skip_override=*/2);
 }
+#endif  // CM_L1L2_SPLIT
 
 void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
     // [MEGA_DEBUG=4] 采集 kernel（mega 之前；默认关，零开销）
     dbg_capture_launch(a, stream);
     // [L1L2-SPLIT] 拆分模式：L1 → L2 两个 launch（同 stream；graph capture
     //   下两节点依次录入，replay 顺序不变）。
+#if CM_L1L2_SPLIT
     if (mx_l1l2_split()) {
         launch_phase_impl<MegaPhase::L1>(a, stream, /*skip_override=*/-1);
         launch_phase_impl<MegaPhase::L2>(a, stream, /*skip_override=*/2);
         return;
     }
+#endif
     // [FRAG-INT] fragment 缓冲为 kernel 内部（rwk->ld），host 不再传入。fragment
     //   分支恒编译（[FRAG-ALWAYS]），运行期按 frag_all/几何自动启用。
     // [OPT-TK-CAP] 按 win_cap 选编译期 count 上界实例（kCap=48/64）：不可达的重档
@@ -253,10 +264,6 @@ void dump_kernel_resources() {
     q("kCap64", (const void*)mega_kernel<true, false, 64>);
     q("full",   (const void*)mega_kernel<true>);
     q("empty",  (const void*)mega_kernel<false>);
-    q("L1full", (const void*)mega_kernel<true, false, 0,
-                                        MegaPhase::L1>);
-    q("L2full", (const void*)mega_kernel<true, false, 0,
-                                        MegaPhase::L2>);
 }
 }  // namespace fp8mega
 
