@@ -716,7 +716,7 @@ __device__ __forceinline__ void dispatch_pull_body(
     int* s_count = reinterpret_cast<int*>(smem_raw);   // EPR：每专家总行数
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）
     int* s_prefix = s_cum + kEPR + 1;                  // EPR*(R+1)：全 experts src 前缀
-    __shared__ int s_task, s_expert, s_window, s_count_w, s_row_off, s_slice;
+    __shared__ int s_task, s_expert, s_window, s_count_w, s_slice;
     __shared__ unsigned s_epoch;
     // prefix_ptr 非空时用独立前缀表缓冲（与 task_setup_body 的 prefix_ptr 对齐）
     const int* prefix = (prefix_ptr != nullptr)
@@ -726,8 +726,6 @@ __device__ __forceinline__ void dispatch_pull_body(
     const int warp = tid / 64;
     const int lane = tid % 64;
     (void)warp; (void)lane;
-    // 相位计时（可选，默认 nullptr 不改变原行为）：仅 block0 的首个任务由 tid0 记录
-    const bool kTick = (pt != nullptr) && (blockIdx.x == 0) && (tid == 0);
     // [O1] 全 experts src 前缀一次预载（s_prefix 扩容 EPR*(R+1)）
     for (int i = tid; i < kEPR * (R + 1); i += (int)blockDim.x)
         s_prefix[i] = prefix[i];
@@ -819,7 +817,6 @@ __device__ __forceinline__ void dispatch_pull_body(
                 s_window = tw - s_cum[lo];
                 const int remain = s_count[lo] - s_window * win_cap;
                 s_count_w = remain < win_cap ? remain : win_cap;
-                s_row_off = s_window * win_cap;
                 s_epoch = *(volatile const uint32_t*)(bar_flags + task_ready_idx);
                 // [L1L2-SPLIT] ring 门等前代 L2 完成；拆分下前代 L2 在下一个
                 //   kernel（stream 顺序已保证），且数据槽不复用 → 编译期跳过。

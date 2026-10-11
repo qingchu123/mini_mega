@@ -244,15 +244,9 @@ __device__ __forceinline__ void r19_store_a_frag(
     *reinterpret_cast<uint4*>(p) = v;
 }
 
-// [R21] L2 的 A（ffn_hidden）fragment 副本：同一 [step][m][16][32B] 分块，
+// [R21] L2 的 A（ffn_hidden）fragment 副本布局：同一 [step][m][16][32B] 分块，
 // step = k/32（I=2048 → 64 步），m = row/16（win_cap/16 个）。L1 epilogue 按
 // 字节写入；L2 一次 warp 装载落连续 512B（4 line）。
-__device__ __forceinline__ void r19_store_ffn_frag(
-        uint8_t* __restrict__ f2, int row, int col, uint8_t v, int mt_total) {
-    f2[((size_t)(col >> 5) * mt_total + (row >> 4)) * 512 + (row & 15) * 32 +
-       (col & 31)] = v;
-}
-
 __device__ __forceinline__ R19Frag r19_load_a2_frag(
         const uint8_t* __restrict__ f2, int kk, int m_abs, int mt_total,
         int row_limit) {
@@ -1333,7 +1327,6 @@ __device__ R19_BIG_ATTR void r19_big_task(
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
     const uint8_t* pool_w = pool + (size_t)pool_slot * S.a->win_cap * kHidden;
-    const CombineCtx cctx = cm_build_ctx(S);
     const int g_l1 = ((2 * S.a->l1_k_out) / kL1BlockN) / S.nslice_eff;
     const int g0_l1 = slice * g_l1;
     // [集71] L1 阶段执行次数（count>0 的任务，tid0 计一次）
@@ -1749,7 +1742,6 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
     const uint8_t* pool_w = pool + (size_t)pool_slot * S.a->win_cap * kHidden;
-    const CombineCtx cctx = cm_build_ctx(S);
     const int g_l1 = ((2 * S.a->l1_k_out) / kL1BlockN) / S.nslice_eff;
     const int g0_l1 = slice * g_l1;
     // [集71] L1 阶段执行次数（count>0 的任务，tid0 计一次）
