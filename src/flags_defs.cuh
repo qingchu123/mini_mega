@@ -91,6 +91,12 @@ struct alignas(256) ranks_flags {
         combine_sums[M_CYCLE][kTopk][kMaxCombineRows][kCombineSlicesMax];
 };
 
+// [WP-G1] 组内权重复制几何：kGroupRanks=4 连续 rank 一组，kGE=32 为每组专家数。
+//   全局专家映射：owner=e/kEPR，组=owner/kGroupRanks，组内专家序
+//   ge=(owner%kGroupRanks)*kEPR+(e%kEPR)∈[0,kGE)。
+constexpr int kGroupRanks = 4;
+constexpr int kGE = kEPR * kGroupRanks;
+
 // ---- 本 rank 私有（普通显存）----
 struct alignas(256) local_data {
     // 输入复用
@@ -106,8 +112,16 @@ struct alignas(256) local_data {
     // [冗余，暂注释] alignas(256) int token_src_meta[kEPR + kGrid][kMaxTPR][3];  // 走 scratch 偏移
 
 
+#if MX_GROUP_WEIGHTS
+    // [WP-G1] 组内 4× 本地只读权重：ge∈[0,kGE=32) 覆盖本组 32 专家。
+    //   ge 块 b∈[0,4) 对应组内第 b 个 owner rank 的 kEPR 个专家（固定种子复现，
+    //   组内各 rank 一致）。取代原 w1[kEPR]/w2[kEPR]。
+    alignas(256) uint8_t w1g[kGE][2*kIntermediate][kHidden];
+    alignas(256) uint8_t w2g[kGE][kHidden][kIntermediate];
+#else
     alignas(256) uint8_t w1[kEPR][2*kIntermediate][kHidden];
     alignas(256) uint8_t w2[kEPR][kHidden][kIntermediate];
+#endif
     alignas(256) uint8_t ffn_hidden[kEPR * kRing][kMaxTPR][kIntermediate];
     // [BALANCE·docs/20] L1 split-K FP32 部分和（gate/up 原值，未 SwiGLU）：每 (slot, N片 s)
     //   一块 [行][2I/NS]，NK 个 K 段 atomicAdd 累加；最后一段读回→SwiGLU→FP8 写 ffn_hidden。

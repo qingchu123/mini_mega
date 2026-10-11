@@ -188,10 +188,31 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     CHECK(mcMemset(d.unk, 0, sizeof(unk_data)));
     d.rf = &d.unk->rf;
     d.rd = &d.unk->rd;
+#if MX_GROUP_WEIGHTS
+    // [WP-G1] 组权重：本 rank 持本组 kGE=32 专家的只读权重。ge 块 b∈[0,4) 对应组内
+    //   第 b 个 owner rank 的 kEPR 个专家；用与原 per-rank 相同的固定种子逐块复现
+    //   （block0 起每块从 row 0 生成 → w1g[ge]==(ge%kEPR) 专家的原字节），因此组内
+    //   各 rank 得到的 w1g/w2g 逐字节一致。w1g[0..kEPR) 与原 w1[0..kEPR) 相同，故
+    //   现有 kernel（只读前 kEPR 专家）在开启后仍逐字节等价。
+    d.w1 = &d.ld->w1g[0][0][0];
+    d.w2 = &d.ld->w2g[0][0][0];
+    for (int b = 0; b < kGroupRanks; ++b) {
+        fp8mega::fill_weights_lane(
+            d.w1 + (size_t)b * kEPR * 2 * kIntermediate * kHidden,
+            kEPR * 2 * kIntermediate, kHidden, 17u, 0);
+        fp8mega::fill_weights_lane(
+            d.w2 + (size_t)b * kEPR * kHidden * kIntermediate,
+            kEPR * kHidden, kIntermediate, 91u, 0);
+    }
+#else
     d.w1 = &d.ld->w1[0][0][0];
     d.w2 = &d.ld->w2[0][0][0];
     fp8mega::fill_weights_lane(d.w1, kEPR * 2 * kIntermediate, kHidden, 17u, 0);
     fp8mega::fill_weights_lane(d.w2, kEPR * kHidden, kIntermediate, 91u, 0);
+#endif
+    if (rank == 0)
+        std::printf("[WP-G1] MX_GROUP_WEIGHTS=%d sizeof(rwk_data)=%zu bytes\n",
+                    MX_GROUP_WEIGHTS, sizeof(rwk_data));
     CHECK(mcDeviceSynchronize());
 
     d.ffn = &d.ld->ffn_hidden[0][0][0];

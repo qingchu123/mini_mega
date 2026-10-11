@@ -66,6 +66,16 @@ constexpr int kRecvStride = 64;   // recv 行宽（word）= 256B/4（256B 缓存
 #define MX_IN_BF16 0
 #endif
 
+// [WP-G1] 组内 4× 静态权重复制：R=32 → 8 组 × 4 连续 rank，每组 32 专家。
+//   1 = local_data 持本组 32 个专家的只读权重 w1g[kGE][2I][H] / w2g[kGE][H][I]
+//       （kGE=kEPR*4=32），取代原 per-rank 的 w1[kEPR]/w2[kEPR]。
+//   0（默认）= 逐字节等价现状（w1/w2 不变），零行为变更。
+//   注：热缓冲（pool/ffn/frag/l1_partial 等）保持 kEPR 不变；消费点（compute_big）
+//   由另一 agent 接入，本开关只负责结构体/填充就绪。
+#ifndef MX_GROUP_WEIGHTS
+#define MX_GROUP_WEIGHTS 0
+#endif
+
 // 自旋上限（异常保护）：约 1s（4M 周期 @2GHz）
 constexpr long long kSpinLimit = 4000000LL;
 // PUBLISH 校验槽 epoch（阶段 1 用常量；生产为 epoch_base+1）
