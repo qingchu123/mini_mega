@@ -687,6 +687,9 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.pt = pt;
     S.frag_a = frag_a;
     S.frag2 = frag2;
+    // [BALANCE·docs/20 §4.2] L1 split-K 部分和 / 段计数缓冲（kernel 内部派生）
+    S.l1_partial = a->rwk->ld.l1_partial[0][0][0];
+    S.l1_part_cnt = a->rwk->lf.l1_part_cnt[0];
     // [R34][FRAG-INT] fragment m 维 = ceil(win_cap/16)；槽 = local_data.frag_a/frag2。
     const int mt_total = (win_cap + 15) >> 4;
     S.mt_total = mt_total;

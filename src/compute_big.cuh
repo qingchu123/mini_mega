@@ -49,6 +49,14 @@
 #define CM_MED_R24 1
 #endif
 
+// [BALANCE·docs/20 §4.2] L1 split-K：把每个 (专家,窗口) 的 L1 沿 K=H 切成 kNK 段，
+//   各段把 gate/up 的 FP32 部分和写/加到 l1_partial[slot][s]，最后一段读回→
+//   SwiGLU→FP8→ffn_hidden/frag2，然后再走现有 l1_prog 发布。默认 0 = 现行为
+//   （逐字不变：所有新路径经 if (L1_SPLITK&&...) 编译期消除）。1 = 开启验证。
+#ifndef L1_SPLITK
+#define L1_SPLITK 0
+#endif
+
 
 // [L1L2-SPLIT] 任务体阶段：拆成两个 kernel 时，L1 kernel 只跑 DISPATCH+L1，
 //   L2 kernel 只跑 L2+tail。kPhaseBoth = 原合并路径（行为逐字不变）。
@@ -199,6 +207,9 @@ struct R19Sched {
     unsigned long long* pt;     // = lf->pre_ticks
     uint8_t* frag_a;            // = ld->frag_a[0]
     uint8_t* frag2;             // = ld->frag2[0]
+    // [BALANCE·docs/20 §4.2] L1 split-K 部分和缓冲 / 段完成计数（kernel 内部派生）
+    float* l1_partial;          // = ld->l1_partial[0][0][0]（FP32 gate/up 部分和）
+    uint32_t* l1_part_cnt;      // = lf->l1_part_cnt[0][0]（每 (slot,s) 段计数）
     bool frag_all;
     uint64_t epoch;             // = current_time[0][1]
     int merge;
@@ -219,9 +230,10 @@ __device__ __forceinline__ R19Frag r19_zero_a() { return R19Frag{0u, 0u}; }
 #else
 #define R21_LDA(step, m)                                                    \
     ((fbase != nullptr)                                                     \
-         ? r19_load_a_frag(fbase, (step), m_abs0 + (m), mt_total,           \
-                           m_abs0 * kM + count)                             \
-         : r19_load_a(pool, k_hidden, (step) * kKStep, count, (m)))
+         ? r19_load_a_frag(fbase, k_step_begin + (step), m_abs0 + (m),      \
+                           mt_total, m_abs0 * kM + count)                   \
+         : r19_load_a(pool, k_hidden, (k_step_begin + (step)) * kKStep,     \
+                      count, (m)))
 #endif
 
 // [R21] L2 的 A 装载选择：f2 非空走 fragment 布局
@@ -245,7 +257,13 @@ __device__ __forceinline__ void r19_l1_big(
         int k_hidden, int n_total, int block_n, int lane, int warp, int nwarps,
         float* checksum, int n_group_begin, int n_group_count,
         uint8_t* ffn_out, uint8_t* ffn2, int out_col_base, int k_out,
-        int m_tile_base = 0) {
+        int m_tile_base = 0,
+        // [BALANCE·docs/20 §4.2] K 范围（默认全 K，既有调用点不变）：
+        //   k_step_begin = 起始 K step（= 全局 k/32），k_steps = 本调用的 step 数
+        //   （<0 → 全 K）。l1_part 非空进入「部分和 epilogue」：跳过 SwiGLU/FP8，
+        //   gate/up 原值 FP32：seg==0 直写、否则 atomicAdd 到 l1_partial。
+        int k_step_begin = 0, int k_steps = -1,
+        float* l1_part = nullptr, int l1_seg = 0, int l1_row0 = 0) {
     const uint8_t* w_e = w1 + (size_t)expert * n_total * k_hidden;
     float acc_chk = 0.0f;
     for (int c0 = 0; c0 < count; c0 += kMT * kM) {
@@ -258,7 +276,7 @@ __device__ __forceinline__ void r19_l1_big(
         for (; g0 + kBatch <= n_group_begin + n_group_count; g0 += kBatch) {
             constexpr int kKStep = 32;
             constexpr int kNT = 2;
-            const int k_iters = k_hidden / kKStep;
+            const int k_iters = (k_steps >= 0) ? k_steps : (k_hidden / kKStep);
             const int n_per_warp = block_n / nwarps;
             int nbase[kBatch];
             #pragma unroll
@@ -275,7 +293,8 @@ __device__ __forceinline__ void r19_l1_big(
                 #pragma unroll
                 for (int q = 0; q < kBatch; ++q)
                     b_pair[sp][kBatch - 1 - q] =
-                        R19_LDB(w_e, nbase[q], sp * kKStep, k_hidden);
+                        R19_LDB(w_e, nbase[q],
+                                (k_step_begin + sp) * kKStep, k_hidden);
             }
             R19Acc acc[kBatch][kMT][kNT];
             #pragma unroll
@@ -309,7 +328,8 @@ __device__ __forceinline__ void r19_l1_big(
                     #pragma unroll
                     for (int q = 0; q < kBatch; ++q)
                         b_pair[sp][kBatch - 1 - q] =
-                            R19_LDB(w_e, nbase[q], nk * kKStep, k_hidden);
+                            R19_LDB(w_e, nbase[q],
+                                    (k_step_begin + nk) * kKStep, k_hidden);
                 }
             }
             #pragma unroll
@@ -319,6 +339,32 @@ __device__ __forceinline__ void r19_l1_big(
                 for (int m = 0; m < kMT; ++m) {
                     #pragma unroll
                     for (int t = 0; t < kNT; ++t) {
+                        // [BALANCE·docs/20 §4.2] 部分和 epilogue：不做 SwiGLU/FP8，
+                        //   把 gate/up 原 acc 以 FP32 写入 l1_partial[..][2*hc(+1)]。
+                        if (l1_part != nullptr) {
+                            const int hc =
+                                (((g0 - n_group_begin) >> 1) + pi) * block_n +
+                                warp * n_per_warp + t * 16 + (lane & 15);
+                            #pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                const int row = m * kM + (lane >> 4) * 4 + i;
+                                if (row < cc) {
+                                    float* pp = l1_part +
+                                        (size_t)(l1_row0 + c0 + row) *
+                                            kL1SliceCols + 2 * hc;
+                                    const float gv = acc[qa][m][t][i];
+                                    const float uv = acc[qb][m][t][i];
+                                    if (l1_seg == 0) {
+                                        pp[0] = gv;
+                                        pp[1] = uv;
+                                    } else {
+                                        atomicAdd(pp, gv);
+                                        atomicAdd(pp + 1, uv);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         R19Acc sw;
                         #pragma unroll
                         for (int i = 0; i < 4; ++i) {
@@ -367,7 +413,8 @@ __device__ __forceinline__ void r19_l1_big(
                 a_c, fbase,
                 mt_total, w1, expert, cc, k_hidden, n_total, block_n, lane,
                 warp, nwarps, checksum, g0, n_group_count - (g0 - n_group_begin),
-                f_c, ffn2, out_col_base, k_out, m_abs0);
+                f_c, ffn2, out_col_base, k_out, m_abs0,
+                k_step_begin, k_steps, l1_part, l1_seg, l1_row0 + c0);
         }
     }
     if (checksum != nullptr && lane == 0)
@@ -388,6 +435,120 @@ __device__ R19_L1BIG_ISO void r19_l1_big_iso(
         pool, fbase, mt_total, w1, expert, count, k_hidden, n_total, block_n,
         lane, warp, nwarps, checksum, n_group_begin, n_group_count, ffn_out,
         ffn2, out_col_base, k_out, m_tile_base);
+}
+
+// ============================================================================
+// [BALANCE·docs/20 §4.2] L1 split-K 归约：读 l1_partial 的 NK 段累加结果
+//   （gate/up 原值，布局 [row][2*hc(+1)]）→ SwiGLU → FP8 → ffn_hidden/frag2。
+//   布局公式与 r19_l1_big 的 epilogue 逐字同构（:336-344/:579-589）。
+// ============================================================================
+template <int kMT>
+__device__ __forceinline__ void r19_l1_reduce(
+        const float* part, int count, int block_n, int lane, int warp,
+        int nwarps, int out_col_base, int k_out, uint8_t* ffn_out,
+        uint8_t* ffn2, int mt_total, int m_tile_base = 0) {
+    constexpr int kNT = 2;
+    const int n_per_warp = block_n / nwarps;
+    // 本 slice 的输出 tile 组数 = (I/nslice_eff)/block_n = (kL1SliceCols/2)/block_n
+    const int g_pairs = (kL1SliceCols / 2) / block_n;
+    for (int c0 = 0; c0 < count; c0 += kMT * kM) {
+        const int cc = (count - c0 < kMT * kM) ? (count - c0) : kMT * kM;
+        uint8_t* f_c = (ffn_out != nullptr) ? ffn_out + (size_t)c0 * k_out
+                                            : nullptr;
+        const int m_abs0 = (c0 >> 4) + m_tile_base;
+        for (int gi = 0; gi < g_pairs; ++gi) {
+            #pragma unroll
+            for (int m = 0; m < kMT; ++m) {
+                #pragma unroll
+                for (int t = 0; t < kNT; ++t) {
+                    const int hc = gi * block_n + warp * n_per_warp + t * 16 +
+                                   (lane & 15);
+                    R19Acc sw = {0.f, 0.f, 0.f, 0.f};
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int row = m * kM + (lane >> 4) * 4 + i;
+                        if (row < cc) {
+                            const float* pr =
+                                part + (size_t)(c0 + row) * kL1SliceCols +
+                                2 * hc;
+                            const float gv = pr[0], uv = pr[1];
+                            sw[i] = gv / (1.0f + __expf(-gv)) * uv;
+                        }
+                    }
+                    if (f_c != nullptr || ffn2 != nullptr) {
+                        const uint32_t packed =
+                            __builtin_mxc_cvt_pk4_f32tof8_cfg(
+                                sw, _MACA_FROUND_TO_NEAREST_EVEN,
+                                _MACA_DENORMAL_FLUSH_NONE,
+                                _MACA_SRC_NO_MODIFIER, false, true);
+                        const int col = out_col_base + hc;
+                        uint8_t* f2p = nullptr;
+                        if (ffn2 != nullptr)
+                            f2p = ffn2 +
+                                  ((size_t)(col >> 5) * mt_total + (m_abs0 + m)) *
+                                      512 +
+                                  (lane >> 4) * 4 * 32 + (col & 31);
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int row = m * kM + (lane >> 4) * 4 + i;
+                            if (row < cc) {
+                                const uint8_t byte = (uint8_t)(packed >> (8 * i));
+                                if (f_c != nullptr)
+                                    f_c[(size_t)row * k_out + col] = byte;
+#ifndef R24_DIAG_NOMAINT
+                                if (f2p != nullptr) f2p[i * 32] = byte;
+#endif
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// [BALANCE·docs/20 §4.2] 块内 split-K：同一任务的 block 自己跑 kNK 个 K 段，
+//   各段（seg）用 r19_l1_big 的部分和 epilogue 写/加到 part[slot][s]；
+//   tid0 用 l1_part_cnt 的 atomicAdd 判「最后一段」触发归约（写 ffn/frag2）。
+//   计数在本窗第一段（seg==0）开始前清零（窗口复用处，不依赖残留值）。
+//   归约完成于调用者发布 l1_prog 之前。part/cnt 已由调用者定位到本 (slot,s)；
+template <int kMT, int kPF, int kBatch>
+__device__ __noinline__ void r19_l1_splitk_iso(
+        const uint8_t* pool_w, const uint8_t* fbase, int mt_total,
+        const uint8_t* w1, int expert, int count, int k_hidden, int n_total,
+        int block_n, int lane, int warp, int nwarps, int n_group_begin,
+        int n_group_count, int out_col_base, int k_out, float* part,
+        uint32_t* cnt, uint8_t* ffn_out, uint8_t* ffn2) {
+    const int chunk = (k_hidden / kNK) / 32;   // 每 K 段 step 数（kKStep=32）
+    __shared__ int s_last;
+    #pragma unroll 1
+    for (int seg = 0; seg < kNK; ++seg) {
+        // [BALANCE·docs/20 §4.2] 窗口复用处清零：本窗第一段开始前把计数归零
+        //   （不依赖初始/上一代的残留值；ring 门保证同槽前代已结束）。
+        if (seg == 0 && lane == 0 && warp == 0)
+            *reinterpret_cast<volatile uint32_t*>(cnt) = 0u;
+        r19_l1_big<kMT, kPF, kBatch>(
+            pool_w, fbase, mt_total, w1, expert, count, k_hidden, n_total,
+            block_n, lane, warp, nwarps, nullptr, n_group_begin, n_group_count,
+            nullptr, nullptr, out_col_base, k_out, /*m_tile_base=*/0,
+            /*k_step_begin=*/seg * chunk, /*k_steps=*/chunk,
+            /*l1_part=*/part, /*l1_seg=*/seg, /*l1_row0=*/0);
+        // 全 block 各 warp 的部分和写必须完成后再计段，否则 tid0 可能先于其它
+        //   warp 的 epilogue 完成而触发归约 → 读到未写完的部分和。
+        __syncthreads();
+        if (lane == 0 && warp == 0) {
+            __threadfence();
+            const unsigned old = atomicAdd(cnt, 1u);
+            s_last = (old == (unsigned)(kNK - 1));
+        }
+        __syncthreads();
+    }
+    if (s_last) {
+        __threadfence();
+        r19_l1_reduce<kMT>(part, count, block_n, lane, warp, nwarps,
+                           out_col_base, k_out, ffn_out, ffn2, mt_total);
+        __syncthreads();
+    }
 }
 
 // ============================================================================
@@ -469,11 +630,13 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
         int expert, int c0_begin, int c0_end, int k_hidden, int n_total,
         int block_n, int lane, int warp, int nwarps, float* checksum,
         int n_group_begin, int n_group_count, uint8_t* ffn_out, uint8_t* ffn2,
-        int out_col_base, int k_out) {
+        int out_col_base, int k_out,
+        // [BALANCE·docs/20 §4.2] K 范围（默认全 K，既有调用点不变）
+        int k_step_begin = 0, int k_steps = -1) {
     constexpr int kKStep = 32;
     constexpr int kNT = 2;
     constexpr int kBufBytes = kMT * kKS * 512;
-    const int k_iters = k_hidden / kKStep;
+    const int k_iters = (k_steps >= 0) ? k_steps : (k_hidden / kKStep);
     const int nstage = k_iters / kKS;
     const int n_per_warp = block_n / nwarps;
     const uint8_t* w_e = w1 + (size_t)expert * n_total * k_hidden;
@@ -491,15 +654,16 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
         #pragma unroll
         for (int q = 0; q < kBatch; ++q)
             nbase[q] = (g0 + q) * block_n + warp * n_per_warp;
-        r24_issue_a<kMT, kKS, kMask, kMTAct>(s_mem, fbase, 0, mt_total,
-                                        m_abs0);
+        r24_issue_a<kMT, kKS, kMask, kMTAct>(s_mem, fbase, k_step_begin,
+                                        mt_total, m_abs0);
         R19Frag2 b_pair[kBPF][kBatch];
         #pragma unroll
         for (int sp = 0; sp < kBPF; ++sp) {
             if (sp >= k_iters) break;
             #pragma unroll
             for (int q = 0; q < kBatch; ++q)
-                b_pair[sp][q] = R19_LDB(w_e, nbase[q], sp * kKStep, k_hidden);
+                b_pair[sp][q] = R19_LDB(w_e, nbase[q],
+                                        (k_step_begin + sp) * kKStep, k_hidden);
         }
         R19Acc acc[kBatch][kMT][kNT];
         #pragma unroll
@@ -516,7 +680,7 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
             if (st + 1 < nstage)
                 r24_issue_a<kMT, kKS, kMask, kMTAct>(
                     s_mem + ((st + 1) & 1) * kBufBytes, fbase,
-                    (st + 1) * kKS, mt_total, m_abs0);
+                    k_step_begin + (st + 1) * kKS, mt_total, m_abs0);
             const uint8_t* sb = s_mem + (st & 1) * kBufBytes;
             #pragma unroll
             for (int j = 0; j < kKS; ++j) {
@@ -546,7 +710,8 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
                 if (nk < k_iters) {
                     #pragma unroll
                     for (int q = 0; q < kBatch; ++q)
-                        b_pair[sp][q] = R19_LDB(w_e, nbase[q], nk * kKStep,
+                        b_pair[sp][q] = R19_LDB(w_e, nbase[q],
+                                                (k_step_begin + nk) * kKStep,
                                                 k_hidden);
                 }
             }
@@ -1281,6 +1446,23 @@ __device__ R19_BIG_ATTR void r19_big_task(
         // 行主序 ffn_hidden 仅 bench 数值校验读 slot0；fragment 时其余槽只写 F2
         if ((kFragNew && CM_FRAG_L2) && pool_slot != 0)
             ffn_slot = nullptr;
+#if L1_SPLITK
+        // [BALANCE·docs/20 §4.2] split-K 路径：块内跑 kNK 个 K 段 + 归约。
+        //   要求 A 走 fragment（fbase）以便按全局 K step 定位；否则退回原链。
+        if (fbase != nullptr) {
+            const int part_slot = e * kRing + (w % kRing);
+            float* part = S.l1_partial +
+                ((size_t)part_slot * kNSlice + slice) * kMaxTPR * kL1SliceCols;
+            uint32_t* cnt =
+                S.l1_part_cnt + (size_t)part_slot * kNSlice + slice;
+            r19_l1_splitk_iso<4, R19_L1_PF, 4>(
+                pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
+                g0_l1, g_l1, out_col_base, S.a->l1_k_out, part, cnt,
+                ffn_slot, ffn2);
+        } else
+#endif
+        {
         // [R24/R34] A-smem 路径：F 可用 + kKS 整除 + 单批（g_l1==kBatch）。
         // [R34] 去掉 count%(MT*16)==0 门控：count>64 时走"全块 + 尾块"两段式
         // （尾块按 row<cc 掩码），权重遍数 = ceil(count/(MT*16))（旧整段 MT4
@@ -1455,6 +1637,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                 (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
+        }   // end L1_SPLITK else（原实例选择链）
     }   // end if (CM_L1_GATE)
     }   // end if constexpr (kPhase != MegaPhase::L2)  —— L1 段
 #if R24_DIAG_PHASE
@@ -1692,6 +1875,29 @@ __device__ R19_SMALL_ATTR void r19_small_task(
             if (CM_FRAG_L2 && CM_FRAG_F2) ffn2 = S.frag2 + soff * f2sz;
         }
         if ((kFragNew && CM_FRAG_L2) && pool_slot != 0) ffn_slot = nullptr;
+#if L1_SPLITK
+        // [BALANCE·docs/20 §4.2] 小档 split-K：同 big（fbase 必需）。
+        if (fbase != nullptr) {
+            const int part_slot = e * kRing + (w % kRing);
+            float* part = S.l1_partial +
+                ((size_t)part_slot * kNSlice + slice) * kMaxTPR * kL1SliceCols;
+            uint32_t* cnt =
+                S.l1_part_cnt + (size_t)part_slot * kNSlice + slice;
+            if (g_l1 % 4 == 0)
+                r19_l1_splitk_iso<2, R19_L1_PF, 4>(
+                    pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                    (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
+                    g0_l1, g_l1, out_col_base, S.a->l1_k_out, part, cnt,
+                    ffn_slot, ffn2);
+            else
+                r19_l1_splitk_iso<2, R19_L1_PF, 2>(
+                    pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                    (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
+                    g0_l1, g_l1, out_col_base, S.a->l1_k_out, part, cnt,
+                    ffn_slot, ffn2);
+        } else
+#endif
+        {
         // 均衡场景 g_l1=4：一次 K 循环处理全部 4 组（A 装载减半）；
         // kPrefetch=2 是为把 32 个 B fragment 槽控制在寄存器预算内。
         if (g_l1 % 4 == 0) {
@@ -1707,6 +1913,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
                 pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                 (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
+        }   // end L1_SPLITK else（原实例选择链）
     }   // end if (CM_L1_GATE)
     }   // end if constexpr (kPhase != MegaPhase::L2)  —— L1 段（small）
     if constexpr (kPhase == MegaPhase::Both) {
