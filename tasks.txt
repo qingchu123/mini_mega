@@ -61,3 +61,126 @@ MT_FORCE_WIN=48 ./scripts/run.sh check --all --only 804900 --graph-nodes 2
 
 
 分析一下mega kernel里面有哪些缓冲区，缓冲区如何使用，如何复用。会不会存在不同轮次，不同rank间的竞争风险。
+
+
+
+
+Objective
+- 定位或修复 max_tokens=512 时 mega kernel 的 graph 输出与 eager 不一致问题，优先用对照和最小实验锁定原因；修复后验证正确性与性能。
+Important Details
+- 最小复现：TIMEOUT=90 ./scripts/run.sh check --all --only 804900 --graph-nodes 1；eager 的 L0/L1/L2/REDUCE 均 PASS，graph×1 常 FAIL，rel≈1.25e-01。graph×1 已失败，因此不能简单归因为图内多个节点复用。
+- MT_FORCE_WIN=48 会触发 slot_capacity != win_cap 守卫，是另一个问题；本次复现不需要设置它。
+- check --smoke 的 max_tokens=16 路径通常 PASS；--all --only 804900 保留 TPR512 用例，使 max_tokens=512。
+- 在独立 worktree /tmp/opencode/base_891 的 891d9f5 上，仅临时修正 warm 的 win 并放宽窗口守卫后，同一 graph×1 命令也 FAIL（rel≈1.28e-01）：问题早于 ranks_data、local_data 重构。
+- 当前主仓库 HEAD 为 3f136be；此前 9bba4e4 已将 combine_sums 和其 epoch 改为 64 位。
+- 当前诊断显示 graph 输出与 graph 运行后 combine_rows 重新计算的结果一致，而 graph combine_rows 与 eager 不同；应继续追查 COMBINE 写入及其上游，而非先改 REDUCE 算术。
+- 特征样本：[graph-raw] rank=28 node=0 ... 首差:k=6,token=10,col=3072,期望=18592,实际=0,目标专家=225。专家 225 属 rank28 本地 expert1；TK 日志该专家 count=110。缺失列片与 slice 边界吻合。
+- R29_COMBINE_FUSE 默认开启；count=110 有机会进入异步 L2 融合推送。src/combine.cuh 的 R30_ST_PLAIN 默认 1，融合路径可能使用普通 store。给非融合 combine_push_pair 加一次摊销的 __threadfence_system()/__syncwarp() 实验后，graph 仍 FAIL，尚不能认定发布序是根因。
+- GPU 测试经 scripts/run.sh 持锁运行；偶发冷启动约 40 秒，通常约 6 秒，不能仅以一次 wall time 判断性能回退。
+Work State
+Completed
+- 建立了 main 与 891d9f5 的同口径复现，排除了“仅由新结构体或 graph 多节点引入”的解释。
+- 在 test/check.cu 增加环境变量控制的临时诊断：MT_GRAPH_DIAG、MT_GRAPH_ROWS、MT_GRAPH_ROWS_DIFF、MT_GRAPH_DIAG_RANK；可对比 eager/graph 的 combine_rows、重新计算 y、首个错误 token/列及每 k 行。
+- 诊断观察到 ct01=1, cyc=0；示例 rank0 输出对 graph 行参考 bad=0，但 graph 行对 eager 有大量差异。
+- ./scripts/build.sh check 可编译；原始 graph×1 失败仍可复现。
+Active
+- 主工作树有未提交实验改动：test/check.cu 的诊断代码，以及 src/combine.cuh 将非融合推送改成“两遍写数据/一次 system fence/再写标记”的实验。该 fence 未修复 graph 错误，勿直接当修复提交。
+- 独立 worktree /tmp/opencode/base_891 有仅用于复现的 warm 窗口及守卫临时改动，勿合回主线。
+- 正在从 rank28、专家225、k6/token10/col3072 的缺失列片反查融合 L2→COMBINE 推送。
+Blocked
+- 尚未确定缺失列片是融合推送未执行、普通 store 对 peer FG 不可见，还是其上游 L2/staging 内容缺失。
+- 尚未做融合开关及 store 类型的 A/B；修复与性能回归未完成。
+Next Move
+1. 保留 test/check.cu 诊断，先撤销主树中无效的 src/combine.cuh 两遍 fence 实验；使用构建参数分别测试 -DR29_COMBINE_FUSE=0、-DR30_ST_PLAIN=0，每次运行 check --all --only 804900 --graph-nodes 1 并记录 [graph-raw]/PASS。先核对 scripts/build.sh 接收的编译参数环境变量。
+2. 若关闭融合能修复，针对 rank28 专家225 在融合路径 dump L2 staging、meta/weights、推送列块及完成标记，定位漏写的具体分支；实施最小修复后回归 check --smoke、graph×1/2 和 mybench -s 2 -cases 804900,807500。
+Relevant Files
+- /home/lchen1/data/projs/mini_mega/test/check.cu：run_graph、eager/graph 行与输出诊断；当前有未提交实验改动。
+- /home/lchen1/data/projs/mini_mega/src/combine.cuh：融合/非融合 COMBINE、R30_ST_PLAIN、combine_sums 标记与 REDUCE；当前两遍 fence 为无效实验。
+- /home/lchen1/data/projs/mini_mega/src/compute_big.cuh：R29_COMBINE_FUSE、fuse.on、异步 L2 以及 combine_push_chunk_rows 调用。
+- /home/lchen1/data/projs/mini_mega/src/kernel.cuh：任务 tail 选择融合标记或非融合推送。
+- /home/lchen1/data/projs/mini_mega/src/megakernel.cu：计算/REDUCE 发射与 host 参数转换。
+- /home/lchen1/data/projs/mini_mega/test/mega_common.cuh：804900 路由、布局、reset 与 launch 参数。
+- /home/lchen1/data/projs/mini_mega/test/70.r32_tpr_perf/0928_tk_info.log：rank28 专家225 对应的实录计数。
+- /tmp/opencode/base_891：旧提交的独立诊断 worktree，临时改动不可直接提交。
+
+
+kMaxTRP=max_tokens_per_rank_total=512
+窗口动态规划
+
+
+我想固定NSLICE=4， 去除Merge机制；
+windows 选择固定选64/32
+
+根据本地专家数量
+500,2,3,46,0,0,0,0
+126,54,32,4,56,7,4,5
+
+得到
+w64 每个本地专家窗口为 (Ex+63)/64 
+w32 每个本地专家窗口为 (Ex+31)/32
+
+64窗口预估耗时 (Sum_E64 +7 / 8) *2.66 (修正系数)
+32窗口预估耗时 (Sum_E32 +7 / 8) *1 (修正系数)
+
+
+然后选一个耗时小的窗口。
+
+
+{32,48,64,80,96,128}
+
+
+
+
+
+
+
+
+
+todo:
+
+combine_rows[M_CYCLE][kTopk][kMaxTPR][kHidden] 改成 combine_rows[M_CYCLE][kMaxTPR][kTopk][kHidden] 会不会性能更好？ 缓存更热了？
+
+把参数进行分类： 
+
+grid规划
+任务规划参数
+调用入参
+输出
+性能调优参数
+调试/debug
+
+
+我想固定NSLICE=4， 去除Merge机制；
+
+
+
+mmakernel   参数模板 ， 寄存器占用， smem占用， PF预取， 理论适用场景
+
+
+实际性能表现：
+
+tpr  mmakernel  参数模板   性能
+
+现在回到窗口动态规划
+
+先统计0专家的情况，
+- 如果有一个1个0专家，就相当于把当前负载最大的专家recv_tokens
+- 如果有两个0专家， 这个两个0专家的负载可以同时给top1，也可以top1和top2各拿一个
+就要比较 top1_recv_tokens /3  和  top2_recv_tokens /2 哪个大了
+- 依次类推
+
+
+
+--> 目前支持窗口最大是多少？  不能更大的原因是因为r24_l1_big 函数smem大小的限制吗？
+
+
+todo: 0专家的负载均衡问题
+
+拆分会增加同步开销。 kernel 边界带来 launch 间隙和 tail effect。graph replay 能降低 launch 成本，但不能消除等待最慢 block 的代价。
+- mega的方式 L2是不是也要等L1， 而且等的时间可能更多？
+
+
+
+launch_compute ->  mega_kernel   ->  r19s/r24b
+改成
+launch_compute ->  mega_l1   ->  r91s
