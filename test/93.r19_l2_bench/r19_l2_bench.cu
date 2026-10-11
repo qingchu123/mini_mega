@@ -121,14 +121,25 @@ int main() {
                     M, t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
     }
 
-    // l2_gemm_body（小档）与 r19_l2_big 对照，M=16/32
-    std::printf("\nl2_gemm_body vs r19_l2_big (K=2048,N=1536)\n");
-    std::printf("%-5s %-16s %9s\n", "M", "variant", "us");
-    for (int M : {16, 32}) {
-        std::printf("%-5d %-16s %9d\n", M, "l2_body<2,1,6>", bench(k_l2small<2,1,6>, M, kGL2));
-        std::printf("%-5d %-16s %9d\n", M, "r19_l2<1,1,6>",  bench(k_l2<1,1,6>, M, kGL2));
-        std::printf("%-5d %-16s %9d\n", M, "r19_l2<2,1,3>",  bench(k_l2<2,1,3>, M, kGL2));
-        std::printf("%-5d %-16s %9d\n", M, "r19_l2<1,1,3>",  bench(k_l2<1,1,3>, M, kGL2));
+    // l2_gemm_body PF 扫描（MT=ceil(M/16)，B6）；对比 CM_BPTR_L2
+    std::printf("\nl2_gemm_body PF sweep (kBatch=6)  [CM_BPTR_L2=%d]\n", (int)CM_BPTR_L2);
+    std::printf("%-5s %12s %12s %12s %12s\n", "M", "PF1", "PF2", "PF4", "PF8");
+    {
+        std::printf("%-5d %12d %12d %12d %12d\n", 16,
+                    bench(k_l2small<1,1,6>, 16, kGL2),
+                    bench(k_l2small<2,1,6>, 16, kGL2),
+                    bench(k_l2small<4,1,6>, 16, kGL2),
+                    bench(k_l2small<8,1,6>, 16, kGL2));
+        std::printf("%-5d %12d %12d %12d %12d\n", 32,
+                    bench(k_l2small<1,2,6>, 32, kGL2),
+                    bench(k_l2small<2,2,6>, 32, kGL2),
+                    bench(k_l2small<4,2,6>, 32, kGL2),
+                    bench(k_l2small<8,2,6>, 32, kGL2));
+        std::printf("%-5d %12d %12d %12d %12d\n", 48,
+                    bench(k_l2small<1,3,6>, 48, kGL2),
+                    bench(k_l2small<2,3,6>, 48, kGL2),
+                    bench(k_l2small<4,3,6>, 48, kGL2),
+                    bench(k_l2small<8,3,6>, 48, kGL2));
     }
 
     // N 缩放（M=64）
