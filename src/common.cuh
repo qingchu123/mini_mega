@@ -24,6 +24,16 @@ constexpr int kRanks = 32;
 #define KNSLICE_OVERRIDE 4
 #endif
 constexpr int kNSlice = KNSLICE_OVERRIDE;  // 每窗口任务切片数（K 片 / N 组）；NS=4：L1 每片 4 组、L2 每片 6 组
+// [BALANCE·docs/20] L1 split-K 的 K 分段数：每 (专家,窗口) 切成 NSLICE×NK 个等代价任务，
+//   轮询映射到 kGrid(=32) 个 AP → 每 AP 恒等负载。NK=8：kNSlice(4)×kNK(8)=32=kGrid。
+//   L1 每 K 段长 = kHidden/kNK；N 片宽 = 2*kIntermediate/kNSlice。
+#ifndef L1_NK_OVERRIDE
+#define L1_NK_OVERRIDE 8
+#endif
+constexpr int kNK = L1_NK_OVERRIDE;
+constexpr int kL1SliceCols = 2 * kIntermediate / kNSlice;   // L1 每 N 片的隐藏列数（gate+up）
+constexpr int kL1KChunk = kHidden / kNK;                    // L1 每 K 段长度
+constexpr int kL1Parts = kNSlice * kNK;                     // 每 (专家,窗口) 任务数（应 ≤ kGrid）
 #ifndef KRING_OVERRIDE
 #define KRING_OVERRIDE 8
 #endif

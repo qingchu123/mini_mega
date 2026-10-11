@@ -72,6 +72,8 @@ struct alignas(256) local_flags {
     alignas(256) unsigned long long pre_ticks[kGrid * 16];
     alignas(256) float l1_chk[kGrid];        // L1 数值校验累加
     alignas(256) float l2_chk[kGrid];        // L2 数值校验累加
+    // [BALANCE·docs/20] L1 split-K：每 (slot, N片 s) 的 K 段完成计数（atomicAdd 判最后一段）
+    alignas(256) uint32_t l1_part_cnt[kEPR * kRing][kNSlice];
 };
 
 // ---- 跨 rank（FG 显存，peer 可写）----
@@ -107,6 +109,9 @@ struct alignas(256) local_data {
     alignas(256) uint8_t w1[kEPR][2*kIntermediate][kHidden];
     alignas(256) uint8_t w2[kEPR][kHidden][kIntermediate];
     alignas(256) uint8_t ffn_hidden[kEPR * kRing][kMaxTPR][kIntermediate];
+    // [BALANCE·docs/20] L1 split-K FP32 部分和（gate/up 原值，未 SwiGLU）：每 (slot, N片 s)
+    //   一块 [行][2I/NS]，NK 个 K 段 atomicAdd 累加；最后一段读回→SwiGLU→FP8 写 ffn_hidden。
+    alignas(256) float l1_partial[kEPR * kRing][kNSlice][kMaxTPR][kL1SliceCols];
     alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
     // [FRAG-INT] A/f2 fragment 缓冲，纯 kernel 内部：由本结构体持有，kernel 从
     //   rwk->ld 直接取基址，host/torch 不再传入。尺寸按 kMaxTPR 静态定（容量
