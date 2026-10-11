@@ -163,24 +163,21 @@ void launch_phase_impl(const MegaLaunchArgs& a, mcStream_t stream,
     MegaLaunchArgs b = a;
     if (skip_override >= 0) b.skip_prologue = skip_override;
     if (a.win_cap <= 48)
-        mega_kernel<true, NoTaskTail, false, 48, ph>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b),
-                                                            NoTaskTail{});
+        mega_kernel<true, false, 48, ph>
+            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b));
     else if (a.win_cap <= 64)
-        mega_kernel<true, NoTaskTail, false, 64, ph>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b),
-                                                            NoTaskTail{});
+        mega_kernel<true, false, 64, ph>
+            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b));
     else
-        mega_kernel<true, NoTaskTail, false, 0, ph>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b),
-                                                            NoTaskTail{});
+        mega_kernel<true, false, 0, ph>
+            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b));
 }
 
 }  // namespace
 
 void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream) {
     mega_kernel<false><<<a.grid, a.threads, (size_t)a.smem, stream>>>(
-        to_mega_args(a), NoTaskTail{});
+        to_mega_args(a));
 }
 
 void launch_l1(const MegaLaunchArgs& a, mcStream_t stream) {
@@ -210,16 +207,14 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
     // [OPT-TK-CAP] 按 win_cap 选编译期 count 上界实例（kCap=48/64）：不可达的重档
     //   （MT8 异步 / MT4 大 GEMM 兜底）被 if constexpr 删除，缩任务体寄存器/栈。
     if (a.win_cap <= 48)
-        mega_kernel<true, NoTaskTail, false, 48>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a),
-                                                            NoTaskTail{});
+        mega_kernel<true, false, 48>
+            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a));
     else if (a.win_cap <= 64)
-        mega_kernel<true, NoTaskTail, false, 64>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a),
-                                                            NoTaskTail{});
+        mega_kernel<true, false, 64>
+            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a));
     else
         mega_kernel<true><<<a.grid, a.threads, (size_t)a.smem, stream>>>(
-            to_mega_args(a), NoTaskTail{});
+            to_mega_args(a));
 }
 
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
@@ -254,13 +249,13 @@ void dump_kernel_resources() {
         else
             std::printf("[RES] %-7s <fail>\n", n);
     };
-    q("kCap48", (const void*)mega_kernel<true, NoTaskTail, false, 48>);
-    q("kCap64", (const void*)mega_kernel<true, NoTaskTail, false, 64>);
+    q("kCap48", (const void*)mega_kernel<true, false, 48>);
+    q("kCap64", (const void*)mega_kernel<true, false, 64>);
     q("full",   (const void*)mega_kernel<true>);
     q("empty",  (const void*)mega_kernel<false>);
-    q("L1full", (const void*)mega_kernel<true, NoTaskTail, false, 0,
+    q("L1full", (const void*)mega_kernel<true, false, 0,
                                         MegaPhase::L1>);
-    q("L2full", (const void*)mega_kernel<true, NoTaskTail, false, 0,
+    q("L2full", (const void*)mega_kernel<true, false, 0,
                                         MegaPhase::L2>);
 }
 }  // namespace fp8mega

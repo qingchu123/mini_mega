@@ -612,8 +612,76 @@ struct TaskDesc {
     int merge;        // 1（未粗化）或 2/4/…
 };
 
-struct NoTaskTail {
-    __device__ __forceinline__ void operator()(const TaskDesc&) const {}
+#include "combine.cuh"
+
+// [R29] tail → 融合上下文获取/回写（默认无融合；kernel.cuh 对 CombineTail 特化）。
+//   任务体在进入 r24 L2 路径且 staging 有效时激活 fuse.on，并在任务尾把该状态
+//   写回 tail，供 CombineTail 选择"只写标记"路径。
+template <typename T>
+struct R29TailFuse {
+    static __device__ __forceinline__ CombineFuseCtx get(const T&) {
+        return CombineFuseCtx{};
+    }
+};
+template <typename T>
+struct R29TailFuseSet {
+    static __device__ __forceinline__ void on(T&, const CombineFuseCtx&) {}
+};
+
+// --------------------------------------------------- COMBINE 任务尾适配器 --
+// 在任务循环 tail 处按 TaskDesc 更新 CombineCtx 并执行本任务 slice 的推送。
+struct CombineTail {
+    CombineCtx ctx;
+    const uint8_t* out_base;  // ffn_out staging 全区基址（BF16）
+    int nwarps;
+    CombineFuseCtx fuse;      // [R29] 融合推送上下文（capable 由 kernel 置位）
+    // [集71] 内部执行次数统计（编译期默认关；运行期 nullptr 关闭）
+    //   条件编译：CombineTail 是 mega_kernel 的**按值模板实参**（进 kernel 参数
+    //   缓冲），关闭态必须不占位，否则参数缓冲布局变化会改变设备码字节。
+#if MX_DBG_COUNT
+    unsigned long long* ctr = nullptr;
+#endif
+    __device__ __forceinline__ void operator()(const TaskDesc& d) const {
+        if (ctx.rows_off < 0) {
+            // [集71] COMBINE 跳过（combine 关闭）
+            if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrCombineSkip, 1);
+            return;
+        }   // [集33] combine 关闭：空操作
+        // [集71] COMBINE 实际执行推送次数
+        if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrCombineExec, 1);
+        CombineCtx c = ctx;
+        c.slice = d.slice;
+        // epoch 已在 ctx 里按 64 位 current_time 设定
+        c.nslice_eff = d.nslice_eff;   // [R35] 粗化几何
+        c.merge = d.merge;
+        const int lane = (int)(threadIdx.x % 64);
+        const int warp = (int)(threadIdx.x / 64);
+        if (fuse.on) {
+            // [R29] 数据已在 L2 各列块推完，任务尾只写完成标记
+            combine_mark_rows(c, d.count, lane, warp, nwarps);
+        } else {
+            combine_push_pair(c, out_base, d.count, lane, warp, nwarps);
+        }
+    }
+};
+
+// [R29] 融合上下文获取特化（任务体据此判断是否走融合推送）
+template <>
+struct R29TailFuse<CombineTail> {
+    static __device__ __forceinline__ CombineFuseCtx get(const CombineTail& t) {
+        CombineFuseCtx f = t.fuse;
+        f.c = &t.ctx;
+        return f;
+    }
+};
+// [R29] 任务尾回写实际融合状态（供 CombineTail 选择只写标记路径）
+template <>
+struct R29TailFuseSet<CombineTail> {
+    static __device__ __forceinline__ void on(CombineTail& t,
+                                              const CombineFuseCtx& f) {
+        t.fuse = f;
+        t.fuse.c = &t.ctx;
+    }
 };
 
 // 大/小 count 任务体（独立 __noinline__ 函数；此位置已可见 L1/L2 body 定义）
@@ -635,7 +703,7 @@ struct NoTaskTail {
 // [L1L2-SPLIT] kPhase：Both=原合并路径；L1=只跑 DISPATCH+L1；L2=只跑 L2+tail。
 //   拆分下数据槽 e*slot_win+w 每窗口独占（ring 门/l2_done 不再需要）；旗槽
 //   （slice_flags/l1_prog/l2_done）保持 ring 索引不变（旗区容量 256 不动）。
-template <typename TaskTail = NoTaskTail, bool kSmallOnly = false,
+template <bool kSmallOnly = false,
           int kCap = 0, MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* self, const ranks_data* remote, int cycle,
@@ -650,7 +718,7 @@ __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* w1, int l1_n_total, int l1_block_n, int l1_k_out,
         uint8_t* ffn_hidden, float* l1_chk,
         const uint8_t* w2, uint16_t* l2_out, int l2_k_out, float* l2_chk,
-        int rep, int n_reps, TaskTail tail = TaskTail{},
+        int rep, int n_reps, CombineTail tail,
         const int* prefix_ptr = nullptr, unsigned long long* pt = nullptr,
         uint8_t* a_smem = nullptr, uint8_t* b_smem = nullptr,
         uint8_t* frag_a = nullptr, uint8_t* frag2 = nullptr,
@@ -829,15 +897,15 @@ __device__ __forceinline__ void dispatch_pull_body(
         // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
         // [R31] kSmallOnly 实例：大任务体不实例化（小核专用路径）
         if constexpr (kSmallOnly) {
-            r19_small_task<TaskTail, kPhase>(S, task, e, w, count, slice,
+            r19_small_task<kPhase>(S, task, e, w, count, slice,
                                              epoch, data_slot, pfx, tail,
                                              a_smem, b_smem);
         } else if (count > kM) {
-            r19_big_task<TaskTail, kCap, kPhase>(S, task, e, w, count, slice,
+            r19_big_task<kCap, kPhase>(S, task, e, w, count, slice,
                                                  epoch, data_slot, pfx, tail,
                                                  a_smem, b_smem);
         } else {
-            r19_small_task<TaskTail, kPhase>(S, task, e, w, count, slice,
+            r19_small_task<kPhase>(S, task, e, w, count, slice,
                                              epoch, data_slot, pfx, tail,
                                              a_smem, b_smem);
         }

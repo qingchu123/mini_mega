@@ -88,74 +88,18 @@ struct MegaArgs {
 #endif
 };
 
-// --------------------------------------------------- COMBINE 任务尾适配器 --
-// 在任务循环 tail 处按 TaskDesc 更新 CombineCtx 并执行本任务 slice 的推送。
-struct CombineTail {
-    CombineCtx ctx;
-    const uint8_t* out_base;  // ffn_out staging 全区基址（BF16）
-    int nwarps;
-    CombineFuseCtx fuse;      // [R29] 融合推送上下文（capable 由 kernel 置位）
-    // [集71] 内部执行次数统计（编译期默认关；运行期 nullptr 关闭）
-    //   条件编译：CombineTail 是 mega_kernel 的**按值模板实参**（进 kernel 参数
-    //   缓冲），关闭态必须不占位，否则参数缓冲布局变化会改变设备码字节。
-#if MX_DBG_COUNT
-    unsigned long long* ctr = nullptr;
-#endif
-    __device__ __forceinline__ void operator()(const TaskDesc& d) const {
-        if (ctx.rows_off < 0) {
-            // [集71] COMBINE 跳过（combine 关闭）
-            if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrCombineSkip, 1);
-            return;
-        }   // [集33] combine 关闭：空操作
-        // [集71] COMBINE 实际执行推送次数
-        if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrCombineExec, 1);
-        CombineCtx c = ctx;
-        c.slice = d.slice;
-        // epoch 已在 ctx 里按 64 位 current_time 设定
-        c.nslice_eff = d.nslice_eff;   // [R35] 粗化几何
-        c.merge = d.merge;
-        const int lane = (int)(threadIdx.x % 64);
-        const int warp = (int)(threadIdx.x / 64);
-        if (fuse.on) {
-            // [R29] 数据已在 L2 各列块推完，任务尾只写完成标记
-            combine_mark_rows(c, d.count, lane, warp, nwarps);
-        } else {
-            combine_push_pair(c, out_base, d.count, lane, warp, nwarps);
-        }
-    }
-};
-
-// [R29] 融合上下文获取特化（任务体据此判断是否走融合推送）
-template <>
-struct R29TailFuse<CombineTail> {
-    static __device__ __forceinline__ CombineFuseCtx get(const CombineTail& t) {
-        CombineFuseCtx f = t.fuse;
-        f.c = &t.ctx;
-        return f;
-    }
-};
-// [R29] 任务尾回写实际融合状态（供 CombineTail 选择只写标记路径）
-template <>
-struct R29TailFuseSet<CombineTail> {
-    static __device__ __forceinline__ void on(CombineTail& t,
-                                              const CombineFuseCtx& f) {
-        t.fuse = f;
-        t.fuse.c = &t.ctx;
-    }
-};
-
 // 计算链任务循环（tail 类型由调用点按运行期开关选择）
 // [FRAG-ALWAYS] 去掉 kFragCap：fragment（A/f2 4-line 快路径）分支恒编译。
 // [FRAG-INT] fragment 缓冲改为 kernel 内部（rwk->ld.frag_a/frag2），不再由 host 传入；
 //   运行期是否真走由 S.frag_all 决定（见 compute.cuh 的 S.frag_all）。
-template <typename TaskTail, bool kSmallOnly = false, int kCap = 0,
+template <bool kSmallOnly = false, int kCap = 0,
           MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
-                                                   TaskTail tail, int cycle,
+                                                   CombineTail tail, int cycle,
                                                    uint8_t* a_smem = nullptr,
                                                    uint8_t* b_smem = nullptr,
                                                    unsigned long long* ctr = nullptr) {
-    dispatch_pull_body<TaskTail, kSmallOnly, kCap, kPhase>(
+    dispatch_pull_body<kSmallOnly, kCap, kPhase>(
         a.self, &a.unk->rd, cycle, a.peer_bases, a.R, a.rank, a.win_cap,
         a.win_cap /*pool_stride*/, a.slot_capacity /*tbl_cap*/,
         kHidden /*k_in*/, kTopk /*topk*/, kRing /*ring*/, a.prefix_off,
@@ -176,10 +120,10 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
 // [L1L2-SPLIT] kPhase：Both=原合并；L1=只跑前序+DISPATCH+L1；L2=只跑 L2+tail
 //   （prologue 行为由 a.skip_prologue 驱动：L2 发射时 host 置 2 = 跳过
 //   route/publish/xbar、轻量 task_setup）。
-template <bool kWithCompute, typename TaskTail = NoTaskTail,
+template <bool kWithCompute,
           bool kSmallOnly = false, int kCap = 0,
           MegaPhase kPhase = MegaPhase::Both>
-__global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
+__global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     // 相位时间戳（block0 tid0；[6]=入口 [0]=route后 [1]=publish后 [2]=xbar后 [3]=setup后）
     const bool kTick = (blockIdx.x == 0) && (threadIdx.x == 0);
     // [集71] 计数缓冲归一（运行期开关折叠成单指针判空；编译期关闭时恒 nullptr，
@@ -305,7 +249,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a, TaskTail tail) {
 #if MX_DBG_COUNT
             tail.ctr = ctr;
 #endif
-            mega_dispatch_loop<CombineTail, kSmallOnly, kCap, kPhase>(
+            mega_dispatch_loop<kSmallOnly, kCap, kPhase>(
                 a, tail, cyc, &s_ab.a[0][0], nullptr,
                 ctr);
         }

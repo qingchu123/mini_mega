@@ -120,19 +120,6 @@
 #define CM_MED_R24 1
 #endif
 
-// [R29] tail → 融合上下文获取/回写（默认无融合；kernel.cuh 对 CombineTail 特化）。
-//   任务体在进入 r24 L2 路径且 staging 有效时激活 fuse.on，并在任务尾把该状态
-//   写回 tail，供 CombineTail 选择"只写标记"路径。
-template <typename T>
-struct R29TailFuse {
-    static __device__ __forceinline__ CombineFuseCtx get(const T&) {
-        return CombineFuseCtx{};
-    }
-};
-template <typename T>
-struct R29TailFuseSet {
-    static __device__ __forceinline__ void on(T&, const CombineFuseCtx&) {}
-};
 
 // [L1L2-SPLIT] 任务体阶段：拆成两个 kernel 时，L1 kernel 只跑 DISPATCH+L1，
 //   L2 kernel 只跑 L2+tail。kPhaseBoth = 原合并路径（行为逐字不变）。
@@ -1291,9 +1278,8 @@ __device__ __forceinline__ void r19_l1_pub_wait(
     if (kTick) S.pt[5] = clock64();
 }
 
-template <typename TaskTail>
 __device__ __forceinline__ void r19_tail_common(
-        const R19Sched& S, TaskTail tail, int task, int e, int w, int count,
+        const R19Sched& S, CombineTail tail, int task, int e, int w, int count,
         int slice, unsigned epoch, int pool_slot) {
     (void)S;
     TaskDesc td;
@@ -1319,10 +1305,10 @@ __device__ __forceinline__ void r19_tail_common(
 // [FRAG-ALWAYS] 去掉 kFragCap：fragment 分支恒编译（运行期按 frag_a/frag_all 决定）
 // [L1L2-SPLIT] kPhase：Both=原合并任务体；L1=只跑 DISPATCH+L1（L2/tail 编译期
 //   消除）；L2=只跑 L2+tail（DISPATCH/pull/L1 编译期消除）。
-template <typename TaskTail, int kCap = 0, MegaPhase kPhase = MegaPhase::Both>
+template <int kCap = 0, MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
-        unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,
+        unsigned epoch, int pool_slot, const int* pfx, CombineTail tail,
         uint8_t* a_smem, uint8_t* b_smem) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
@@ -1336,7 +1322,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     constexpr int kR24BPF = (kCap > 0) ? 4 : R24_BPF;
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
     // [L1L2-SPLIT] L2 阶段不需要 fuse 上下文（R29 融合推送是 L2 段内的事，L1 不读）
-    CombineFuseCtx fuse = R29TailFuse<TaskTail>::get(tail);
+    CombineFuseCtx fuse = R29TailFuse<CombineTail>::get(tail);
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
     r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx);
@@ -1542,7 +1528,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
 #else
         fuse.on = false;   // 回退：L2 不推送，任务尾走整段推送
 #endif
-        R29TailFuseSet<TaskTail>::on(tail, fuse);
+        R29TailFuseSet<CombineTail>::on(tail, fuse);
         if (count <= 32 && g_l2 % 6 == 0) {
             // [R34] 同 L1：小档单批（A 只装一遍，B 一遍）
 #if CM_FRAG_L2
@@ -1676,10 +1662,10 @@ __device__ R19_BIG_ATTR void r19_big_task(
 // 声明以隔离大任务的寄存器分配（探针：空体调用点对 TPR=16 中性）。
 // ============================================================================
 // [L1L2-SPLIT] 同 r19_big_task：kPhase 控制任务体的阶段范围（Both/L1/L2）。
-template <typename TaskTail, MegaPhase kPhase = MegaPhase::Both>
+template <MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_SMALL_ATTR void r19_small_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
-        unsigned epoch, int pool_slot, const int* pfx, TaskTail tail,
+        unsigned epoch, int pool_slot, const int* pfx, CombineTail tail,
         uint8_t* a_smem, uint8_t* b_smem) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
