@@ -69,6 +69,11 @@ scripts/build.sh all       # = so bench mybench check（不含 whl）
 不带目标时等价 `all`；`mybench`/`check`/`bench`/`whl` 会自动先编 `so`。
 `whl` 不进 `all`：它依赖 torch 环境，本机未装 torch 时会必然失败。
 
+构建为**增量**：`so` 依据各 TU 的 `-MMD` 依赖按 mtime 跳过未变动对象
+（改动只影响部分 TU 时仅重编该部分），`mybench`/`check` 仅在自身源码或
+`megakernel.so` 变化时重链。无改动重跑 `all` <0.1s；`KERNEL_CFLAGS` 或
+包含路径变化时自动全量重编（指纹存于 `build/obj_so/.buildflags`）。
+
 依赖：MACA（`MACA_PATH=/opt/maca`）、`cucc`、`mcr` 运行时、系统头 `cute`
 （位于 `/opt/maca/include`）。`so`/`mybench`/`check`/`bench` 无需 torch / 容器。
 
