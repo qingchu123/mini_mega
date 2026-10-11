@@ -114,6 +114,74 @@
 #include "common.cuh"
 #include "flags.cuh"
 
+// ---------------------------------------------------------------- 主 kernel --
+// host -> device 参数（按值传结构体；全部为 POD）
+struct MegaArgs {
+    // ======================================================================
+    // [1] grid 规划：决定 block/任务划分与行 stride 的几何量
+    // ======================================================================
+    int R, rank;               // rank 数 / 本 rank 号
+    int tokens;                // 实际 token 数（<= slot_capacity）
+    int slot_capacity;         // 专家 token 容量（= max_tokens；= src_index_table 行容量）
+    int win_cap;               // 窗口容量（窗口划分 / pool / staging / ffn / l2 行 stride）
+    // 已内联常量（原运行期传参，本子集固定）：
+    //   k_in=kHidden、topk=kTopk、ring=kRing、l1_block_n=kL1BlockN、
+    //   l1_n_total=2*l1_k_out、tbl_cap=slot_capacity、pool_stride=win_cap、
+    //   publish_epoch=kPublishEpoch、recv_stride=kRecvStride
+
+    // ======================================================================
+    // [2] 调用入参：结构体/缓冲指针、偏移、flag 索引
+    // ======================================================================
+    // -- 结构体指针 --
+    rwk_data* rwk;                // 本 rank 普通显存整块（lf + ld）
+    unk_data* unk;                // 本 rank FG 整块（rf + rd；= unk_peers[rank]）
+    unk_data* const* unk_peers;   // 各 rank unk 基址表（设备数组，含 self）
+    // -- 对称区 / 输入 --
+    const uint8_t* self;          // 本 rank 对称区基址
+    uint8_t* const* peer_bases;   // 各 rank 对称区基址表（拉 x / weights）
+    const int64_t* topk_idx;      // 本 rank 输入路由（对称区内视图）
+    // -- 可选独立缓冲（nullptr → self 内对应偏移）--
+    uint8_t* pool_ptr;            // [A-RWK] pool 缓冲（→ Self+pool_off）
+    int* prefix_ptr;              // 前缀表缓冲（→ self+prefix_off）
+    // -- 前序 / 收尾偏移（self 内）--
+    int64_t prefix_off;           // prefix_tbl 在 self 内偏移（prefix_ptr 为空时用）
+    // -- 数据缓冲偏移（self / peer sym 内）--
+    int64_t x_off, weights_off, pool_off, w_off, meta_off;
+    int64_t combine_rows_off;     // 目标 rank combine_rows（BF16，<0 关闭 COMBINE）
+    // -- 计算链缓冲 --
+    int l1_k_out;                 // L1 输出隐藏维 I（l1_n_total 由 2*l1_k_out 派生）
+    int l2_k_out;                 // L2 输出维 H
+    const uint8_t* w1;            // [EPR][2I][H] lane 序 packed tile（gate/up 配对）
+    const uint8_t* w2;            // [EPR][H][I] lane 序 packed tile
+    uint8_t* ffn_hidden;          // [EPR][ring][win_cap][I] FP8
+    uint16_t* l2_out;             // [kGrid][win_cap][H] BF16
+    // -- flag 索引（layout 头经 host 传入；kernel 不 include 该头）--
+    int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
+    int64_t slice_flags_idx, l1_prog_idx;
+
+    // ======================================================================
+    // [3] 输出
+    // ======================================================================
+    // 本 kernel（mega_kernel）不写最终 y；y 由 REDUCE 经 host 侧指针写出。
+
+    // ======================================================================
+    // [4] 性能调优参数
+    // ======================================================================
+    int max_spins;                // 各同步门的自旋上限
+    int skip_prologue;            // [R38] 前序复用：0 完整，>0 复用（见 kernel.cuh 说明）
+
+    // ======================================================================
+    // [5] 调试 / debug（MX_DBG_COUNT，编译期默认关）
+    // ======================================================================
+    // （控制/诊断状态 out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk
+    //   已迁入 local_flags（lf->...），不在此结构体。）
+#if MX_DBG_COUNT
+    unsigned long long* exec_ctr;  // [kExecCtrSlots] 各计数槽（nullptr = 不统计）
+    int dbg_count;                 // 运行期开关（host 读 env MXKERNEL_COUNT 填入）
+#endif
+};
+
+
 // [CM-SKIP] 分阶段消融诊断（默认 0，不影响基线；仅 perf-only 口径）：
 //   CM_SKIP_GEMM=1 同时跳过 L1+L2（纯通信）；CM_SKIP_L1/L2 单独跳过。
 #ifndef CM_SKIP_GEMM
@@ -626,24 +694,44 @@ __device__ __forceinline__ void l2_gemm_body(
 template <bool kSmallOnly = false,
           int kCap = 0, MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void dispatch_pull_body(
-        const uint8_t* self, const ranks_data* remote, int cycle,
-        uint8_t* const* peer_bases, int R, int rank,
-        int win_cap, int pool_stride, int tbl_cap, int k_in, int topk, int ring,
-        int64_t prefix_off, int64_t x_off, int64_t weights_off,
-        int64_t pool_off, int64_t w_off, int64_t meta_off,
-        uint8_t* pool_ptr,
-        uint32_t* bar_flags, int64_t task_counter_idx, int64_t l2_done_idx,
-        int64_t task_ready_idx, int64_t slice_flags_idx, int64_t l1_prog_idx,
-        int* out_processed, int* dbg, int max_spins,
-        const uint8_t* w1, int l1_n_total, int l1_block_n, int l1_k_out,
-        uint8_t* ffn_hidden, float* l1_chk,
-        const uint8_t* w2, uint16_t* l2_out, int l2_k_out, float* l2_chk,
-        int rep, int n_reps,
-        int64_t combine_rows_off, unk_data* const* unk_peers, uint64_t epoch,
-        const int* prefix_ptr = nullptr, unsigned long long* pt = nullptr,
-        uint8_t* a_smem = nullptr, uint8_t* b_smem = nullptr,
-        uint8_t* frag_a = nullptr, uint8_t* frag2 = nullptr,
-        unsigned long long* ctr = nullptr) {
+        const MegaArgs* a, int cycle, uint8_t* a_smem = nullptr,
+        uint8_t* b_smem = nullptr, unsigned long long* ctr = nullptr) {
+    const uint8_t* self = a->self;
+    const ranks_data* remote = &a->unk->rd;
+    uint8_t* const* peer_bases = a->peer_bases;
+    const int R = a->R, rank = a->rank, win_cap = a->win_cap;
+    const int pool_stride = a->win_cap, tbl_cap = a->slot_capacity;
+    const int k_in = kHidden, topk = kTopk, ring = kRing;
+    const int64_t prefix_off = a->prefix_off, x_off = a->x_off;
+    const int64_t weights_off = a->weights_off, pool_off = a->pool_off;
+    const int64_t w_off = a->w_off, meta_off = a->meta_off;
+    uint8_t* pool_ptr = a->pool_ptr;
+    uint32_t* bar_flags = a->rwk->lf.bar[cycle];
+    const int64_t task_counter_idx = a->task_counter_idx;
+    const int64_t l2_done_idx = a->l2_done_idx;
+    const int64_t task_ready_idx = a->task_ready_idx;
+    const int64_t slice_flags_idx = a->slice_flags_idx;
+    const int64_t l1_prog_idx = a->l1_prog_idx;
+    int* out_processed = a->rwk->lf.out_processed;
+    int* dbg = a->rwk->lf.dbg;
+    const int max_spins = a->max_spins;
+    const uint8_t* w1 = a->w1;
+    const int l1_n_total = 2 * a->l1_k_out, l1_block_n = kL1BlockN;
+    const int l1_k_out = a->l1_k_out;
+    uint8_t* ffn_hidden = a->ffn_hidden;
+    float* l1_chk = a->rwk->lf.l1_chk;
+    const uint8_t* w2 = a->w2;
+    uint16_t* l2_out = a->l2_out;
+    const int l2_k_out = a->l2_k_out;
+    float* l2_chk = a->rwk->lf.l2_chk;
+    const int rep = 0, n_reps = 1;
+    const int64_t combine_rows_off = a->combine_rows_off;
+    unk_data* const* unk_peers = a->unk_peers;
+    const uint64_t epoch = (uint64_t)a->rwk->lf.current_time[0][1];
+    const int* prefix_ptr = a->prefix_ptr;
+    unsigned long long* pt = a->rwk->lf.pre_ticks;
+    uint8_t* frag_a = a->rwk->ld.frag_a[0];
+    uint8_t* frag2 = a->rwk->ld.frag2[0];
     extern __shared__ __align__(16) uint8_t smem_raw[];
     int* s_count = reinterpret_cast<int*>(smem_raw);   // EPR：每专家总行数
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）

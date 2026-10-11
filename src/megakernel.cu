@@ -206,13 +206,13 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
     //   分支恒编译（[FRAG-ALWAYS]），运行期按 frag_all/几何自动启用。
     // [OPT-TK-CAP] 按 win_cap 选编译期 count 上界实例（kCap=48/64）：不可达的重档
     //   （MT8 异步 / MT4 大 GEMM 兜底）被 if constexpr 删除，缩任务体寄存器/栈。
-    if (a.win_cap <= 48)
-        mega_kernel<true, false, 48>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a));
-    else if (a.win_cap <= 64)
-        mega_kernel<true, false, 64>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a));
-    else
+    // if (a.win_cap <= 48)
+    //     mega_kernel<true, false, 48>
+    //         <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a));
+    // else if (a.win_cap <= 64)
+    //     mega_kernel<true, false, 64>
+    //         <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a));
+    // else
         mega_kernel<true><<<a.grid, a.threads, (size_t)a.smem, stream>>>(
             to_mega_args(a));
 }

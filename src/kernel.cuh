@@ -21,72 +21,6 @@
 // 固定 AOT 编译上限，避免按实际 block 大小重复编译。
 __global__ void __launch_bounds__(1024) mega_empty_kernel() {}
 
-// ---------------------------------------------------------------- 主 kernel --
-// host -> device 参数（按值传结构体；全部为 POD）
-struct MegaArgs {
-    // ======================================================================
-    // [1] grid 规划：决定 block/任务划分与行 stride 的几何量
-    // ======================================================================
-    int R, rank;               // rank 数 / 本 rank 号
-    int tokens;                // 实际 token 数（<= slot_capacity）
-    int slot_capacity;         // 专家 token 容量（= max_tokens；= src_index_table 行容量）
-    int win_cap;               // 窗口容量（窗口划分 / pool / staging / ffn / l2 行 stride）
-    // 已内联常量（原运行期传参，本子集固定）：
-    //   k_in=kHidden、topk=kTopk、ring=kRing、l1_block_n=kL1BlockN、
-    //   l1_n_total=2*l1_k_out、tbl_cap=slot_capacity、pool_stride=win_cap、
-    //   publish_epoch=kPublishEpoch、recv_stride=kRecvStride
-
-    // ======================================================================
-    // [2] 调用入参：结构体/缓冲指针、偏移、flag 索引
-    // ======================================================================
-    // -- 结构体指针 --
-    rwk_data* rwk;                // 本 rank 普通显存整块（lf + ld）
-    unk_data* unk;                // 本 rank FG 整块（rf + rd；= unk_peers[rank]）
-    unk_data* const* unk_peers;   // 各 rank unk 基址表（设备数组，含 self）
-    // -- 对称区 / 输入 --
-    const uint8_t* self;          // 本 rank 对称区基址
-    uint8_t* const* peer_bases;   // 各 rank 对称区基址表（拉 x / weights）
-    const int64_t* topk_idx;      // 本 rank 输入路由（对称区内视图）
-    // -- 可选独立缓冲（nullptr → self 内对应偏移）--
-    uint8_t* pool_ptr;            // [A-RWK] pool 缓冲（→ Self+pool_off）
-    int* prefix_ptr;              // 前缀表缓冲（→ self+prefix_off）
-    // -- 前序 / 收尾偏移（self 内）--
-    int64_t prefix_off;           // prefix_tbl 在 self 内偏移（prefix_ptr 为空时用）
-    // -- 数据缓冲偏移（self / peer sym 内）--
-    int64_t x_off, weights_off, pool_off, w_off, meta_off;
-    int64_t combine_rows_off;     // 目标 rank combine_rows（BF16，<0 关闭 COMBINE）
-    // -- 计算链缓冲 --
-    int l1_k_out;                 // L1 输出隐藏维 I（l1_n_total 由 2*l1_k_out 派生）
-    int l2_k_out;                 // L2 输出维 H
-    const uint8_t* w1;            // [EPR][2I][H] lane 序 packed tile（gate/up 配对）
-    const uint8_t* w2;            // [EPR][H][I] lane 序 packed tile
-    uint8_t* ffn_hidden;          // [EPR][ring][win_cap][I] FP8
-    uint16_t* l2_out;             // [kGrid][win_cap][H] BF16
-    // -- flag 索引（layout 头经 host 传入；kernel 不 include 该头）--
-    int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
-    int64_t slice_flags_idx, l1_prog_idx;
-
-    // ======================================================================
-    // [3] 输出
-    // ======================================================================
-    // 本 kernel（mega_kernel）不写最终 y；y 由 REDUCE 经 host 侧指针写出。
-
-    // ======================================================================
-    // [4] 性能调优参数
-    // ======================================================================
-    int max_spins;                // 各同步门的自旋上限
-    int skip_prologue;            // [R38] 前序复用：0 完整，>0 复用（见 kernel.cuh 说明）
-
-    // ======================================================================
-    // [5] 调试 / debug（MX_DBG_COUNT，编译期默认关）
-    // ======================================================================
-    // （控制/诊断状态 out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk
-    //   已迁入 local_flags（lf->...），不在此结构体。）
-#if MX_DBG_COUNT
-    unsigned long long* exec_ctr;  // [kExecCtrSlots] 各计数槽（nullptr = 不统计）
-    int dbg_count;                 // 运行期开关（host 读 env MXKERNEL_COUNT 填入）
-#endif
-};
 
 // 计算链任务循环（tail 类型由调用点按运行期开关选择）
 // [FRAG-ALWAYS] 去掉 kFragCap：fragment（A/f2 4-line 快路径）分支恒编译。
@@ -94,25 +28,12 @@ struct MegaArgs {
 //   运行期是否真走由 S.frag_all 决定（见 compute.cuh 的 S.frag_all）。
 template <bool kSmallOnly = false, int kCap = 0,
           MegaPhase kPhase = MegaPhase::Both>
-__device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
+__device__ __forceinline__ void mega_dispatch_loop(const MegaArgs* a,
                                                    int cycle,
                                                    uint8_t* a_smem = nullptr,
                                                    uint8_t* b_smem = nullptr,
                                                    unsigned long long* ctr = nullptr) {
-    dispatch_pull_body<kSmallOnly, kCap, kPhase>(
-        a.self, &a.unk->rd, cycle, a.peer_bases, a.R, a.rank, a.win_cap,
-        a.win_cap /*pool_stride*/, a.slot_capacity /*tbl_cap*/,
-        kHidden /*k_in*/, kTopk /*topk*/, kRing /*ring*/, a.prefix_off,
-        a.x_off, a.weights_off, a.pool_off, a.w_off, a.meta_off,
-        a.pool_ptr, a.rwk->lf.bar[cycle],
-        a.task_counter_idx, a.l2_done_idx, a.task_ready_idx, a.slice_flags_idx,
-        a.l1_prog_idx, a.rwk->lf.out_processed, a.rwk->lf.dbg, a.max_spins, a.w1,
-        2 * a.l1_k_out /*l1_n_total*/, kL1BlockN /*l1_block_n*/, a.l1_k_out,
-        a.ffn_hidden, a.rwk->lf.l1_chk, a.w2,
-        a.l2_out, a.l2_k_out, a.rwk->lf.l2_chk, /*rep=*/0, /*n_reps=*/1,
-        a.combine_rows_off, a.unk_peers, (uint64_t)a.rwk->lf.current_time[0][1],
-        a.prefix_ptr, a.rwk->lf.pre_ticks, a_smem, b_smem,
-        a.rwk->ld.frag_a[0], a.rwk->ld.frag2[0], ctr);
+    dispatch_pull_body<kSmallOnly, kCap, kPhase>(a, cycle, a_smem, b_smem, ctr);
 }
 
 // 主 kernel（单轮）。
@@ -145,6 +66,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         uint8_t a[2][R24_MT * R24_KS * 512];
     };
     __shared__ ABShared s_ab;
+    __shared__ MegaArgs s_a;
+    if (threadIdx.x == 0) s_a = a;
     if (kTick) a.rwk->lf.pre_ticks[6] = clock64();
     // 0) [M_CYCLE] 预清 ct2=(c+2)%M_CYCLE 槽（本轮 copy c 尚未定，用 current_time
     //   [b][0] 派生；入口全 block 同为 L ⇒ c 一致）。ct1 留给下一轮，本轮不碰。
@@ -216,7 +139,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         //   （原 NoTaskTail 运行期从不执行，却占整核寄存器/代码布局 collateral；
         //   71 机 TPR=16 −7µs，TPR=256 中性）。
         mega_dispatch_loop<kSmallOnly, kCap, kPhase>(
-            a, cyc, &s_ab.a[0][0], nullptr, ctr);
+            &s_a, cyc, &s_ab.a[0][0], nullptr, ctr);
     }
     if (kTick) a.rwk->lf.pre_ticks[15] = clock64();
 }
