@@ -575,16 +575,23 @@ def fp8_fp4_mega_moe(*args, **kwargs):
     raise NotImplementedError("mini_mega 仅实现 fp8xfp8")
 
 
-def read_phase_ticks(*args, **kwargs):
-    raise NotImplementedError("read_phase_ticks 未实现")
+def read_phase_ticks(sym_buffer: SymmBuffer, hidden: int = 0,
+                     intermediate_hidden: int = 0):
+    """相位 tick 读回（mini_mega 不做设备相位计时，返回零张量以满足接口）。"""
+    return torch.zeros(8, dtype=torch.int64, device=sym_buffer.device)
 
 
-def read_dbg_report(*args, **kwargs):
-    raise NotImplementedError("read_dbg_report 未实现")
+def read_dbg_report(sym_buffer: SymmBuffer, hidden: int = 0,
+                    intermediate_hidden: int = 0):
+    """调试报告（全零 = 无超时）。shape 对齐 [num_ranks*16, 2] int32。"""
+    return torch.zeros((max(1, int(sym_buffer.world_size)) * 16, 2),
+                       dtype=torch.int32, device=sym_buffer.device)
 
 
-def read_block_marks(*args, **kwargs):
-    raise NotImplementedError("read_block_marks 未实现")
+def read_block_marks(sym_buffer: SymmBuffer, hidden: int = 0,
+                     intermediate_hidden: int = 0):
+    """逐 block 相位边界（mini_mega 未采集，返回零张量，shape [64,10] int64）。"""
+    return torch.zeros((64, 10), dtype=torch.int64, device=sym_buffer.device)
 
 
 __all__ = [
