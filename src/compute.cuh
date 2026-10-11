@@ -777,70 +777,35 @@ __device__ __forceinline__ void dispatch_pull_body(
     if (tid == 0 && kPhase != MegaPhase::L1)
         MX_CTR_ADD(ctr, kCtrLoopEnter, 1);
     // 任务体调度参数（循环不变量打包，按 const& 传给两个 noinline 任务体）
+    // [S-SHRINK] S 只放派生量；纯 a-> 字段由任务体经 S.a（smem）直接读。
     R19Sched S;
-    S.self = self;
-    S.remote = remote;
+    S.a = a;
     S.cycle = cycle;
-    S.peer_bases = peer_bases;
-    S.R = R;
-    S.rank = rank;
-    S.win_cap = win_cap;
-    S.pool_stride = pool_stride;
-    S.tbl_cap = tbl_cap;
-    S.k_in = k_in;
-    S.topk = topk;
-    S.ring = ring;
-    S.x_off = x_off;
-    S.weights_off = weights_off;
-    S.pool_off = pool_off;
     // [A-RWK] pool 基址：显式传入（普通显存）或回退对称区 self+pool_off
     S.pool_base = (pool_ptr != nullptr)
                       ? pool_ptr
                       : const_cast<uint8_t*>(self) + pool_off;
-    S.w_off = w_off;
-    S.meta_off = meta_off;
     S.bar_flags = bar_flags;
-    S.l2_done_idx = l2_done_idx;
-    S.task_ready_idx = task_ready_idx;
-    S.slice_flags_idx = slice_flags_idx;
-    S.l1_prog_idx = l1_prog_idx;
     S.dbg = dbg;
-    S.max_spins = max_spins;
-    // [集71] 计数缓冲下传任务体（L1/L2/COMBINE/wait-all 统计）
-    S.ctr = ctr;
-    S.w1 = w1;
-    S.l1_n_total = l1_n_total;
-    S.l1_block_n = l1_block_n;
-    S.l1_k_out = l1_k_out;
-    S.ffn_hidden = ffn_hidden;
-    S.frag_a = frag_a;
-    S.frag2 = frag2;
     S.l1_chk = l1_chk;
-    S.w2 = w2;
-    S.l2_out = l2_out;
-    S.l2_k_out = l2_k_out;
     S.l2_chk = l2_chk;
     S.pt = pt;
-    S.combine_rows_off = combine_rows_off;
-    S.unk_peers = unk_peers;
-    S.epoch = epoch;
-    // [R21] A fragment 副本（放在 ffn_hidden 的空槽）启用条件：
-    //   单波（每 block 恰 1 任务，sibling 组固定）+ 每 expert 单窗（win_cap
-    // [R34][FRAG-INT] fragment 的 m 维长度 = ceil(win_cap/16)（win_cap 允许非 16
-    //   整除：尾块由 row<cc 掩码，fragment 尾 tile 折叠到最后一 tile 读取）。
-    //   A/F2 fragment 槽 = local_data.frag_a/frag2[(e*ring + w%ring)]（恒存在）。
+    S.frag_a = frag_a;
+    S.frag2 = frag2;
+    // [R34][FRAG-INT] fragment m 维 = ceil(win_cap/16)；槽 = local_data.frag_a/frag2。
     const int mt_total = (win_cap + 15) >> 4;
     S.mt_total = mt_total;
-    // [FRAG-INT] A/f2 fragment 专用缓冲恒存在（local_data.frag_a/frag2，非 host 传入）。
-    //   取消 afrag_ok（借 ffn_hidden 空槽）路径：一律走专用缓冲，不再有 launch 级分支。
 #if defined(CM_NO_FRAGALL)
     S.frag_all = false;
 #else
     S.frag_all = (frag_a != nullptr) && (frag2 != nullptr) &&
                  (l1_k_out > 0) && (mt_total > 0) && (win_cap > 0);
 #endif
+    S.epoch = epoch;
     S.merge = merge;
     S.nslice_eff = nslice_eff;
+    // [集71] 计数缓冲下传任务体
+    S.ctr = ctr;
     int processed = 0;
     while (true) {
         // ---- 领号 + 解码 + ring 门（仅 tid0）----
@@ -902,7 +867,6 @@ __device__ __forceinline__ void dispatch_pull_body(
         const int data_slot =
             (kPhase == MegaPhase::Both) ? pool_slot : (e * slot_win + w);
         const int* pfx = s_prefix + e * (R + 1);
-        // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
         // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
         if (count > kM) {
             r19_big_task<kPhase>(S, task, e, w, count, slice,

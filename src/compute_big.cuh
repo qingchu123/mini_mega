@@ -270,44 +270,22 @@ __device__ __forceinline__ R19Frag r19_load_a2_frag(
 // dispatch_pull_body 的循环不变量集中打包，按 const& 传给两个 noinline 任务体，
 // 避免大参数表经 ABI 展开（也便于两个任务体共享）。
 struct R19Sched {
-    const uint8_t* self;
-    const ranks_data* remote;   // 本 rank ranks_data（src_index_table 等）
+    // [S-SHRINK] 只缓存派生量/间接指针；纯 a-> 字段直接经 a（落在 smem s_a）读。
+    const MegaArgs* a;          // 输入视图（smem）
     int cycle;                  // [M_CYCLE] 本轮远端片
-    uint8_t* const* peer_bases;
-    int R, rank;
-    int win_cap, pool_stride, tbl_cap, k_in, topk, ring;
-    int64_t x_off, weights_off, pool_off, w_off, meta_off;
-    uint8_t* pool_base;   // [A-RWK] pool 基址（nullptr → self+pool_off）
-    uint32_t* bar_flags;
-    int64_t l2_done_idx, task_ready_idx, slice_flags_idx, l1_prog_idx;
-    int* dbg;
-    int max_spins;
-    const uint8_t* w1;
-    int l1_n_total, l1_block_n, l1_k_out;
-    uint8_t* ffn_hidden;
-    uint8_t* frag_a;    // [OPT-AFRAG] A 输入 fragment 缓冲（nullptr=关闭）
-    uint8_t* frag2;     // [OPT-AFRAG] L1 输出 fragment 缓冲（nullptr=关闭）
-    bool frag_all;      // [OPT-AFRAG] 多窗口下的 fragment 布局启用
-    float* l1_chk;
-    const uint8_t* w2;
-    uint16_t* l2_out;
-    int l2_k_out;
-    float* l2_chk;
-    unsigned long long* pt;
-    int64_t combine_rows_off;   // tail(COMBINE) 需要（来自 a）
-    unk_data* const* unk_peers;
+    uint8_t* pool_base;         // [A-RWK] pool 基址（nullptr → self+pool_off）
+    uint32_t* bar_flags;        // = lf->bar[cycle]
+    int* dbg;                   // = lf->dbg
+    float* l1_chk;              // = lf->l1_chk
+    float* l2_chk;              // = lf->l2_chk
+    unsigned long long* pt;     // = lf->pre_ticks
+    uint8_t* frag_a;            // = ld->frag_a[0]
+    uint8_t* frag2;             // = ld->frag2[0]
+    bool frag_all;
     uint64_t epoch;             // = current_time[0][1]
-    bool poolfrag_ok; // [R23] pool 槽直接按 native-fragment 序落盘（免 F_A 副本）
-    // [R35] 波量化粗化：本任务的逻辑 slice 数（merge）与物理 slice 数
-    //   （nslice_eff = kNSlice/merge）。几何公式用 nslice_eff；
-    //   [R36b] slice_flags/l1_prog 粒度=物理 slice（stride=nslice_eff），
-    //   combine 完成标记仍按逻辑 slice（slice*merge + i）写满 sums_stride。
     int merge;
     int nslice_eff;
-    // [R34] F_A/F2 的 m 维长度 = ceil(win_cap/16)（win_cap 可 16 非整除：尾块
-    //   按 row<cc 掩码）。fragment 专用缓冲 = local_data.frag_a/frag2（恒存在）。
     int mt_total;
-    // [集71] 内部执行次数统计（编译期关闭时为空操作；运行期 nullptr 关闭）
     unsigned long long* ctr = nullptr;
 };
 
@@ -1051,27 +1029,27 @@ __device__ __forceinline__ void r19_pull_flags(
     const int warp = tid / 64;
     const int lane = tid % 64;
     const int nwarps = (int)(blockDim.x / 64);
-    const int s_row_off = w * S.win_cap;
+    const int s_row_off = w * S.a->win_cap;
     // 旗槽：保持 ring 索引（旗区容量 EPR*ring*nslice=256 不变）；数据槽 pool_slot
     //   在拆分下为 e*slot_win+w（每窗口独占，见 dispatch_pull_body）。
-    const int flag_slot = e * S.ring + (w % S.ring);
+    const int flag_slot = e * kRing + (w % kRing);
     // [GEN] 槽携带代际：pool_slot=e*ring+w%ring 会绕回复用；旗值改用单调代际
     //   epoch + w/ring（= 该槽第几次被用），wait 端用本窗算出的同一值等待，
     //   避免上一代窗口遗留的旗被误判就绪（多波 merge=1 陈旧读修复）。
 #ifdef NO_GEN_FIX
     const unsigned gen = epoch;
 #else
-    const unsigned gen = epoch + (unsigned)(w / (S.ring > 0 ? S.ring : 1));
+    const unsigned gen = epoch + (unsigned)(w / (kRing > 0 ? kRing : 1));
 #endif
     (void)flag_slot;
     // [R35] 物理任务覆盖 merge 个连续逻辑 slice：K 片为连续 merge 段
-    const int u4_slice = (S.k_in / 16) / S.nslice_eff;   // 本任务 uint4 数
+    const int u4_slice = (kHidden / 16) / S.nslice_eff;   // 本任务 uint4 数
     const int u4_off = slice * u4_slice;
     uint8_t* pool = S.pool_base;
-    float* wt = reinterpret_cast<float*>(const_cast<uint8_t*>(S.self) + S.w_off);
-    int* meta = reinterpret_cast<int*>(const_cast<uint8_t*>(S.self) + S.meta_off);
+    float* wt = reinterpret_cast<float*>(const_cast<uint8_t*>(S.a->self) + S.a->w_off);
+    int* meta = reinterpret_cast<int*>(const_cast<uint8_t*>(S.a->self) + S.a->meta_off);
     const uint32_t* src_tbl =
-        &S.remote->src_index_table[S.cycle][0][0][0];
+        &(&S.a->unk->rd)->src_index_table[S.cycle][0][0][0];
     const bool kTick = (S.pt != nullptr) && (blockIdx.x == 0) && (task == 0) &&
                        (tid == 0);
     // ---- 行均分 K 片 pull：半 warp 一行（8 warp × 2 行并行），staging 写 weights/meta
@@ -1084,7 +1062,7 @@ __device__ __forceinline__ void r19_pull_flags(
     uint8_t* frag_base = nullptr;
     if (kAfrag) {
         // 按 (expert, window) 数据槽定位专用 A fragment（local_data.frag_a）
-        const size_t fsz = (size_t)(S.k_in / 32) * (size_t)S.mt_total * 512;
+        const size_t fsz = (size_t)(kHidden / 32) * (size_t)S.mt_total * 512;
         frag_base = S.frag_a + (size_t)pool_slot * fsz;
     }
     const int mt_total = S.mt_total;   // [R34] ceil(win_cap/16)
@@ -1097,14 +1075,14 @@ __device__ __forceinline__ void r19_pull_flags(
     for (int s2 = wlo + half; s2 < whi; s2 += 2) {
         const int global_row = s_row_off + s2;
         int src = 0;
-        while (src + 1 < S.R && pfx[src + 1] <= global_row) ++src;
+        while (src + 1 < S.a->R && pfx[src + 1] <= global_row) ++src;
         const int slot_in_rank = global_row - pfx[src];
         const uint32_t encoded =
-            src_tbl[(size_t)(e * S.R + src) * kMaxTPR + slot_in_rank];
-        const int src_token = (int)(encoded / (uint32_t)S.topk);
-        const bool valid = src_token >= 0 && src_token < S.tbl_cap;
+            src_tbl[(size_t)(e * S.a->R + src) * kMaxTPR + slot_in_rank];
+        const int src_token = (int)(encoded / (uint32_t)kTopk);
+        const bool valid = src_token >= 0 && src_token < S.a->slot_capacity;
         uint4* dstp = reinterpret_cast<uint4*>(
-            pool + ((size_t)pool_slot * S.pool_stride + s2) * S.k_in);
+            pool + ((size_t)pool_slot * S.a->win_cap + s2) * kHidden);
         if (valid) {
             // [O2] 权重远端读先于整行搬运发出：与搬运 store 并行，
             // 避免原顺序（先搬运后读权重）把远端读延迟暴露在任务尾。
@@ -1113,20 +1091,20 @@ __device__ __forceinline__ void r19_pull_flags(
             if constexpr (kPhase != MegaPhase::L1) {
                 if (ll == 0)
                     wv = *(reinterpret_cast<const float*>(
-                               S.peer_bases[src] + S.weights_off) + encoded);
+                               S.a->peer_bases[src] + S.a->weights_off) + encoded);
             }
             // [L1L2-SPLIT] pool/frag 数据搬移仅 Both/L1（L2 阶段不碰输入缓冲）。
             if constexpr (kPhase != MegaPhase::L2) {
 #ifdef PULL_LOCAL_DIAG
                 // [诊断] 远端读换成本 rank 本地读（同 volume/pattern），量化远端代价
                 const uint4* srcp = reinterpret_cast<const uint4*>(
-                                        S.self + S.x_off) +
-                                    (size_t)(src_token % S.tbl_cap) *
-                                        (S.k_in / 16) + u4_off;
+                                        S.a->self + S.a->x_off) +
+                                    (size_t)(src_token % S.a->slot_capacity) *
+                                        (kHidden / 16) + u4_off;
 #else
                 const uint4* srcp = reinterpret_cast<const uint4*>(
-                                        S.peer_bases[src] + S.x_off) +
-                                    (size_t)src_token * (S.k_in / 16) + u4_off;
+                                        S.a->peer_bases[src] + S.a->x_off) +
+                                    (size_t)src_token * (kHidden / 16) + u4_off;
 #endif
                 // [H2] 本场景 u4_slice=96（6144/16/4）：3 个远端装载先全量发出，
                 // 再连续 store，消除 load→store→load 的串行依赖（−1.7µs）。
@@ -1159,11 +1137,11 @@ __device__ __forceinline__ void r19_pull_flags(
             }
             if constexpr (kPhase != MegaPhase::L1) {
                 if (ll == 0) {
-                    wt[(size_t)blockIdx.x * S.win_cap + s2] = wv;
-                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 0] = src;
-                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 1] = src_token;
-                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 2] =
-                        (int)(encoded % (uint32_t)S.topk);
+                    wt[(size_t)blockIdx.x * S.a->win_cap + s2] = wv;
+                    meta[((size_t)blockIdx.x * S.a->win_cap + s2) * 3 + 0] = src;
+                    meta[((size_t)blockIdx.x * S.a->win_cap + s2) * 3 + 1] = src_token;
+                    meta[((size_t)blockIdx.x * S.a->win_cap + s2) * 3 + 2] =
+                        (int)(encoded % (uint32_t)kTopk);
                 }
             }
         } else {
@@ -1179,10 +1157,10 @@ __device__ __forceinline__ void r19_pull_flags(
             }
             if constexpr (kPhase != MegaPhase::L1) {
                 if (ll == 0) {
-                    wt[(size_t)blockIdx.x * S.win_cap + s2] = 0.0f;
-                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 0] = 0;
-                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 1] = 0;
-                    meta[((size_t)blockIdx.x * S.win_cap + s2) * 3 + 2] = 0;
+                    wt[(size_t)blockIdx.x * S.a->win_cap + s2] = 0.0f;
+                    meta[((size_t)blockIdx.x * S.a->win_cap + s2) * 3 + 0] = 0;
+                    meta[((size_t)blockIdx.x * S.a->win_cap + s2) * 3 + 1] = 0;
+                    meta[((size_t)blockIdx.x * S.a->win_cap + s2) * 3 + 2] = 0;
                 }
             }
         }
@@ -1205,7 +1183,7 @@ __device__ __forceinline__ void r19_pull_flags(
             //   kNSlice=16 因此无需改布局常量即可用。
             // [L1L2-SPLIT] 旗槽恒用 ring 索引（容量 256 不随数据槽扩容）。
             *reinterpret_cast<volatile uint32_t*>(
-                S.bar_flags + S.slice_flags_idx +
+                S.bar_flags + S.a->slice_flags_idx +
                 (size_t)flag_slot * S.nslice_eff + slice) = gen;
 #ifndef PULL_FENCE_MIN
             __threadfence();
@@ -1224,11 +1202,11 @@ __device__ __forceinline__ void r19_pull_flags(
                 // [集71] wait-all（分片就绪旗）等待轮次
                 MX_CTR_ADD(S.ctr, kCtrWaitAllSlice, 1);
                 while (*(volatile const uint32_t*)(S.bar_flags +
-                                                   S.slice_flags_idx +
+                                                   S.a->slice_flags_idx +
                                                    (size_t)flag_slot *
                                                        S.nslice_eff +
                                                    s2) != gen) {
-                    if (++spin > S.max_spins) {
+                    if (++spin > S.a->max_spins) {
                         if (S.dbg != nullptr) atomicAdd(S.dbg + 4, 1);
                         break;
                     }
@@ -1250,25 +1228,25 @@ __device__ __forceinline__ void r19_l1_pub_wait(
 #ifdef NO_GEN_FIX
     const unsigned gen = epoch;
 #else
-    const unsigned gen = epoch + (unsigned)(w / (S.ring > 0 ? S.ring : 1));
+    const unsigned gen = epoch + (unsigned)(w / (kRing > 0 ? kRing : 1));
 #endif
     __syncthreads();
     // ---- l1_prog 发布 + L1→L2 依赖（本窗全部 NSLICE 个旗）----
     if (tid == 0) {
         __threadfence();
         // [R36b] 同 slice 旗：flag 粒度=物理 slice（stride=nslice_eff）
-        l1_progress_publish(S.bar_flags, (int)S.l1_prog_idx, pool_slot, slice,
+        l1_progress_publish(S.bar_flags, (int)S.a->l1_prog_idx, pool_slot, slice,
                             gen, (int)S.nslice_eff);
         for (int s2 = 0; s2 < S.nslice_eff; ++s2) {
             if (s2 == slice) continue;
             long long spin = 0;
             // [集71] wait-all（l1_prog 旗）等待轮次
             MX_CTR_ADD(S.ctr, kCtrWaitAllL1Prog, 1);
-            while (*(volatile const uint32_t*)(S.bar_flags + S.l1_prog_idx +
+            while (*(volatile const uint32_t*)(S.bar_flags + S.a->l1_prog_idx +
                                                (size_t)pool_slot *
                                                    S.nslice_eff +
                                                s2) != gen) {
-                if (++spin > S.max_spins) {
+                if (++spin > S.a->max_spins) {
                     if (S.dbg != nullptr) atomicAdd(S.dbg + 4, 1);
                     break;
                 }
@@ -1283,14 +1261,14 @@ __device__ __forceinline__ void r19_l1_pub_wait(
 
 __device__ __forceinline__ CombineCtx cm_build_ctx(const R19Sched& S) {
     CombineCtx c;
-    c.meta = reinterpret_cast<const int*>(S.self + S.meta_off);
-    c.weights = reinterpret_cast<const float*>(S.self + S.w_off);
-    c.peer_bases = S.peer_bases;
-    c.unk_peers = S.unk_peers;
-    c.rows_off = S.combine_rows_off;
+    c.meta = reinterpret_cast<const int*>(S.a->self + S.a->meta_off);
+    c.weights = reinterpret_cast<const float*>(S.a->self + S.a->w_off);
+    c.peer_bases = S.a->peer_bases;
+    c.unk_peers = S.a->unk_peers;
+    c.rows_off = S.a->combine_rows_off;
     c.epoch = S.epoch;
     c.block_idx = (int)blockIdx.x;
-    c.staging_cap = S.win_cap;
+    c.staging_cap = S.a->win_cap;
     c.cycle = S.cycle;
     return c;
 }
@@ -1308,7 +1286,7 @@ __device__ __forceinline__ void r19_tail_common(
         if (fused)
             combine_mark_rows(c, count, lane, warp, 8);
         else
-            combine_push_pair(c, reinterpret_cast<const uint8_t*>(S.l2_out),
+            combine_push_pair(c, reinterpret_cast<const uint8_t*>(S.a->l2_out),
                               count, lane, warp, 8);
     }
     __syncthreads();
@@ -1336,7 +1314,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     //   编译单元隔离寄存器/栈，因此不再需要 if constexpr 删除不可达档。
     // [R38] tk/长尾（win_cap<=64）用更深 B 预取环（R24_BPF_HAVE_HEADROOM=4）：这些
     //   场景 count<=64、寄存器预算有裕量；均衡大档（win_cap>64）保持 R24_BPF(2)，
-    //   避免 TPR=256 回退。运行期按 S.win_cap 选择（见各 r24 调用点）。
+    //   避免 TPR=256 回退。运行期按 S.a->win_cap 选择（见各 r24 调用点）。
     constexpr int kR24BPF = R24_BPF;
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
     // [tail 内联] ctx/fuse 由 S 现构造（CombineTail 已去除）
@@ -1344,7 +1322,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     CombineFuseCtx fuse;
     fuse.capable = (cctx.rows_off >= 0);
     fuse.c = &cctx;
-    fuse.out_base = reinterpret_cast<const uint8_t*>(S.l2_out);
+    fuse.out_base = reinterpret_cast<const uint8_t*>(S.a->l2_out);
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
     r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx);
@@ -1354,26 +1332,26 @@ __device__ R19_BIG_ATTR void r19_big_task(
     // ---- L1：M 档位（kMT 个 16 行 tile 共享 B 一遍）----
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
-    const uint8_t* pool_w = pool + (size_t)pool_slot * S.pool_stride * S.k_in;
+    const uint8_t* pool_w = pool + (size_t)pool_slot * S.a->win_cap * kHidden;
     const CombineCtx cctx = cm_build_ctx(S);
-    const int g_l1 = (S.l1_n_total / S.l1_block_n) / S.nslice_eff;
+    const int g_l1 = ((2 * S.a->l1_k_out) / kL1BlockN) / S.nslice_eff;
     const int g0_l1 = slice * g_l1;
     // [集71] L1 阶段执行次数（count>0 的任务，tid0 计一次）
     if (tid == 0 && count > 0) MX_CTR_ADD(S.ctr, kCtrL1Exec, 1);
     if (CM_L1_GATE) {
-        uint8_t* ffn_slot = (S.ffn_hidden != nullptr)
-            ? S.ffn_hidden + (size_t)pool_slot * S.win_cap * S.l1_k_out
+        uint8_t* ffn_slot = (S.a->ffn_hidden != nullptr)
+            ? S.a->ffn_hidden + (size_t)pool_slot * S.a->win_cap * S.a->l1_k_out
             : nullptr;
-        const int out_col_base = slice * (S.l1_k_out / S.nslice_eff);
+        const int out_col_base = slice * (S.a->l1_k_out / S.nslice_eff);
         // A fragment 副本：一律走 local_data.frag_a/frag2 专用缓冲
         const bool kFragNew = S.frag_all && count > 0;
         const uint8_t* fbase = nullptr;
         uint8_t* ffn2 = nullptr;
         if (kFragNew) {
             const size_t asz =
-                (size_t)(S.k_in / 32) * (size_t)S.mt_total * 512;
+                (size_t)(kHidden / 32) * (size_t)S.mt_total * 512;
             const size_t f2sz =
-                (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
+                (size_t)(S.a->l1_k_out / 32) * (size_t)S.mt_total * 512;
             const size_t soff = (size_t)pool_slot;   // [L1L2-SPLIT] 数据槽
             if (CM_FRAG_A) fbase = S.frag_a + soff * asz;
             if (CM_FRAG_L2 && CM_FRAG_F2) ffn2 = S.frag2 + soff * f2sz;
@@ -1387,93 +1365,93 @@ __device__ R19_BIG_ATTR void r19_big_task(
         // 回退为 ceil(count/64)）。count<=64 时权重同为 1 遍而 async 多一遍
         // stage 同步且尾块掩码有开销，实测更慢 → 保持非 async 回退。
         const bool kAsync = (fbase != nullptr) && (count > 64) &&
-                            ((S.k_in / 32) % R24_KS == 0) &&
+                            ((kHidden / 32) % R24_KS == 0) &&
                             (g_l1 % R19_L1_BATCH == 0);
         if (count <= 32 && g_l1 % 4 == 0) {
             // [L1TUNE-B] 17..32 档：MT2/PF1（同 1 组权重、acc 减半）替代 MT4/PF2。
             //   实测 TPR24 630→483（−23%，docs/15/16）。count≤16 走 small 档。
             r19_l1_big<2, 1, 4>(
-                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
+                pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
         } else if (count <= 32 && g_l1 % 2 == 0 && g_l1 >= 2) {
             // [R35] NSLICE=8 等 g_l1=2 几何：单批 2 组小档（A 装载一遍、MT2
             //   runtime 裁剪），与 NSLICE=4 的 <2,kNT,2,4> 同构按比例缩小；
             //   避免落入 r19_l1_big<4,...> 的 MT4 档（A 读 2× + M 空转）。
             r19_l1_big<4, R19_L1_PF, 2>(
-                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
+                pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
         } else if (count <= 48 && g_l1 % 4 == 0) {
             // [OPT-33] 33..48 档：MT3（恰好 ceil(count/16)=3 个 tile），acc 比
             //   MT4 小（[4][3][2] → [4][3][2] 不变，但省 1 个 M tile 的寄存器/
             //   发射槽），减少尾块 M 空转（原 MT4 对 33..48 仍按 4 tile 分配）。
             bool med_r24 = false;
 #if CM_MED_R24
-            if (fbase != nullptr && ((S.k_in / 32) % 16 == 0)) {
+            if (fbase != nullptr && ((kHidden / 32) % 16 == 0)) {
                 // [OPT-KCAP-REMOVE] win_cap<=64（tk/长尾）用更深 B 预取环(4)；
                 //   均衡大档保持 R24_BPF(2)。运行期等价原 kCap>0 编译期选择。
-                if (S.win_cap <= 64) {
+                if (S.a->win_cap <= 64) {
                     r24_l1_big<3, 16, CM_L1_BATCH, true, 3, 4>(
-                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                        (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                         S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                        S.l1_k_out);
+                        S.a->l1_k_out);
                 } else {
                     r24_l1_big<3, 16, CM_L1_BATCH, true, 3, R24_BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                        (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                         S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                        S.l1_k_out);
+                        S.a->l1_k_out);
                 }
                 med_r24 = true;
             }
 #endif
             if (!med_r24) {
                 r19_l1_big<3, R19_L1_PF, 4>(
-                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
+                pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
             }
         } else if (count <= 48 && g_l1 % 2 == 0 && g_l1 >= 2) {
             // [OPT-NS8] NSLICE=8 时 g_l1=2：33..48 档用 MT3/B2（A 装一遍、
             //   runtime M 裁剪），避免落入 r19_l1_big<4,...> 的 MT4 慢档。
             r19_l1_big<3, R19_L1_PF, 2>(
-                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
+                pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
         } else if (count > 48 && count <= 64 && fbase != nullptr &&
-                   ((S.k_in / 32) % R24_KS == 0)) {
+                   ((kHidden / 32) % R24_KS == 0)) {
             // [L1TUNE-D] 49..64 档走 r24 A-smem：整块(64)无掩码、49..63 尾块掩码。
             //   原条件仅 count%64==0 进入，49..63 掉进 r19 慢回退（TPR54 826→653，docs/16）。
             // [OPT-KCAP-REMOVE] win_cap<=64 用 BPF=4，均衡大档 BPF=2。
             if (count % (4 * kM) == 0) {
-                if (S.win_cap <= 64) {
+                if (S.a->win_cap <= 64) {
                     r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, 4>(
-                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                        (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                         S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                        S.l1_k_out);
+                        S.a->l1_k_out);
                 } else {
                     r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, R24_BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                        (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                         S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                        S.l1_k_out);
+                        S.a->l1_k_out);
                 }
             } else {
-                if (S.win_cap <= 64) {
+                if (S.a->win_cap <= 64) {
                     r24_l1_big<4, R24_KS, R19_L1_BATCH, true, 4, 4>(
-                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                        (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                         S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                        S.l1_k_out);
+                        S.a->l1_k_out);
                 } else {
                     r24_l1_big<4, R24_KS, R19_L1_BATCH, true, 4, R24_BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                        (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                         S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                        S.l1_k_out);
+                        S.a->l1_k_out);
                 }
             }
         } else if (kAsync) {
@@ -1483,68 +1461,68 @@ __device__ R19_BIG_ATTR void r19_big_task(
             const int full = count - count % (R19_L1_MT * kM);
             if (full > 0)
                 r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, false, R19_L1_MT, kR24BPF>(
-                    a_smem, fbase, S.mt_total, S.w1, e, 0, full, S.k_in,
-                    S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                    a_smem, fbase, S.mt_total, S.a->w1, e, 0, full, kHidden,
+                    (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                     S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                    S.l1_k_out);
+                    S.a->l1_k_out);
             if (full < count) {
                 // [R34] 尾块只占 1 tile（r<=16，TPR=129/257/513 皆 r=1）时用
                 //   MT1/KS16 小档：A/MMA 降到 1/8（B 遍数不变），并省一半 stage
                 //   同步；几何不匹配时回退 MT8 掩码档
                 const bool kTiny = (count - full <= kM) &&
-                                   ((S.k_in / 32) % 16 == 0);
+                                   ((kHidden / 32) % 16 == 0);
                 // [R36] 尾块活跃 tile 数（编译期裁剪 A/MMA/epilogue）
                 const int l1_act = (count - full + kM - 1) / kM;
                 if (kTiny)
                     r24_l1_big<1, 16, R19_L1_BATCH, true, 1, kR24BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
-                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, full, count,
+                        kHidden, (2 * S.a->l1_k_out), kL1BlockN, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
-                        out_col_base, S.l1_k_out);
+                        out_col_base, S.a->l1_k_out);
                 // [TAIL-MT] 尾块按精确活跃 tile 数选档（原仅 5/8）：count∈65..127
                 //   原先一律用 MTAct=8（按 128 行算）→ 白算（TPR 84/90 台阶）。
                 else if (l1_act == 2)
                     r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 2, kR24BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
-                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, full, count,
+                        kHidden, (2 * S.a->l1_k_out), kL1BlockN, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
-                        out_col_base, S.l1_k_out);
+                        out_col_base, S.a->l1_k_out);
                 else if (l1_act == 3)
                     r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 3, kR24BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
-                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, full, count,
+                        kHidden, (2 * S.a->l1_k_out), kL1BlockN, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
-                        out_col_base, S.l1_k_out);
+                        out_col_base, S.a->l1_k_out);
                 else if (l1_act == 4)
                     r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 4, kR24BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
-                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, full, count,
+                        kHidden, (2 * S.a->l1_k_out), kL1BlockN, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
-                        out_col_base, S.l1_k_out);
+                        out_col_base, S.a->l1_k_out);
                 else if (l1_act == 5)
                     r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 5, kR24BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
-                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, full, count,
+                        kHidden, (2 * S.a->l1_k_out), kL1BlockN, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
-                        out_col_base, S.l1_k_out);
+                        out_col_base, S.a->l1_k_out);
                 else if (l1_act == 6)
                     r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 6, kR24BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
-                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, full, count,
+                        kHidden, (2 * S.a->l1_k_out), kL1BlockN, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
-                        out_col_base, S.l1_k_out);
+                        out_col_base, S.a->l1_k_out);
                 else if (l1_act == 7)
                     r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 7, kR24BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
-                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, full, count,
+                        kHidden, (2 * S.a->l1_k_out), kL1BlockN, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
-                        out_col_base, S.l1_k_out);
+                        out_col_base, S.a->l1_k_out);
                 else
                     r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, R19_L1_MT, kR24BPF>(
-                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
-                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        a_smem, fbase, S.mt_total, S.a->w1, e, full, count,
+                        kHidden, (2 * S.a->l1_k_out), kL1BlockN, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
-                        out_col_base, S.l1_k_out);
+                        out_col_base, S.a->l1_k_out);
             }
         } else
             // [R27·delivered] 非 async 回退固定 MT4/B4：避免与 async 的 MT8 档
@@ -1552,9 +1530,9 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // MT8 全档回退实测栈 1880B→2688B、71 机 TPR=128 回归 +4.7%；固定
             // MT4 回退后栈 2072B、TPR=128 回归收窄至 +2.8%）。
             r19_l1_big<4, R19_L1_PF, 4>(
-                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
+                pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
     }   // end if (CM_L1_GATE)
     }   // end if constexpr (kPhase != MegaPhase::L2)  —— L1 段
 #if R24_DIAG_PHASE
@@ -1572,24 +1550,24 @@ __device__ R19_BIG_ATTR void r19_big_task(
 #endif
     // ---- L2：M 档位（K=I、N=H），BF16 写每块 staging 槽 ----
     if constexpr (kPhase != MegaPhase::L1) {
-    const int g_l2 = (S.l2_k_out / S.l1_block_n) / S.nslice_eff;
+    const int g_l2 = (S.a->l2_k_out / kL1BlockN) / S.nslice_eff;
     const int g0_l2 = slice * g_l2;
     // [集71] L2 阶段执行次数（count>0 的任务，tid0 计一次）
     if (tid == 0 && count > 0) MX_CTR_ADD(S.ctr, kCtrL2Exec, 1);
     if (CM_L2_GATE) {
         const uint8_t* ffn_slot =
-            (S.ffn_hidden != nullptr)
-                ? S.ffn_hidden + (size_t)pool_slot * S.win_cap * S.l1_k_out
+            (S.a->ffn_hidden != nullptr)
+                ? S.a->ffn_hidden + (size_t)pool_slot * S.a->win_cap * S.a->l1_k_out
                 : nullptr;
-        uint16_t* out_slot = (S.l2_out != nullptr)
-            ? S.l2_out + (size_t)blockIdx.x * S.win_cap * S.l2_k_out
+        uint16_t* out_slot = (S.a->l2_out != nullptr)
+            ? S.a->l2_out + (size_t)blockIdx.x * S.a->win_cap * S.a->l2_k_out
             : nullptr;
-        const uint8_t* w2_e = S.w2 + (size_t)e * S.l2_k_out * S.l1_k_out;
+        const uint8_t* w2_e = S.a->w2 + (size_t)e * S.a->l2_k_out * S.a->l1_k_out;
         // L2 的 A 走 local_data.frag2 的 fragment 副本
         const uint8_t* f2 = nullptr;
         if (CM_FRAG_L2 && S.frag_all && count > 0) {
             const size_t f2sz =
-                (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
+                (size_t)(S.a->l1_k_out / 32) * (size_t)S.mt_total * 512;
             if (CM_FRAG_A2)
                 f2 = S.frag2 + (size_t)pool_slot * f2sz;   // [L1L2-SPLIT] 数据槽
         }
@@ -1597,7 +1575,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
         // [R35] 去掉 g_l2%R19_L2_BATCH==0 门控：奇数 g_l2（NSLICE=8 → 24/8=3）
         //   由 r24_l2_big 的 kBatch=1 余量路径补齐，不再回退 MT4 慢路径。
         const bool kAsyncL2 = (f2 != nullptr) && (count > 64) &&
-                              ((S.l1_k_out / 32) % R24_KS == 0) && (g_l2 >= 1);
+                              ((S.a->l1_k_out / 32) % R24_KS == 0) && (g_l2 >= 1);
         // [R29] 融合激活：仅当 tail 支持 + r24 路径 + staging 有效
 #if R29_COMBINE_FUSE
         fuse.on = fuse.capable && kAsyncL2 && (out_slot != nullptr);
@@ -1609,40 +1587,40 @@ __device__ R19_BIG_ATTR void r19_big_task(
 #if CM_FRAG_L2
             if (f2 != nullptr)
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, true>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
-                    S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
-                    g0_l2, g_l2, out_slot, S.l2_k_out, f2, S.mt_total);
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out,
+                    kL1BlockN, lane, warp, kComputeWarps, S.l2_chk,
+                    g0_l2, g_l2, out_slot, S.a->l2_k_out, f2, S.mt_total);
             else
 #endif
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, false>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                    S.l2_k_out, nullptr, 0);
+                    S.a->l2_k_out, nullptr, 0);
         } else if (count <= 32 && g_l2 % 3 == 0 && g_l2 >= 3) {
             // [R35] NSLICE=8 等 g_l2=3 几何：单批 3 组小档（A 一遍、MT2 裁剪），
             //   避免落入 r19_l2_big<4,PF,3> 的 MT4 档（M 空转）。
 #if CM_FRAG_L2
             if (f2 != nullptr)
                 l2_gemm_body<2, kNTilesPerWarp, 2, 3, true>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                    S.l2_k_out, f2, S.mt_total);
+                    S.a->l2_k_out, f2, S.mt_total);
             else
 #endif
                 l2_gemm_body<2, kNTilesPerWarp, 2, 3>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                    S.l2_k_out);
+                    S.a->l2_k_out);
         } else if (count <= 48 && g_l2 % 6 == 0) {
             // [OPT-33] 33..48 档：MT3 单批（ceil(count/16)=3 tile），acc[3][3][2]；
             //   原 MT4/3 分两批（acc[3][4][2]=24）→ MT3 更小且只一次调用。
             bool med_r24 = false;
 #if CM_MED_R24
-            if (f2 != nullptr && ((S.l1_k_out / 32) % 16 == 0)) {
+            if (f2 != nullptr && ((S.a->l1_k_out / 32) % 16 == 0)) {
                 r24_l2_big<3, 16, 3, true, 3, kR24BPF>(
-                    a_smem, f2, S.mt_total, w2_e, 0, count, S.l1_k_out,
-                    S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps,
-                    S.l2_chk, g0_l2, g_l2, out_slot, S.l2_k_out, nullptr);
+                    a_smem, f2, S.mt_total, w2_e, 0, count, S.a->l1_k_out,
+                    S.a->l2_k_out, kL1BlockN, lane, warp, kComputeWarps,
+                    S.l2_chk, g0_l2, g_l2, out_slot, S.a->l2_k_out, nullptr);
                 med_r24 = true;
             }
 #endif
@@ -1650,93 +1628,93 @@ __device__ R19_BIG_ATTR void r19_big_task(
 #if CM_FRAG_L2
             if (f2 != nullptr)
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, true>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out,
-                    S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
-                    g0_l2, g_l2, out_slot, S.l2_k_out, f2, S.mt_total);
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out,
+                    kL1BlockN, lane, warp, kComputeWarps, S.l2_chk,
+                    g0_l2, g_l2, out_slot, S.a->l2_k_out, f2, S.mt_total);
             else
 #endif
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, false>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                    S.l2_k_out, nullptr, 0);
+                    S.a->l2_k_out, nullptr, 0);
             }
         } else if (count > 48 && count <= 64 && f2 != nullptr &&
                    (count % (4 * kM) == 0) &&
-                   ((S.l1_k_out / 32) % R24_KS == 0)) {
+                   ((S.a->l1_k_out / 32) % R24_KS == 0)) {
             // [OPT-64] 49..64 档 L2 同样走 r24 A-smem（MT4 无掩码）
             r24_l2_big<4, R24_KS, 3, false, 4, kR24BPF>(
-                a_smem, f2, S.mt_total, w2_e, 0, count, S.l1_k_out,
-                S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps,
-                S.l2_chk, g0_l2, g_l2, out_slot, S.l2_k_out, nullptr);
+                a_smem, f2, S.mt_total, w2_e, 0, count, S.a->l1_k_out,
+                S.a->l2_k_out, kL1BlockN, lane, warp, kComputeWarps,
+                S.l2_chk, g0_l2, g_l2, out_slot, S.a->l2_k_out, nullptr);
         } else if (kAsyncL2) {
             // [R34] 同 L1：全块 + 尾块（尾块掩码；融合推送对两段都生效）
             const int full = count - count % (R19_L2_MT * kM);
             if (full > 0)
                 r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, false, R19_L2_MT, kR24BPF>(
-                    a_smem, f2, S.mt_total, w2_e, 0, full, S.l1_k_out,
-                    S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps,
-                    S.l2_chk, g0_l2, g_l2, out_slot, S.l2_k_out,
+                    a_smem, f2, S.mt_total, w2_e, 0, full, S.a->l1_k_out,
+                    S.a->l2_k_out, kL1BlockN, lane, warp, kComputeWarps,
+                    S.l2_chk, g0_l2, g_l2, out_slot, S.a->l2_k_out,
                     fuse.on ? &fuse : nullptr);
             if (full < count) {
                 const bool kTiny = (count - full <= kM) &&
-                                   ((S.l1_k_out / 32) % 16 == 0);
+                                   ((S.a->l1_k_out / 32) % 16 == 0);
                 const int l2_act = (count - full + kM - 1) / kM;
                 if (kTiny)
                     r24_l2_big<1, 16, R19_L2_BATCH, true, 1, kR24BPF>(
                         a_smem, f2, S.mt_total, w2_e, full, count,
-                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        S.a->l1_k_out, S.a->l2_k_out, kL1BlockN, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                        S.a->l2_k_out, fuse.on ? &fuse : nullptr);
                 // [TAIL-MT] 同 L1：按精确活跃 tile 选档，消除 count∈65..127 的 MTAct=8 白算
                 else if (l2_act == 2)
                     r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 2, kR24BPF>(
                         a_smem, f2, S.mt_total, w2_e, full, count,
-                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        S.a->l1_k_out, S.a->l2_k_out, kL1BlockN, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                        S.a->l2_k_out, fuse.on ? &fuse : nullptr);
                 else if (l2_act == 3)
                     r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 3, kR24BPF>(
                         a_smem, f2, S.mt_total, w2_e, full, count,
-                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        S.a->l1_k_out, S.a->l2_k_out, kL1BlockN, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                        S.a->l2_k_out, fuse.on ? &fuse : nullptr);
                 else if (l2_act == 4)
                     r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 4, kR24BPF>(
                         a_smem, f2, S.mt_total, w2_e, full, count,
-                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        S.a->l1_k_out, S.a->l2_k_out, kL1BlockN, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                        S.a->l2_k_out, fuse.on ? &fuse : nullptr);
                 else if (l2_act == 5)
                     r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 5, kR24BPF>(
                         a_smem, f2, S.mt_total, w2_e, full, count,
-                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        S.a->l1_k_out, S.a->l2_k_out, kL1BlockN, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                        S.a->l2_k_out, fuse.on ? &fuse : nullptr);
                 else if (l2_act == 6)
                     r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 6, kR24BPF>(
                         a_smem, f2, S.mt_total, w2_e, full, count,
-                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        S.a->l1_k_out, S.a->l2_k_out, kL1BlockN, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                        S.a->l2_k_out, fuse.on ? &fuse : nullptr);
                 else if (l2_act == 7)
                     r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 7, kR24BPF>(
                         a_smem, f2, S.mt_total, w2_e, full, count,
-                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        S.a->l1_k_out, S.a->l2_k_out, kL1BlockN, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                        S.a->l2_k_out, fuse.on ? &fuse : nullptr);
                 else
                     r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, R19_L2_MT, kR24BPF>(
                         a_smem, f2, S.mt_total, w2_e, full, count,
-                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        S.a->l1_k_out, S.a->l2_k_out, kL1BlockN, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                        S.a->l2_k_out, fuse.on ? &fuse : nullptr);
             }
         } else
             // [R27·delivered] 同上：回退固定 MT4/B3
             r19_l2_big<4, R19_L2_PF, 3>(
-                ffn_slot, f2, S.mt_total, w2_e, count, S.l1_k_out,
-                S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
-                g0_l2, g_l2, out_slot, S.l2_k_out);
+                ffn_slot, f2, S.mt_total, w2_e, count, S.a->l1_k_out,
+                S.a->l2_k_out, kL1BlockN, lane, warp, kComputeWarps, S.l2_chk,
+                g0_l2, g_l2, out_slot, S.a->l2_k_out);
     }   // end if (CM_L2_GATE)
     }   // end if constexpr (kPhase != MegaPhase::L1)  —— L2 段
     __syncthreads();
@@ -1770,24 +1748,24 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     // ---- L1：小 count 档位（与基线实例选择一致）----
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
-    const uint8_t* pool_w = pool + (size_t)pool_slot * S.pool_stride * S.k_in;
+    const uint8_t* pool_w = pool + (size_t)pool_slot * S.a->win_cap * kHidden;
     const CombineCtx cctx = cm_build_ctx(S);
-    const int g_l1 = (S.l1_n_total / S.l1_block_n) / S.nslice_eff;
+    const int g_l1 = ((2 * S.a->l1_k_out) / kL1BlockN) / S.nslice_eff;
     const int g0_l1 = slice * g_l1;
     // [集71] L1 阶段执行次数（count>0 的任务，tid0 计一次）
     if (tid == 0 && count > 0) MX_CTR_ADD(S.ctr, kCtrL1Exec, 1);
     if (CM_L1_GATE) {
-        uint8_t* ffn_slot = (S.ffn_hidden != nullptr)
-            ? S.ffn_hidden + (size_t)pool_slot * S.win_cap * S.l1_k_out
+        uint8_t* ffn_slot = (S.a->ffn_hidden != nullptr)
+            ? S.a->ffn_hidden + (size_t)pool_slot * S.a->win_cap * S.a->l1_k_out
             : nullptr;
-        const int out_col_base = slice * (S.l1_k_out / S.nslice_eff);
+        const int out_col_base = slice * (S.a->l1_k_out / S.nslice_eff);
         // [FRAG-ALL] 小档同样走 fragment：A 从 frag_a、输出写 frag2
         const bool kFragNew = S.frag_all && count > 0;
         const uint8_t* fbase = nullptr;
         uint8_t* ffn2 = nullptr;
         if (kFragNew) {
-            const size_t asz = (size_t)(S.k_in / 32) * (size_t)S.mt_total * 512;
-            const size_t f2sz = (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
+            const size_t asz = (size_t)(kHidden / 32) * (size_t)S.mt_total * 512;
+            const size_t f2sz = (size_t)(S.a->l1_k_out / 32) * (size_t)S.mt_total * 512;
             const size_t soff = (size_t)pool_slot;   // [L1L2-SPLIT] 数据槽
             if (CM_FRAG_A) fbase = S.frag_a + soff * asz;
             if (CM_FRAG_L2 && CM_FRAG_F2) ffn2 = S.frag2 + soff * f2sz;
@@ -1798,16 +1776,16 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         if (g_l1 % 4 == 0) {
             // count<=16（热路径）档切 r19<1,2,4>：与 17-32 的 r19 统一，实测中性
             r19_l1_big<1, R19_L1_PF, 4>(
-                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
+                pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
         } else
             // [b] g_l1=2（NSLICE=8）几何：paired<4,kNT,1,2> → r19<1,2,2>，
             //   彻底移除 small task 的 paired 实例（省其 PF4 预取环寄存器）
             r19_l1_big<1, R19_L1_PF, 2>(
-                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
+                pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
+                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
     }   // end if (CM_L1_GATE)
     }   // end if constexpr (kPhase != MegaPhase::L2)  —— L1 段（small）
     if constexpr (kPhase == MegaPhase::Both) {
@@ -1815,38 +1793,38 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     }   // end if constexpr (kPhase == MegaPhase::Both)
     // ---- L2：小 count（与基线实例选择一致）----
     if constexpr (kPhase != MegaPhase::L1) {
-    const int g_l2 = (S.l2_k_out / S.l1_block_n) / S.nslice_eff;
+    const int g_l2 = (S.a->l2_k_out / kL1BlockN) / S.nslice_eff;
     const int g0_l2 = slice * g_l2;
     // [集71] L2 阶段执行次数（count>0 的任务，tid0 计一次）
     if (tid == 0 && count > 0) MX_CTR_ADD(S.ctr, kCtrL2Exec, 1);
     if (CM_L2_GATE) {
         const uint8_t* ffn_slot =
-            (S.ffn_hidden != nullptr)
-                ? S.ffn_hidden + (size_t)pool_slot * S.win_cap * S.l1_k_out
+            (S.a->ffn_hidden != nullptr)
+                ? S.a->ffn_hidden + (size_t)pool_slot * S.a->win_cap * S.a->l1_k_out
                 : nullptr;
-        uint16_t* out_slot = (S.l2_out != nullptr)
-            ? S.l2_out + (size_t)blockIdx.x * S.win_cap * S.l2_k_out
+        uint16_t* out_slot = (S.a->l2_out != nullptr)
+            ? S.a->l2_out + (size_t)blockIdx.x * S.a->win_cap * S.a->l2_k_out
             : nullptr;
-        const uint8_t* w2_e = S.w2 + (size_t)e * S.l2_k_out * S.l1_k_out;
+        const uint8_t* w2_e = S.a->w2 + (size_t)e * S.a->l2_k_out * S.a->l1_k_out;
         // [FRAG-ALL] L2 的 A 走 L1 的 frag2 fragment 副本
         const uint8_t* f2 = nullptr;
         if (CM_FRAG_L2 && S.frag_all && count > 0 && CM_FRAG_A2) {
             const size_t f2sz =
-                (size_t)(S.l1_k_out / 32) * (size_t)S.mt_total * 512;
+                (size_t)(S.a->l1_k_out / 32) * (size_t)S.mt_total * 512;
             f2 = S.frag2 + (size_t)pool_slot * f2sz;   // [L1L2-SPLIT] 数据槽
         }
 #define L2CALL(KB)                                                             \
     do {                                                                       \
         if (f2 != nullptr)                                                     \
             l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, KB, true>(               \
-                ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,   \
+                ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,   \
                 lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,    \
-                S.l2_k_out, f2, S.mt_total);                                   \
+                S.a->l2_k_out, f2, S.mt_total);                                   \
         else                                                                   \
             l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, KB>(                     \
-                ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,   \
+                ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,   \
                 lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,    \
-                S.l2_k_out);                                                   \
+                S.a->l2_k_out);                                                   \
     } while (0)
         if (g_l2 % 6 == 0) {
             L2CALL(6);
@@ -1859,34 +1837,34 @@ __device__ R19_SMALL_ATTR void r19_small_task(
             const int gb = g_l2 / 2;
             if (f2 != nullptr) {
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, 3, true>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, gb, out_slot,
-                    S.l2_k_out, f2, S.mt_total);
+                    S.a->l2_k_out, f2, S.mt_total);
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, 3, true>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2 + gb, g_l2 - gb,
-                    out_slot, S.l2_k_out, f2, S.mt_total);
+                    out_slot, S.a->l2_k_out, f2, S.mt_total);
             } else {
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, 3>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, gb, out_slot,
-                    S.l2_k_out);
+                    S.a->l2_k_out);
                 l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 1, 3>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2 + gb, g_l2 - gb,
-                    out_slot, S.l2_k_out);
+                    out_slot, S.a->l2_k_out);
             }
         } else {
             if (f2 != nullptr)
                 l2_gemm_body<4, kNTilesPerWarp, 1, 2, true>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                    S.l2_k_out, f2, S.mt_total);
+                    S.a->l2_k_out, f2, S.mt_total);
             else
                 l2_gemm_body<4, kNTilesPerWarp, 1, 2>(
-                    ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n,
+                    ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
-                    S.l2_k_out);
+                    S.a->l2_k_out);
         }
 #undef L2CALL
     }
