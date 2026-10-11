@@ -43,6 +43,10 @@ _KERNEL_M_TILE = 16     # kM：M tile 行数（win_cap 对齐粒度）
 # 自适应 win 下限：kernel 守卫（src/megakernel.cu）仅放行 win==slot 或
 # 16 的倍数且 48<=win<=slot；win<48 的小窗在 REDUCE/graph 上未验证。
 _WIN_ADAPT_MIN = 48
+# [FIXED-WIN] 固定窗口容量（本 wheel 打包默认 48）：>0 时所有 launch 强制该 win，
+#   覆盖自适应。用 MXK_FORCE_WIN=0 恢复自适应、或设其它 16 倍数。值会被夹到
+#   [48, min(win_phys, num_max_tokens_per_rank)]，区间为空时回退逻辑窗口。
+_FORCE_WIN_DEFAULT = int(os.environ.get("MXK_FORCE_WIN", "48") or 0)
 
 # 物理窗口容量缺省：与调用方逻辑窗口解耦，按最大值分配（AUTO 表最大 80、
 # 长尾自适应最大 64）；可用 MXK_WIN_PHYS 覆盖（不超过 EXPERT_WINDOW_MAX）。
@@ -352,17 +356,35 @@ class SymmBuffer:
         self._launch_cfg = base
         return base
 
+    def _forced_win(self) -> int:
+        """[FIXED-WIN] 固定窗口：<=0 返回 0（走自适应）；否则夹到放行区间。"""
+        try:
+            fw = int(os.environ.get("MXK_FORCE_WIN", str(_FORCE_WIN_DEFAULT)) or 0)
+        except ValueError:
+            return 0
+        if fw <= 0:
+            return 0
+        hi = (min(int(self.win_phys), int(self.num_max_tokens_per_rank))
+              // _KERNEL_M_TILE) * _KERNEL_M_TILE
+        if hi < _WIN_ADAPT_MIN:
+            return int(self.expert_window)   # 放行区间为空：回退逻辑窗口
+        return max(_WIN_ADAPT_MIN, min(hi, fw))
+
     def launch_config(self, num_tokens: int):
         """当前应使用的 (win_cap, skip_prologue)。"""
         capturing = _is_stream_capturing()
+        fwin = self._forced_win()
         # win_cap 每 launch 自适应（capture 复用缓存）；skip_prologue 由 capture 节点号决定。
         if capturing:
-            win = self._launch_cfg if self._launch_cfg is not None \
-                else int(self.expert_window)
+            win = fwin or (self._launch_cfg if self._launch_cfg is not None
+                           else int(self.expert_window))
             skip = 2 if (self.prologue_reuse and self._capture_node > 0) else 0
             self._capture_node += 1
             return win, skip
         self._capture_node = 0
+        if fwin:
+            self._launch_cfg = fwin
+            return fwin, 0
         win = self._select_adaptive_cfg(int(num_tokens))
         return win, 0
 
