@@ -27,18 +27,17 @@ common.cuh                     场景常量、CM_* 宏默认值、计数器枚�
 
 | 入口 | 发射的 kernel | 模板实参 | 触发条件 | 行 |
 |---|---|---|---|---|
-| `launch_prelude` | `mega_kernel<false>` | kWithCompute=false | 仅前序（ROUTE/PUBLISH/XBAR/TASK_SETUP） | :159 |
-| `launch_compute` | `mega_kernel<true>` | kCap=0 | `frag_a == nullptr` | :185 |
-| `launch_compute` | `mega_kernel<true,NoTaskTail,false,48>` | kCap=48 | `frag_a!=nullptr && win_cap ≤ 48` | :173 |
-| `launch_compute` | `mega_kernel<true,NoTaskTail,false,64>` | kCap=64 | `frag_a!=nullptr && 48 < win_cap ≤ 64` | :177 |
-| `launch_compute` | `mega_kernel<true,NoTaskTail,false>` | kCap=0 | `frag_a!=nullptr && win_cap > 64` | :181 |
-| `launch_reduce` | `mega_reduce_kernel` | — | 每次全链必经，grid=`2*tokens`，block=256 | :190 |
-| `launch_empty` | `mega_empty_kernel` | — | 空基准 | :203 |
-| `fill_weights_lane` | `fill_w_lane_kernel` | — | 权重填充工具 | :207 |
+| `launch_prelude` | `mega_kernel<false>` | kWithCompute=false | 仅前序（ROUTE/PUBLISH/XBAR/TASK_SETUP） | :178 |
+| `launch_compute` | `mega_kernel<true>` | kWithCompute=true | 计算链（DISPATCH→L1→L2→COMBINE） | :197 |
+| `launch_reduce` | `mega_reduce_kernel` | — | 每次全链必经，grid=`2*tokens`，block=256 | :217 |
+| `launch_empty` | `mega_empty_kernel` | — | 空基准 | :230 |
+| `fill_weights_lane` | `fill_w_lane_kernel` | — | 权重填充工具 | :234 |
 
-`launch_compute` 在 `MEGA_DEBUG=4` 时先发 `mxk_dbg_capture_kernel<<<1,1>>>`（:152，仅 printf），默认关闭。
+`launch_compute` 在 `MEGA_DEBUG=4` 时先发 `mxk_dbg_capture_kernel<<<1,1>>>`（仅 printf），默认关闭。
 
-**关于 `NoTaskTail`**：它是 `mega_kernel` 的模板参数，但 `kernel.cuh:249` 的局部变量 `CombineTail tail` 会在任务循环中遮蔽参数，因此 `NoTaskTail` 运行期不被执行（见 §6）。
+> `[OPT-KCAP-REMOVE]` 已去掉编译期 `kCap` 模板参：`launch_compute` 恒发射
+> `mega_kernel<true>`（`mega_kernel<true,false,MegaPhase::Both>`），不再按 `win_cap`
+> 选 48/64 实例；重档寄存器/栈改由 `r24_*_big` 的 `R19_GEMM_ATTR=__noinline__` 隔离。
 
 ## 4. 参数如何改变路径
 
@@ -47,8 +46,10 @@ common.cuh                     场景常量、CM_* 宏默认值、计数器枚�
 | 参数 | 作用 | 取值与影响 |
 |---|---|---|
 | `kWithCompute` | 是否进入任务循环 | `false`：只跑前序；`true`：前序 + 计算链 + COMBINE |
-| `kCap` | 编译期 count 上界，删除不可达的重档 | `48`：`count≤48` 时 `<kCap48>` 分支替换为 MT3，不实例化 MT4/MT8 大 GEMM；`64`：同理用 `r19_*_big<4,…>`；`0`：不做裁剪 |
 | `kSmallOnly` | 编译期删除大 count 任务体 | **当前无任何实例化点**，属未使用模板分支（§6） |
+
+> `[OPT-KCAP-REMOVE]` 原 `kCap` 编译期 count 上界模板参已删除（重档隔离改走
+> `R19_GEMM_ATTR=__noinline__`，见 §3 注）。
 
 > [FRAG-ALWAYS，2026-10-10] 原 `kFragCap` 模板参已删除：A/f2 的 4-line
 > fragment 快路径**恒编译**（`if constexpr(kFragCap)` 的 true 分支为唯一路径），
@@ -97,11 +98,13 @@ count > kM (16) ?         → r19_big_task
 | 2 | `count≤32 && g_l1%2==0 && g_l1≥2` | `paired<2,2,2,2>` | 1427-1434 |
 | 3 | `count≤48 && g_l1%4==0` | fbase 且 `(k_in/32)%16==0` → `r24_l1_big<3,16,B,mask,3>`；否则 `paired<2,2,3,4>` | 1435-1480 |
 | 4 | `count≤48 && g_l1%2==0 && g_l1≥2` | `paired<2,2,3,2>` | 1481-1487 |
-| 5 | `48<count≤64 && fbase && count%64==0 && (k_in/32)%8==0` | `r24_l1_big<4,8,B2,false,4>` | 1488-1496 |
-| 6 | `kCap48` | `paired<2,2,3,4,false>` | 1497-1505 |
-| 7 | `kCap64` | `r19_l1_big<4,2,4>` | 1506-1512 |
-| 8 | `kAsyncL1`：fbase && count>64 && `(k_in/32)%8==0` && g_l1%2==0 | 整块 `r24_l1_big<8,8,2,false,8>`；尾块：`count-full≤16` → `<1,16,2,mask,1>`；`l1_act==5` → `<8,8,2,mask,5>`；否则 `<8,8,2,mask,8>` | 1513-1550 |
-| 9 | 其余 | `r19_l1_big<4,2,4>` | 1551-1559 |
+| 5 | `48<count≤64 && fbase && count%64==0 && (k_in/32)%8==0` | `r24_l1_big<4,R24_KS,B2,false,4>` | 1444-1456 |
+| 6 | `kAsyncL1`：fbase && count>64 && `(k_in/32)%8==0` && g_l1%2==0 | 整块 `r24_l1_big<8,8,2,false,8>`；尾块：`count-full≤16` → `<1,16,2,mask,1>`；`l1_act==5` → `<8,8,2,mask,5>`；否则 `<8,8,2,mask,8>` | 1458-1500 |
+| 7 | 其余 | `r19_l1_big<4,2,4>` | 1501-1508 |
+
+> `[OPT-KCAP-REMOVE]` 原序 6/7 的 `kCap48`/`kCap64` 分支已删除（无编译期裁档）。
+> 本表前几行的 `paired` 实例为历史记录：生产已改用 `r19_l1_big`（配对等价），
+> 当前档位与运行期 `win_cap` 选 `BPF` 以 `docs/12_L1函数族说明.md` §5 为准。
 
 ### 5.3 `r19_big_task` 的 L2 分支（compute_big.cuh:1607-1726）
 
@@ -112,11 +115,12 @@ count > kM (16) ?         → r19_big_task
 | 1 | `count≤32 && g_l2%6==0` | `l2_gemm_body<2,2,2,6>` | 1607-1626 |
 | 2 | `count≤32 && g_l2%3==0 && g_l2≥3` | `l2_gemm_body<2,2,2,3>`（NS=8 也走此分支） | 1627-1633 |
 | 3 | `count≤48 && g_l2%6==0` | `f2 && (l1_k_out/32)%16==0` → `r24_l2_big<3,16,3,mask,3>`；否则 `l2_gemm_body<2,2,3,3>` | 1634-1666 |
-| 4 | `48<count≤64 && f2 && count%64==0 && (l1_k_out/32)%8==0` | `r24_l2_big<4,8,3,false,4>` | 1667-1674 |
-| 5 | `kCap48` | `l2_gemm_body<2,2,3,3,false>` | 1675-1681 |
-| 6 | `kCap64` | `r19_l2_big<4,1,3>` | 1682-1688 |
-| 7 | `kAsyncL2`：f2 && count>64 && `(l1_k_out/32)%8==0` | 整块 `r24_l2_big<8,8,2,false,8>`（传 `&fuse`）+ 尾块同 L1 | 1689-1720 |
-| 8 | 其余 | `r19_l2_big<4,1,3>` | 1721-1726 |
+| 4 | `48<count≤64 && f2 && count%64==0 && (l1_k_out/32)%8==0` | `r24_l2_big<4,R24_KS,3,false,4>` | 1614-1621 |
+| 5 | `kAsyncL2`：f2 && count>64 && `(l1_k_out/32)%8==0` | 整块 `r24_l2_big<8,8,2,false,8>`（传 `&fuse`）+ 尾块同 L1 | 1622-1654 |
+| 6 | 其余 | `r19_l2_big<4,1,3>` | 1655-1662 |
+
+> `[OPT-KCAP-REMOVE]` 原序 5/6 的 `kCap48`/`kCap64` 分支已删除；`count≤48`/`≤64`
+> 的兜底现统一走「其余」`r19_l2_big<4,…>`（对生产 `kCap=0` 行为不变）。
 
 ### 5.4 `r19_small_task` 的 L1/L2 分支（compute_big.cuh:1742-1845）
 
@@ -171,7 +175,7 @@ small 路径**不走 fragment，也不设置 `fuse.on`**，因此任务尾恒为
 | kBatch（N 组批） | kBatch 个 N 组共享一份 A，A 装载次数 = 1/kBatch | `compute.cuh:719` |
 | A fragment | fbase/f2 走 4-line 连续装载，否则 16-line 散射 | 消除 L2 straggler 130→16µs（`compute_big.cuh:27-40`） |
 | task 隔离 | small/big 两个 `__noinline__`，寄存器不共享 | 保护 count=16 热路径（`compute_big.cuh:11-16`） |
-| kCap 裁档 | 编译期删不可达 MT8/MT4，缩栈 | tk −3.1% / −4.0%（`perf.md` v8/v9） |
+| GEMM 属性隔离 | `r24_*_big` 加 `R19_GEMM_ATTR=__noinline__`，重档独立寄存器/栈 | 替代原 `kCap` 编译期裁档（`[OPT-KCAP-REMOVE]`） |
 | bsm | B 走 smem 异步 | 实测中性/略负（`perf.md:330`），默认关 |
 
 **约束驱动（少数，正确性）：**

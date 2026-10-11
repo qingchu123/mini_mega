@@ -35,6 +35,13 @@ constexpr int kL1BlockN = 256;
 // recv 行宽（word）：与 layout 的 ((EPR+1)+3)&~3 一致（原 MegaArgs.recv_stride）
 constexpr int kRecvStride = (kEPR + 1 + 3) & ~3;
 
+// [OPT-GEMM-ATTR] 重型 GEMM 档函数属性：__noinline__ 让每个档独立寄存器/栈
+//   分配，调用者（任务体/内核）只承担控制流与调用约定，避免最坏路径的 acc/
+//   寄存器预算传染到其它档。可用 -DR19_GEMM_ATTR=__forceinline__ 回退实验。
+#ifndef R19_GEMM_ATTR
+#define R19_GEMM_ATTR __noinline__
+#endif
+
 // 自旋上限（异常保护）：约 1s（4M 周期 @2GHz）
 constexpr long long kSpinLimit = 4000000LL;
 // PUBLISH 校验槽 epoch（阶段 1 用常量；生产为 epoch_base+1）

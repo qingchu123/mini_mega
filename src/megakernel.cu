@@ -168,15 +168,8 @@ void launch_phase_impl(const MegaLaunchArgs& a, mcStream_t stream,
                        int skip_override) {
     MegaLaunchArgs b = a;
     if (skip_override >= 0) b.skip_prologue = skip_override;
-    if (a.win_cap <= 48)
-        mega_kernel<true, false, 48, ph>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b));
-    else if (a.win_cap <= 64)
-        mega_kernel<true, false, 64, ph>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b));
-    else
-        mega_kernel<true, false, 0, ph>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b));
+    mega_kernel<true, false, ph>
+        <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b));
 }
 #endif  // CM_L1L2_SPLIT
 
@@ -215,17 +208,10 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
 #endif
     // [FRAG-INT] fragment 缓冲为 kernel 内部（rwk->ld），host 不再传入。fragment
     //   分支恒编译（[FRAG-ALWAYS]），运行期按 frag_all/几何自动启用。
-    // [OPT-TK-CAP] 按 win_cap 选编译期 count 上界实例（kCap=48/64）：不可达的重档
-    //   （MT8 异步 / MT4 大 GEMM 兜底）被 if constexpr 删除，缩任务体寄存器/栈。
-    // if (a.win_cap <= 48)
-    //     mega_kernel<true, false, 48>
-    //         <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a));
-    // else if (a.win_cap <= 64)
-    //     mega_kernel<true, false, 64>
-    //         <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(a));
-    // else
-        mega_kernel<true><<<a.grid, a.threads, (size_t)a.smem, stream>>>(
-            to_mega_args(a));
+    // [OPT-KCAP-REMOVE] 已去掉编译期 count 上界实例（kCap=48/64）：task body 内
+    //   按运行期 win_cap 选档，重型 GEMM 档用 R19_GEMM_ATTR=__noinline__ 隔离寄存器。
+    mega_kernel<true><<<a.grid, a.threads, (size_t)a.smem, stream>>>(
+        to_mega_args(a));
 }
 
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
@@ -260,8 +246,6 @@ void dump_kernel_resources() {
         else
             std::printf("[RES] %-7s <fail>\n", n);
     };
-    q("kCap48", (const void*)mega_kernel<true, false, 48>);
-    q("kCap64", (const void*)mega_kernel<true, false, 64>);
     q("full",   (const void*)mega_kernel<true>);
     q("empty",  (const void*)mega_kernel<false>);
 }

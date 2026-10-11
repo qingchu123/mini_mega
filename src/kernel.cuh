@@ -20,19 +20,17 @@ __global__ void __launch_bounds__(1024) mega_empty_kernel();
 
 
 // 计算链任务循环
-template <bool kSmallOnly = false, int kCap = 0,
-          MegaPhase kPhase = MegaPhase::Both>
+template <bool kSmallOnly = false, MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs* a,
                                                    int cycle,
                                                    uint8_t* a_smem = nullptr,
                                                    uint8_t* b_smem = nullptr,
                                                    unsigned long long* ctr = nullptr) {
-    dispatch_pull_body<kSmallOnly, kCap, kPhase>(a, cycle, a_smem, b_smem, ctr);
+    dispatch_pull_body<kSmallOnly, kPhase>(a, cycle, a_smem, b_smem, ctr);
 }
 
 // 主 kernel。kWithCompute=false 只跑前序；kPhase 见 dispatch（Both/L1/L2）。
-template <bool kWithCompute,
-          bool kSmallOnly = false, int kCap = 0,
+template <bool kWithCompute, bool kSmallOnly = false,
           MegaPhase kPhase = MegaPhase::Both>
 __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     const bool kTick = (blockIdx.x == 0) && (threadIdx.x == 0);
@@ -105,17 +103,15 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     if (kWithCompute) {
         // [M_CYCLE] copy c（与 xbar/task_setup 同片）
         const int cyc = (int)((a.rwk->lf.current_time[blockIdx.x][1] - 1) % M_CYCLE);
-        mega_dispatch_loop<kSmallOnly, kCap, kPhase>(
+        mega_dispatch_loop<kSmallOnly, kPhase>(
             &s_a, cyc, &s_ab.a[0][0], nullptr, ctr);
     }
     if (kTick) a.rwk->lf.pre_ticks[15] = clock64();
 }
 
 // [multi_compile] 显式实例化在 src/multi_compile/kernel_*.cu；此处抑制隐式实例化。
-extern template __global__ void mega_kernel<false, false, 0, MegaPhase::Both>(MegaArgs);
-extern template __global__ void mega_kernel<true, false, 0, MegaPhase::Both>(MegaArgs);
-extern template __global__ void mega_kernel<true, false, 48, MegaPhase::Both>(MegaArgs);
-extern template __global__ void mega_kernel<true, false, 64, MegaPhase::Both>(MegaArgs);
+extern template __global__ void mega_kernel<false, false, MegaPhase::Both>(MegaArgs);
+extern template __global__ void mega_kernel<true, false, MegaPhase::Both>(MegaArgs);
 
 // ---------------------------------------------------------------- REDUCE --
 // REDUCE：每 token 2 个 block 列分半

@@ -691,8 +691,7 @@ __device__ __forceinline__ void l2_gemm_body(
 // [L1L2-SPLIT] kPhase：Both=原合并路径；L1=只跑 DISPATCH+L1；L2=只跑 L2+tail。
 //   拆分下数据槽 e*slot_win+w 每窗口独占（ring 门/l2_done 不再需要）；旗槽
 //   （slice_flags/l1_prog/l2_done）保持 ring 索引不变（旗区容量 256 不动）。
-template <bool kSmallOnly = false,
-          int kCap = 0, MegaPhase kPhase = MegaPhase::Both>
+template <bool kSmallOnly = false, MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void dispatch_pull_body(
         const MegaArgs* a, int cycle, uint8_t* a_smem = nullptr,
         uint8_t* b_smem = nullptr, unsigned long long* ctr = nullptr) {
@@ -913,7 +912,7 @@ __device__ __forceinline__ void dispatch_pull_body(
                                              epoch, data_slot, pfx,
                                              a_smem, b_smem);
         } else if (count > kM) {
-            r19_big_task<kCap, kPhase>(S, task, e, w, count, slice,
+            r19_big_task<kPhase>(S, task, e, w, count, slice,
                                                  epoch, data_slot, pfx,
                                                  a_smem, b_smem);
         } else {

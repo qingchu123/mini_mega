@@ -492,10 +492,10 @@ __device__ __forceinline__ void r19_l1_big(
 // [R27·delivered] A-smem 阶段步长由 16 降为 8：MT8 下 smem 双缓冲保持
 //   2*8*8*512=64KB（KS=16 会到 128KB，加动态 smem 后超设备 131072B/block
 //   上限，实测启动失败）。KS=8 在 71 机与 KS=16 中性，本地略优。
-// [OPT-TK-CAP64] tk_first 扫描发现：MT8 大档 acc（kBatch*kMT*kNT*4）把
-//   r19_big_task 的寄存器/栈顶高，拖慢同函数内 count<=64 的小/中档路径。
-//   win_cap<=64 时 count>64 不可达 → 用 kCap64 实例（见 megakernel.cu）
-//   编译期删除 MT8 异步档，前 50 launch 平均 ~-4%，大档 TPR=256 不变。
+// [OPT-KCAP-REMOVE] MT8 大档 acc（kBatch*kMT*kNT*4）会把 r19_big_task 的寄存器/
+//   栈顶高，拖慢同函数内 count<=64 的小/中档路径。原用编译期 kCap=48/64 实例删除
+//   重档（见旧 [OPT-TK-CAP64]，前 50 launch ~-4%）；现改由 r24_*_big 的
+//   R19_GEMM_ATTR=__noinline__ 独立寄存器/栈隔离达成同等效果（运行期按 win_cap 选档）。
 #ifndef R24_KS
 #define R24_KS 8
 #endif
@@ -562,7 +562,7 @@ __device__ __forceinline__ R19Frag r24_lds_a(const uint8_t* sbuf, int j, int m) 
 
 template <int kMT, int kKS, int kBatch, bool kMask = false, int kMTAct = kMT,
           int kBPF = R24_BPF>
-__device__ __forceinline__ void r24_l1_big(
+__device__ R19_GEMM_ATTR void r24_l1_big(
         uint8_t* s_mem, const uint8_t* fbase, int mt_total, const uint8_t* w1,
         int expert, int c0_begin, int c0_end, int k_hidden, int n_total,
         int block_n, int lane, int warp, int nwarps, float* checksum,
@@ -832,7 +832,7 @@ __device__ __forceinline__ void r19_l2_big(
 // g0 批次在外层：每批一次完整 K 流水（与 r19_l2_big 的 A 读次数相同）。
 template <int kMT, int kKS, int kBatch, bool kMask = false, int kMTAct = kMT,
           int kBPF = R24_BPF>
-__device__ __forceinline__ void r24_l2_big(
+__device__ R19_GEMM_ATTR void r24_l2_big(
         uint8_t* s_mem, const uint8_t* f2, int mt_total, const uint8_t* w2,
         int c0_begin, int c0_end, int k_in, int n_total, int block_n, int lane,
         int warp, int nwarps, float* checksum, int n_group_begin,
@@ -1323,7 +1323,7 @@ __device__ __forceinline__ void r19_tail_common(
 // [FRAG-ALWAYS] 去掉 kFragCap：fragment 分支恒编译（运行期按 frag_a/frag_all 决定）
 // [L1L2-SPLIT] kPhase：Both=原合并任务体；L1=只跑 DISPATCH+L1（L2/tail 编译期
 //   消除）；L2=只跑 L2+tail（DISPATCH/pull/L1 编译期消除）。
-template <int kCap = 0, MegaPhase kPhase = MegaPhase::Both>
+template <MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         unsigned epoch, int pool_slot, const int* pfx,
@@ -1331,13 +1331,13 @@ __device__ R19_BIG_ATTR void r19_big_task(
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
-    // [OPT-TK-CAP] 编译期任务 count 上界（0=不限）：win_cap<=kCap 时相应重档
-    //   不可达，用 if constexpr 删除其模板实例以缩寄存器/栈。
-    constexpr bool kCap64 = (kCap > 0);
-    constexpr bool kCap48 = (kCap > 0 && kCap <= 48);
-    // [R38] tk/长尾实例（kCap>0）用更深 B 预取环（R24_BPF=4）：这些实例
-    //   count<=64、寄存器预算有裕量；均衡大档（kCap=0）保持 2，避免 TPR=256 回退。
-    constexpr int kR24BPF = (kCap > 0) ? 4 : R24_BPF;
+    // [OPT-KCAP-REMOVE] 去掉编译期 count 上界模板参：改由运行期档选择（count 分支
+    //   本已是运行期 if）。重型 GEMM 档（r24_*）用 R19_GEMM_ATTR=__noinline__ 独立
+    //   编译单元隔离寄存器/栈，因此不再需要 if constexpr 删除不可达档。
+    // [R38] tk/长尾（win_cap<=64）用更深 B 预取环（R24_BPF_HAVE_HEADROOM=4）：这些
+    //   场景 count<=64、寄存器预算有裕量；均衡大档（win_cap>64）保持 R24_BPF(2)，
+    //   避免 TPR=256 回退。运行期按 S.win_cap 选择（见各 r24 调用点）。
+    constexpr int kR24BPF = R24_BPF;
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
     // [tail 内联] ctx/fuse 由 S 现构造（CombineTail 已去除）
     const CombineCtx cctx = cm_build_ctx(S);
@@ -1410,11 +1410,21 @@ __device__ R19_BIG_ATTR void r19_big_task(
             bool med_r24 = false;
 #if CM_MED_R24
             if (fbase != nullptr && ((S.k_in / 32) % 16 == 0)) {
-                r24_l1_big<3, 16, CM_L1_BATCH, true, 3, kR24BPF>(
-                    a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                    S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
-                    S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                    S.l1_k_out);
+                // [OPT-KCAP-REMOVE] win_cap<=64（tk/长尾）用更深 B 预取环(4)；
+                //   均衡大档保持 R24_BPF(2)。运行期等价原 kCap>0 编译期选择。
+                if (S.win_cap <= 64) {
+                    r24_l1_big<3, 16, CM_L1_BATCH, true, 3, 4>(
+                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
+                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                        S.l1_k_out);
+                } else {
+                    r24_l1_big<3, 16, CM_L1_BATCH, true, 3, R24_BPF>(
+                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
+                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                        S.l1_k_out);
+                }
                 med_r24 = true;
             }
 #endif
@@ -1435,26 +1445,20 @@ __device__ R19_BIG_ATTR void r19_big_task(
                    (count % (4 * kM) == 0) &&
                    ((S.k_in / 32) % R24_KS == 0)) {
             // [OPT-64] 49..64 档改走 r24 A-smem（MT4 无掩码）：A 经 bsm 异步搬运
-            r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, kR24BPF>(
-                a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
-                S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                S.l1_k_out);
-        } else if constexpr (kCap48) {
-            // [OPT-TK-CAP48] win_cap<=48：count<=48，上述小/中档分支对生产
-            //   g_l1 几何恒命中；此处仅为兜底（保持正确），用已实例化的 paired
-            //   MT3 替换 r19_l1_big<4> 重档 → 不实例化大 GEMM（省寄存器/栈）。
-            r19_l1_big<3, R19_L1_PF, 4>(
-                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
-        } else if constexpr (kCap64) {
-            // [OPT-TK-CAP64] cap64 变体：count<=64，MT8 异步档不可达 → 直接
-            //   走固定 MT4 回退；if constexpr 保证不实例化 MT8 模板（不占栈）。
-            r19_l1_big<4, R19_L1_PF, 4>(
-                pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
-                S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
-                g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
+            // [OPT-KCAP-REMOVE] win_cap<=64 用 BPF=4，均衡大档 BPF=2。
+            if (S.win_cap <= 64) {
+                r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, 4>(
+                    a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
+                    S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                    S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                    S.l1_k_out);
+            } else {
+                r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, R24_BPF>(
+                    a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
+                    S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                    S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                    S.l1_k_out);
+            }
         } else if (kAsync) {
             // [R34] 全块（无掩码，原 async 快路径）+ 尾块（kMask=true）两段式：
             //   尾块 A 读取折叠到 F 最后一 tile、写/checksum 按 row<cc 掩码，
@@ -1615,20 +1619,6 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 a_smem, f2, S.mt_total, w2_e, 0, count, S.l1_k_out,
                 S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps,
                 S.l2_chk, g0_l2, g_l2, out_slot, S.l2_k_out, nullptr);
-        } else if constexpr (kCap48) {
-            // [OPT-TK-CAP48] 兜底：count<=48，用已实例化的 paired MT3 替换
-            //   r19_l2_big<4> 重档（不实例化大 GEMM）。
-            l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, false>(
-                ffn_slot, w2_e, count, S.l1_k_out, S.l2_k_out, S.l1_block_n, lane,
-                warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot, S.l2_k_out,
-                nullptr, 0);
-        } else if constexpr (kCap64) {
-            // [OPT-TK-CAP64] cap64 变体：count<=64，MT8 异步档不可达 → 固定
-            //   MT4/B3，if constexpr 保证不实例化 MT8 模板。
-            r19_l2_big<4, R19_L2_PF, 3>(
-                ffn_slot, f2, S.mt_total, w2_e, count, S.l1_k_out,
-                S.l2_k_out, S.l1_block_n, lane, warp, kComputeWarps, S.l2_chk,
-                g0_l2, g_l2, out_slot, S.l2_k_out);
         } else if (kAsyncL2) {
             // [R34] 同 L1：全块 + 尾块（尾块掩码；融合推送对两段都生效）
             const int full = count - count % (R19_L2_MT * kM);
