@@ -179,7 +179,7 @@ __device__ __forceinline__ void route_build_body(
                     &unk_peers[dst]->rd.src_index_table[cycle][le][rank][0];
                 __stwt(dstpt + slot, (uint32_t)idx);
             }
-            __threadfence_system();
+            // __threadfence_system();
         } else if (tid < 64) {
             for (int idx = tid; idx < num_pairs; idx += 64) {
                 const int64_t raw = topk_idx[idx];
@@ -213,7 +213,7 @@ __device__ __forceinline__ void route_build_body(
                 &unk_peers[dst]->rd.src_index_table[cycle][le][rank][0];
             __stwt(dstpt + slot, (uint32_t)idx);
         }
-        __threadfence_system();
+        // __threadfence_system();
     }
     __syncthreads();
     // rsc_ptr 必为非空（调用方传 &rwk->ld.route_slot_counts[0]）
@@ -495,52 +495,4 @@ __device__ __forceinline__ int task_setup_body(
         sb();
     }
     return s_cum[kEPR];
-}
-
-// [R38] 轻量 TASK_SETUP（跨 graph 节点前序复用）：路由/计数/prefix 表均持久，
-//   仅重臂每节点 flag（task_counter/l2_done/task_ready）并推进 cycle 计数。
-//   与 task_setup_body 的 flag 语义/可见性顺序一致（普通写 + 释放 fence）。
-__device__ __forceinline__ void task_setup_light_body(
-        local_flags* lf, int64_t task_ready_idx, int64_t task_counter_idx,
-        int64_t l2_done_idx, int max_spins, int* dbg = nullptr) {
-    const int cyc = (int)(lf->current_time[blockIdx.x][1] % M_CYCLE);
-    uint32_t* bar_flags = lf->bar[cyc];
-    const int tid = threadIdx.x;
-    unsigned my_epoch = 0u;
-    if (blockIdx.x == 0) {
-        if (tid == 0) {
-            *(volatile int*)(bar_flags + task_counter_idx) = (int)gridDim.x;
-            const int64_t c = lf->current_time[0][1];
-            my_epoch = (unsigned)(c + 1);
-            lf->current_time[0][1] = c + 1;
-        }
-        bool wrote = false;
-        for (int i = tid; i < kEPR * kRing; i += (int)blockDim.x) {
-            bar_flags[l2_done_idx + i] = 0u;
-            wrote = true;
-        }
-        if (wrote) __threadfence();
-        __syncthreads();
-        if (tid == 0) {
-            __threadfence();
-            *reinterpret_cast<volatile uint32_t*>(bar_flags + task_ready_idx) =
-                my_epoch;
-        }
-    } else {
-        if (tid == 0) {
-            const int64_t c = lf->current_time[blockIdx.x][1];
-            const unsigned expected = (unsigned)(c + 1);
-            volatile const uint32_t* ready = bar_flags + task_ready_idx;
-            long long spin = 0;
-            while (*ready != expected) {
-                if (++spin > max_spins) {
-                    if (dbg) atomicAdd(dbg + 3, 1);
-                    break;
-                }
-            }
-            lf->current_time[blockIdx.x][1] = c + 1;
-            __threadfence();
-        }
-        __syncthreads();
-    }
 }

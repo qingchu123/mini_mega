@@ -278,7 +278,7 @@ __device__ __forceinline__ void xbar_route_ready_body(
     if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrPhaseXbar, 1);
     if (blockIdx.x == 0 && threadIdx.x < 64) {
         const int lane = threadIdx.x;
-        __threadfence_system();
+        // [EXP-fence] removed __threadfence_system();
         // 各 lane 的 release fence 先于 lane0 的 announce
         __syncwarp();
         unsigned epoch = 0;
@@ -294,7 +294,7 @@ __device__ __forceinline__ void xbar_route_ready_body(
                 &unk_peers[lane]->rf.xbar_barrier[cyc][rank][lane];
             __stwt(slot, epoch);
         }
-        __threadfence_system();
+        // [EXP-fence] removed __threadfence_system();
         // 收齐自己该收的槽：xbar_barrier[src][rank]；lane<R 各自轮询 + ballot 聚合
         int spins = 0;
         while (true) {
@@ -324,7 +324,7 @@ __device__ __forceinline__ void xbar_route_ready_body(
             if (spins > max_spins) MX_CTR_ADD(ctr, kCtrXbarTimeout, 1);
         }
         if (lane == 0) {
-            __threadfence_system();
+        // [EXP-fence] removed __threadfence_system();
             // 同设备旗用普通写 + fence：__stwt 在普通显存上不更新 L2，
             // volatile 读可能长期命中旧值（实测 release 等待偶发超时）。
             *reinterpret_cast<volatile uint32_t*>(bar_flags + xrelease_idx) =

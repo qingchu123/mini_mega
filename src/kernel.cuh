@@ -88,11 +88,6 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     // 3) TASK_SETUP（block0 leader 建 prefix/窗口表，其余等 task_ready）
     if constexpr (kPhase == MegaPhase::L2) {
         if (kTick) a.rwk->lf.pre_ticks[3] = clock64();
-    } else if (a.skip_prologue) {
-        // [R38] 复用前序：prefix/路由/计数持久，仅轻量重臂 flag（省 checksum
-        //   轮询与 prefix 重建）。
-        task_setup_light_body(&a.rwk->lf, a.task_ready_idx, a.task_counter_idx,
-                              a.l2_done_idx, a.max_spins, a.rwk->lf.dbg);
     } else {
         task_setup_body(a.self, &a.unk->rd, a.R, a.rank, a.slot_capacity,
                         a.prefix_off, &a.rwk->lf, a.task_ready_idx,
