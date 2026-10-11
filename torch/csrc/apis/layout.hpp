@@ -43,6 +43,8 @@ struct SymmLayout {
   int64_t expert_recv_counts_bytes = 0;
   int64_t prefix_tbl_bytes = 0;
   int64_t recv_stride = 0;       // recv 行宽（word）：(EPR+1+3)&~3 = 12
+  int64_t prefold_off = 0;       // [BF16-IN] 本地 fold 的 fp8 x 区（scratch 内）
+  int in_bf16 = 0;               // [BF16-IN] 1=输入 x 为 bf16
 };
 
 inline int64_t kEPRConst() { return 8; }
@@ -51,7 +53,8 @@ inline SymmLayout compute_symm_layout(int64_t num_ranks, int64_t num_experts,
                                       int64_t num_max_tokens_per_rank,
                                       int64_t num_topk, int64_t hidden,
                                       int64_t intermediate_hidden,
-                                      int64_t win_cap) {
+                                      int64_t win_cap,
+                                      bool bf16_in = false) {
   using namespace deep_gemm::layout;
   if (num_ranks < 1 || num_experts < 1 || num_experts % num_ranks != 0) {
     throw std::runtime_error(
@@ -79,7 +82,7 @@ inline SymmLayout compute_symm_layout(int64_t num_ranks, int64_t num_experts,
   const auto scratch = compute_mega_moe_scratch<int64_t>(
       num_ranks, E, num_max_tokens_per_rank, num_topk, hidden,
       intermediate_hidden, win_cap, /*with_sf=*/false, /*fp8_layout=*/true,
-      /*with_prefold=*/false);
+      /*with_prefold=*/bf16_in);
 
   SymmLayout o;
   o.view_bytes = mb.get_num_bytes();
@@ -103,6 +106,8 @@ inline SymmLayout compute_symm_layout(int64_t num_ranks, int64_t num_experts,
       (int64_t)num_ranks * (((epr + 1) + 3) & ~(int64_t)3) * 4;
   o.prefix_tbl_bytes = (int64_t)epr * (num_ranks + 1) * 4;
   o.recv_stride = (int)(((epr + 1) + 3) & ~(int64_t)3);
+  o.prefold_off = o.scratch_offset + scratch.prefolded_input_tokens;
+  o.in_bf16 = bf16_in ? 1 : 0;
 
   // sym 末端 COMBINE 行区（与 bench run_scene/run_aligned 同式）
   const int64_t barrier_pad_off = align_up_i64(o.sym_bytes, 256);
@@ -123,14 +128,15 @@ inline SymmLayout get_symm_layout_for_mega_moe(
   if (num_shared_experts != 0) {
     throw std::runtime_error("get_symm_layout_for_mega_moe: 不支持 shared experts");
   }
-  if (mma_type != "fp8xfp8") {
+  if (mma_type != "fp8xfp8" && mma_type != "bf16xfp8") {
     throw std::runtime_error(
-        "get_symm_layout_for_mega_moe: mini_mega 仅支持 fp8xfp8，收到 " +
+        "get_symm_layout_for_mega_moe: mini_mega 仅支持 fp8xfp8/bf16xfp8，收到 " +
         mma_type);
   }
   return compute_symm_layout(num_ranks, num_experts, num_max_tokens_per_rank,
                              num_topk, hidden, intermediate_hidden,
-                             expert_window);
+                             expert_window,
+                             /*bf16_in=*/mma_type == "bf16xfp8");
 }
 
 inline int64_t get_symm_buffer_size_for_mega_moe(
@@ -186,7 +192,8 @@ inline std::vector<int64_t> layout_to_vector(const SymmLayout& o) {
           o.token_route_weights_off, o.token_src_meta_off,
           o.barrier_slots_off,     o.combine_rows_off,
           o.src_index_table_bytes, o.expert_recv_counts_bytes,
-          o.prefix_tbl_bytes,      o.recv_stride};
+          o.prefix_tbl_bytes,      o.recv_stride,
+          o.prefold_off,           o.in_bf16};
 }
 
 }  // namespace mxk

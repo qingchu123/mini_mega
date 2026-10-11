@@ -311,6 +311,8 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.slice_flags_idx = kSliceFlagsIdx;
     a.l1_prog_idx = kL1ProgIdx;
     a.x_off = L.x_off;
+    a.prefold_off = L.prefold_off;
+    a.in_bf16 = MX_IN_BF16;
     a.weights_off = L.topk_weights_off;
     a.pool_off = L.expert_tokens_off;
     a.pool_ptr = d.ld ? &d.ld->expert_tokens[0][0][0] : nullptr;

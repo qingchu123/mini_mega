@@ -48,6 +48,7 @@ struct SymmBuffer {
   uint16_t* l2_out = nullptr;     // [kGrid][win][H] BF16
   int64_t ffn_hidden_bytes = 0;
   int64_t l2_out_bytes = 0;
+  int bf16_in = 0;               // [BF16-IN] 1=输入 x 为 bf16
 
   // [FRAG-INT] A/f2 fragment 缓冲为 kernel 内部（rwk->ld），torch 不再分配。
   int64_t launch_count = 0;
@@ -84,7 +85,7 @@ inline void release_symm_buffer(SymmBuffer* b) {
 inline SymmBuffer* create_symm_buffer_owned(
     int64_t rank, int64_t R, int64_t num_experts, int64_t cap, int64_t topk,
     int64_t hidden, int64_t intermediate_hidden, int64_t win_alloc,
-    int64_t device) {
+    int64_t device, int64_t bf16_in = 0) {
   if (mcSetDevice((int)device) != mcSuccess) {
     throw std::runtime_error("create_symm_buffer: mcSetDevice 失败");
   }
@@ -100,7 +101,8 @@ inline SymmBuffer* create_symm_buffer_owned(
   b->win = win_alloc;
   b->device = device;
   b->L = compute_symm_layout(R, num_experts, cap, topk, hidden,
-                             intermediate_hidden, win_alloc);
+                             intermediate_hidden, win_alloc, bf16_in != 0);
+  b->bf16_in = (int)bf16_in;
   try {
     b->sym = reinterpret_cast<uint8_t*>(
         allocate_finegrained(b->L.total_bytes, device));
@@ -256,6 +258,8 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
   a.l2_out = b.l2_out;
   a.l2_k_out = (int)b.hidden;
   a.combine_rows_off = b.L.combine_rows_off;
+  a.prefold_off = b.L.prefold_off;
+  a.in_bf16 = b.L.in_bf16;
   a.y = y;
   a.grid = (int)kMegaGrid();
   a.threads = 512;

@@ -32,7 +32,7 @@ EXPERT_WINDOW_MIN = 8
 EXPERT_WINDOW_MAX = 128
 EXPERT_WINDOW_MULTIPLE = 8
 
-_SUPPORTED_MMA_TYPES = ("fp8xfp8",)
+_SUPPORTED_MMA_TYPES = ("fp8xfp8", "bf16xfp8")
 
 # L1 gate/up 配对粒度 = kernel 的 l1_block_n（见 make_mega_args）。
 _L1_BLOCK_N = 256
@@ -76,7 +76,7 @@ def select_fp8_mega_moe_window(num_tokens: int, num_topk: int, num_ranks: int,
                                num_experts: int,
                                mma_type: str = "fp8xfp8") -> int:
     """选择一次 launch 的专家窗口宽度；全 rank 必须同值。"""
-    if mma_type not in ("fp8xfp8", "fp8xfp4"):
+    if mma_type not in ("fp8xfp8", "bf16xfp8", "fp8xfp4"):
         raise ValueError(f"unsupported FP8 MegaMoE mma_type: {mma_type!r}")
     for name, value in (("num_tokens", num_tokens), ("num_topk", num_topk),
                         ("num_ranks", num_ranks), ("num_experts", num_experts)):
@@ -215,13 +215,14 @@ class SymmBuffer:
          prefix_tbl_off, expert_tokens_off, token_route_weights_off,
          token_src_meta_off, barrier_slots_off, combine_rows_off,
          self.src_index_table_bytes, self.expert_recv_counts_bytes,
-         self.prefix_tbl_bytes, self.recv_stride) = (int(v) for v in info)
+         self.prefix_tbl_bytes, self.recv_stride,
+         self.prefold_off, self.in_bf16) = (int(v) for v in info)
 
         # ---- C++ 自有分配：sym(FG) / rwk / unk(FG) / 计算链缓冲 ----
         # Python 不再分配任何显存；指针与句柄全部经 _C 绑定获取。
         self._impl = _C.create_symm_buffer(
             rank, world_size, num_experts, cap, num_topk, hidden,
-            intermediate_hidden, self.win_phys, device)
+            intermediate_hidden, self.win_phys, device, mma_type)
         self._sym_ptr = int(_C.symm_sym_ptr(self._impl))
         self.buffer = _C.wrap_device_ptr(self._sym_ptr, total_bytes, device)
         self.buffer.zero_()
@@ -238,8 +239,10 @@ class SymmBuffer:
                 group.barrier()
             torch.cuda.synchronize()
 
-        # ---- 输入视图 ----
-        self.x = _view(self.buffer, torch.float8_e4m3fn, (cap, hidden), x_off)
+        # ---- 输入视图（bf16xfp8：x 为 bf16；fp8xfp8：x 为 fp8）----
+        _xdtype = (torch.bfloat16 if mma_type == "bf16xfp8"
+                   else torch.float8_e4m3fn)
+        self.x = _view(self.buffer, _xdtype, (cap, hidden), x_off)
         self.x_sf = None
         self.topk_idx = _view(self.buffer, torch.int64, (cap, num_topk),
                               topk_idx_off)
@@ -513,9 +516,10 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
                  cumulative_local_expert_recv_stats=None,
                  activation: str = "swiglu", activation_clamp=None,
                  expert_window: Optional[int] = None) -> None:
-    if sym_buffer.mma_type != "fp8xfp8":
+    if sym_buffer.mma_type not in ("fp8xfp8", "bf16xfp8"):
         raise ValueError(
-            f"fp8_mega_moe requires an fp8xfp8 SymmBuffer, got {sym_buffer.mma_type!r}")
+            f"fp8_mega_moe requires fp8xfp8/bf16xfp8 SymmBuffer, got "
+            f"{sym_buffer.mma_type!r}")
     if activation != "swiglu":
         raise ValueError(f"fp8xfp8 requires activation='swiglu', got {activation!r}")
     num_tokens = int(y.shape[0])
@@ -556,8 +560,15 @@ def bf16_mega_moe(*args, **kwargs):
     raise NotImplementedError("mini_mega 仅实现 fp8xfp8")
 
 
-def bf16_fp8_mega_moe(*args, **kwargs):
-    raise NotImplementedError("mini_mega 仅实现 fp8xfp8")
+def bf16_fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
+                      l2_weights: torch.Tensor, sym_buffer: SymmBuffer,
+                      **kwargs) -> None:
+    """bf16 输入 x + fp8 权重：kernel 内 prefold bf16→fp8，peer 只拉 fp8。"""
+    if sym_buffer.mma_type != "bf16xfp8":
+        raise ValueError(
+            f"bf16_fp8_mega_moe requires a bf16xfp8 SymmBuffer, got "
+            f"{sym_buffer.mma_type!r}")
+    return fp8_mega_moe(y, l1_weights, l2_weights, sym_buffer, **kwargs)
 
 
 def fp8_fp4_mega_moe(*args, **kwargs):

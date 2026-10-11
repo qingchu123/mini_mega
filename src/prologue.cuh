@@ -99,7 +99,6 @@
 #include "common.cuh"
 #include "flags.cuh"
 
-#if MX_IN_BF16
 // [BF16-IN] 4 个 bf16 → 4 个 fp8(E4M3, RNE) 打包为 uint32。
 __device__ __forceinline__ uint32_t mx_fold_bf16x4(const uint16_t* p) {
     using F32x4 = __NATIVE_VECTOR__(4, float);
@@ -121,7 +120,6 @@ __device__ __forceinline__ void x_fold_body(const uint8_t* x, uint8_t* pf,
         *reinterpret_cast<uint32_t*>(pf + i) = mx_fold_bf16x4(xh + i);
     __threadfence();
 }
-#endif  // MX_IN_BF16
 
 // ---------------------------------------------------------------- ROUTE_BUILD --
 // 骨架 bench:190-224 逐条移植（仅 block0 调用；tid_base/smem_off 供 WS 子集）。

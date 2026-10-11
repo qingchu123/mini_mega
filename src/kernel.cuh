@@ -69,11 +69,11 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         // [R38] 复用前序：路由/计数持久，跳过 ROUTE/PUBLISH（数据与 node0 相同）。
         if (kTick) a.rwk->lf.pre_ticks[0] = a.rwk->lf.pre_ticks[1] = clock64();
     }
-#if MX_IN_BF16
     // [BF16-IN] 本地 x(bf16) fold → fp8（写 self+prefold_off），供 peer pull。
-    x_fold_body(a.self + a.x_off, const_cast<uint8_t*>(a.self) + a.prefold_off,
-                a.tokens * kHidden);   // peer 只读有效 token 行
-#endif
+    if (a.in_bf16)
+        x_fold_body(a.self + a.x_off,
+                    const_cast<uint8_t*>(a.self) + a.prefold_off,
+                    a.tokens * kHidden);   // peer 只读有效 token 行
     // 2) XBAR_ROUTE_READY（每节点：可见性门 + 跨 rank 对齐）
     if (a.skip_prologue >= 2) {
         if constexpr (kPhase != MegaPhase::L2) {

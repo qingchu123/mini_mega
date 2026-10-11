@@ -1003,11 +1003,9 @@ __device__ __forceinline__ void r19_pull_flags(
             }
             // [L1L2-SPLIT] pool/frag 数据搬移仅 Both/L1（L2 阶段不碰输入缓冲）。
             if constexpr (kPhase != MegaPhase::L2) {
-#if MX_IN_BF16
-                const int64_t xoff = S.a->prefold_off;   // 本地 fold 后的 fp8 x
-#else
-                const int64_t xoff = S.a->x_off;
-#endif
+                // [BF16-IN] bf16 输入时读本地 fold 后的 fp8 区，否则读 fp8 x。
+                const int64_t xoff =
+                    S.a->in_bf16 ? S.a->prefold_off : S.a->x_off;
 #ifdef PULL_LOCAL_DIAG
                 // [诊断] 远端读换成本 rank 本地读（同 volume/pattern），量化远端代价
                 const uint4* srcp = reinterpret_cast<const uint4*>(

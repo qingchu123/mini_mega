@@ -139,15 +139,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("create_symm_buffer",
         [](int64_t rank, int64_t R, int64_t num_experts, int64_t cap,
            int64_t topk, int64_t hidden, int64_t intermediate_hidden,
-           int64_t win_alloc, int64_t device) {
-          return mxk::create_symm_buffer_owned(rank, R, num_experts, cap, topk,
-                                               hidden, intermediate_hidden,
-                                               win_alloc, device);
+           int64_t win_alloc, int64_t device, const std::string& mma_type) {
+          return mxk::create_symm_buffer_owned(
+              rank, R, num_experts, cap, topk, hidden, intermediate_hidden,
+              win_alloc, device, mma_type == "bf16xfp8" ? 1 : 0);
         },
         py::arg("rank"), py::arg("R"), py::arg("num_experts"),
         py::arg("cap"), py::arg("topk"), py::arg("hidden"),
         py::arg("intermediate_hidden"), py::arg("win_alloc"),
-        py::arg("device"),
+        py::arg("device"), py::arg("mma_type") = "fp8xfp8",
         // 生命周期由 destroy_symm_buffer 显式管理（不 take_ownership，避免 double free）
         py::return_value_policy::reference);
   // 指针与布局只读访问（Python 视图/IPC 用）
