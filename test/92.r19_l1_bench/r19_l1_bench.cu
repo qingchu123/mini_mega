@@ -42,6 +42,17 @@ __global__ void __launch_bounds__(kThreads) k_r19(
                               nullptr, 0, kI);
 }
 
+// N 缩放：组宽 BN、nwarps=NW、总组数 ngroups（N = ngroups*BN）
+template <int MT, int PF, int BATCH, int BN, int NW>
+__global__ void __launch_bounds__(kThreads) k_r19n(
+        const uint8_t* pool, const uint8_t* frag, const uint8_t* w1,
+        uint8_t* ffn, int mt_total, int count, int ngroups) {
+    const int lane = threadIdx.x & 63, warp = threadIdx.x >> 6;
+    r19_l1_big<MT, PF, BATCH>(pool, frag, mt_total, w1, 0, count, kH, kN, BN,
+                              lane, warp, NW, nullptr, 0, ngroups, ffn,
+                              nullptr, 0, kI);
+}
+
 template <class F>
 double timeit(F launch, int rep) {
     mcStream_t st = nullptr; mcStreamCreate(&st);
@@ -115,6 +126,22 @@ int main() {
         std::printf("%-5d %9d %9d %9d %9d %9d %9d %9d\n",
                     M, t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
     }
+
+    // ---- N 缩放（M=48, kMT=3, kPF=2）----
+    // 组宽固定 256（NW=8, kBatch=4/2）；N=128 用组宽 64（NW=2, 2 组）。
+    std::printf("\nN 缩放 (M=48, MT3/PF2)  N=组数*组宽\n");
+    std::printf("%-6s %-14s %9s\n", "N", "geometry", "us");
+    auto tn = [&](auto kfn, int thr, int count, int ng) {
+        return (int)timeit([&](mcStream_t st) {
+            kfn<<<1, thr, 0, st>>>(pool, frag, w1, ffn, mt, count, ng);
+        }, REP);
+    };
+    std::printf("%-6d %-14s %9d\n", 128,  "bn64 x2  nw2",  tn(k_r19n<3,2,2,64,2>, 128, 48, 2));
+    std::printf("%-6d %-14s %9d\n", 256,  "bn128 x2 nw4",  tn(k_r19n<3,2,2,128,4>, 256, 48, 2));
+    std::printf("%-6d %-14s %9d\n", 512,  "bn256 x2 nw8",  tn(k_r19n<3,2,2,256,8>, 512, 48, 2));
+    std::printf("%-6d %-14s %9d\n", 1024, "bn256 x4 nw8",  tn(k_r19n<3,2,4,256,8>, 512, 48, 4));
+    std::printf("%-6d %-14s %9d\n", 2048, "bn256 x8 nw8",  tn(k_r19n<3,2,4,256,8>, 512, 48, 8));
+    std::printf("%-6d %-14s %9d\n", 4096, "bn256 x16 nw8", tn(k_r19n<3,2,4,256,8>, 512, 48, 16));
 
     MYCHK(mcFree(g_flush));
     MYCHK(mcFree(pool)); MYCHK(mcFree(w1)); MYCHK(mcFree(ffn)); MYCHK(mcFree(frag));
