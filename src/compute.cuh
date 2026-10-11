@@ -60,6 +60,8 @@ struct MegaArgs {
     // -- 数据缓冲偏移（self / peer sym 内）--
     int64_t x_off, weights_off, pool_off, w_off, meta_off;
     int64_t combine_rows_off;     // 目标 rank combine_rows（BF16，<0 关闭 COMBINE）
+    int64_t prefold_off;          // [BF16-IN] 本地 fold 的 fp8 x 区（self 内偏移）
+    int in_bf16;                  // [BF16-IN] 输入 x 是 bf16(1) / fp8(0)
     // -- 计算链缓冲 --
     int l1_k_out;                 // L1 输出隐藏维 I（l1_n_total 由 2*l1_k_out 派生）
     int l2_k_out;                 // L2 输出维 H

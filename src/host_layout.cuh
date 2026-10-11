@@ -48,6 +48,8 @@ struct ProdLayout {
     int64_t slot_capacity = 0;  // 专家 token 容量（= max_tokens）
     int64_t win_capacity = 0;   // 窗口容量（pool/staging/窗口划分）
     int64_t recv_stride = 0;    // recv 行宽（word）：(EPR+1+3)&~3 = 12
+    int64_t prefold_off = 0;    // [BF16-IN] 本地 fold 的 fp8 x 区（sym 内绝对偏移）
+    int64_t prefold_bytes = 0;  // [BF16-IN] 折叠区字节数（= slot_cap*H）
 };
 
 static inline int64_t align_up_i64(int64_t x, int64_t a) {
@@ -65,7 +67,7 @@ static ProdLayout compute_layout(int R, int max_tokens, int topk, int H, int I,
                               /*num_shared_experts=*/0);
     const auto scratch = L::compute_mega_moe_scratch<int64_t>(
         R, E, max_tokens, topk, H, I, win_cap, /*with_sf=*/false,
-        /*fp8_layout=*/true);
+        /*fp8_layout=*/true, /*with_prefold=*/MX_IN_BF16);
 
     ProdLayout o;
     o.mega_bytes = mb.get_num_bytes();
@@ -78,12 +80,14 @@ static ProdLayout compute_layout(int R, int max_tokens, int topk, int H, int I,
     o.topk_idx_off = reinterpret_cast<int64_t>(mb.input_topk_idx_buffer.base);
     o.topk_weights_off =
         reinterpret_cast<int64_t>(mb.input_topk_weights_buffer.base);
-    o.input_token_bytes = (int64_t)max_tokens * H;
+    o.input_token_bytes = (int64_t)max_tokens * H * (MX_IN_BF16 ? 2 : 1);
     o.route_slot_counts_off = o.scratch_offset + scratch.route_slot_counts;
     o.src_index_table_off = o.scratch_offset + scratch.src_index_table;
     o.expert_recv_counts_off = o.scratch_offset + scratch.expert_recv_counts;
     o.prefix_tbl_off = o.scratch_offset + scratch.prefix_tbl;
     o.expert_tokens_off = o.scratch_offset + scratch.expert_tokens;
+    o.prefold_off = o.scratch_offset + scratch.prefolded_input_tokens;
+    o.prefold_bytes = (int64_t)max_tokens * H;
     o.token_route_weights_off = o.scratch_offset + scratch.token_route_weights;
     o.token_src_meta_off = o.scratch_offset + scratch.token_src_meta;
     o.src_index_table_bytes = (int64_t)R * kEPR * max_tokens * 4;

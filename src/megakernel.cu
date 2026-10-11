@@ -125,6 +125,8 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.ffn_hidden = a.ffn_hidden;
     m.l2_out = a.l2_out;
     m.combine_rows_off = a.combine_rows_off;
+    m.prefold_off = a.prefold_off;
+    m.in_bf16 = a.in_bf16;
     // [诊断] MX_SKIP_COMBINE=1：禁用任务尾 COMBINE（combine_rows_off<0 → 空操作）
     if (const char* s = std::getenv("MX_SKIP_COMBINE");
         s != nullptr && std::atoi(s) != 0)

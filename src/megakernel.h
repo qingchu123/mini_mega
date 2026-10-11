@@ -82,6 +82,8 @@ struct MegaLaunchArgs {
     // -- 数据缓冲偏移（self / peer sym 内）--
     int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;
     int64_t combine_rows_off = -1;         // combine_rows（BF16）；<0 关闭 COMBINE
+    int64_t prefold_off = 0;               // [BF16-IN] 本地 fold 的 fp8 x 区（self 内）
+    int in_bf16 = 0;                       // [BF16-IN] x 是 bf16(1)/fp8(0)
     // -- 计算链缓冲 --
     const uint8_t* w1 = nullptr;
     const uint8_t* w2 = nullptr;

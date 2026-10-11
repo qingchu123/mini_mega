@@ -133,12 +133,28 @@ inline size_t l2_bytes(const Geo& g) {
 
 // 确定性输入（与 bench.cu DISPATCH 视图一致）：x 与 topk_weights 的 max_tokens 行
 inline void fill_inputs(const Geo& g, Dev& d) {
+#if MX_IN_BF16
+    // [BF16-IN] 写 bf16，其值 = 目标 fp8 字节对应的 E4M3 值（bf16 可精确表示）
+    //   → fold 后得到与原 fp8 口径完全相同的 pool 字节，下游参考不变。
+    std::vector<uint16_t> xb((size_t)g.max_tokens * kHidden);
+    for (int t = 0; t < g.max_tokens; ++t)
+        for (int c = 0; c < kHidden; ++c) {
+            const uint8_t b = (uint8_t)((d.rank * 37 + t * 7 + c * 3) & 0x3f);
+            const float v = fp8_e4m3_decode(b);
+            uint32_t u;
+            std::memcpy(&u, &v, sizeof(u));
+            xb[(size_t)t * kHidden + c] = (uint16_t)(u >> 16);
+        }
+    CHECK(mcMemcpy(d.sym + g.L.x_off, xb.data(), xb.size() * sizeof(uint16_t),
+                   mcMemcpyHostToDevice));
+#else
     std::vector<uint8_t> xb((size_t)g.max_tokens * kHidden);
     for (int t = 0; t < g.max_tokens; ++t)
         for (int c = 0; c < kHidden; ++c)
             xb[(size_t)t * kHidden + c] =
                 (uint8_t)((d.rank * 37 + t * 7 + c * 3) & 0x3f);
     CHECK(mcMemcpy(d.sym + g.L.x_off, xb.data(), xb.size(), mcMemcpyHostToDevice));
+#endif
     std::vector<float> wv((size_t)g.max_tokens * kTopk);
     for (int i = 0; i < g.max_tokens * kTopk; ++i)
         wv[i] = 1.0f + d.rank * 0.25f + (i % 7) * 0.01f;

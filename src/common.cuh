@@ -42,6 +42,12 @@ constexpr int kRecvStride = (kEPR + 1 + 3) & ~3;
 #define R19_GEMM_ATTR __noinline__
 #endif
 
+// [BF16-IN] 输入 x 为 bf16（模型直接喂）：prologue 本地 fold 成 fp8 写独立区
+//   （layout prefolded_input_tokens），peer 只 pull fp8（体积减半）。0=原 fp8xfp8。
+#ifndef MX_IN_BF16
+#define MX_IN_BF16 0
+#endif
+
 // 自旋上限（异常保护）：约 1s（4M 周期 @2GHz）
 constexpr long long kSpinLimit = 4000000LL;
 // PUBLISH 校验槽 epoch（阶段 1 用常量；生产为 epoch_base+1）

@@ -99,6 +99,30 @@
 #include "common.cuh"
 #include "flags.cuh"
 
+#if MX_IN_BF16
+// [BF16-IN] 4 个 bf16 → 4 个 fp8(E4M3, RNE) 打包为 uint32。
+__device__ __forceinline__ uint32_t mx_fold_bf16x4(const uint16_t* p) {
+    using F32x4 = __NATIVE_VECTOR__(4, float);
+    F32x4 f;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) f[j] = __uint_as_float(((uint32_t)p[j]) << 16);
+    return __builtin_mxc_cvt_pk4_f32tof8_cfg(
+        f, _MACA_FROUND_TO_NEAREST_EVEN, _MACA_DENORMAL_FLUSH_NONE,
+        _MACA_SRC_NO_MODIFIER, false, true);
+}
+// 本地 fold：x(bf16)[n_elems] → fp8（同长度，1B/元素），全 grid 协作；写完
+//   __threadfence，供 peer 经 xbar 门后 pull（体积减半）。
+__device__ __forceinline__ void x_fold_body(const uint8_t* x, uint8_t* pf,
+                                            int n_elems) {
+    const int stride = (int)(gridDim.x * blockDim.x) * 4;
+    const uint16_t* xh = reinterpret_cast<const uint16_t*>(x);
+    for (int i = (int)(blockIdx.x * blockDim.x + threadIdx.x) * 4; i < n_elems;
+         i += stride)
+        *reinterpret_cast<uint32_t*>(pf + i) = mx_fold_bf16x4(xh + i);
+    __threadfence();
+}
+#endif  // MX_IN_BF16
+
 // ---------------------------------------------------------------- ROUTE_BUILD --
 // 骨架 bench:190-224 逐条移植（仅 block0 调用；tid_base/smem_off 供 WS 子集）。
 __device__ __forceinline__ void route_build_body(

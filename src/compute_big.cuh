@@ -1003,15 +1003,20 @@ __device__ __forceinline__ void r19_pull_flags(
             }
             // [L1L2-SPLIT] pool/frag 数据搬移仅 Both/L1（L2 阶段不碰输入缓冲）。
             if constexpr (kPhase != MegaPhase::L2) {
+#if MX_IN_BF16
+                const int64_t xoff = S.a->prefold_off;   // 本地 fold 后的 fp8 x
+#else
+                const int64_t xoff = S.a->x_off;
+#endif
 #ifdef PULL_LOCAL_DIAG
                 // [诊断] 远端读换成本 rank 本地读（同 volume/pattern），量化远端代价
                 const uint4* srcp = reinterpret_cast<const uint4*>(
-                                        S.a->self + S.a->x_off) +
+                                        S.a->self + xoff) +
                                     (size_t)(src_token % S.a->slot_capacity) *
                                         (kHidden / 16) + u4_off;
 #else
                 const uint4* srcp = reinterpret_cast<const uint4*>(
-                                        S.a->peer_bases[src] + S.a->x_off) +
+                                        S.a->peer_bases[src] + xoff) +
                                     (size_t)src_token * (kHidden / 16) + u4_off;
 #endif
                 // [H2] 本场景 u4_slice=96（6144/16/4）：3 个远端装载先全量发出，
