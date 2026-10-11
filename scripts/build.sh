@@ -79,11 +79,18 @@ KERNEL_CFLAGS=${KERNEL_CFLAGS:-}
 
 build_so() {
   # 接口层 + kernel -> test/megakernel.so（-fPIC -shared）
-  # SONAME=megakernel.so：消费者的 DT_NEEDED 记为裸名，经 RUNPATH=$ORIGIN 解析，
-  # 与 cwd 无关（否则链接路径 test/megakernel.so 会被写入 DT_NEEDED）。
-  "$CUCC" -O3 -std=c++17 -fPIC -shared "${INC[@]}" $KERNEL_CFLAGS \
-    -Wl,-soname,megakernel.so \
-    -o "$OUT/megakernel.so" src/megakernel.cu
+  # [multi_compile] 各 kernel 实例在 src/multi_compile/*.cu 单独编译（-j 并行），再链接。
+  local objd="$PWD/build/obj_so"
+  mkdir -p "$objd"
+  local srcs=(src/megakernel.cu)
+  for f in src/multi_compile/*.cu; do [ -e "$f" ] && srcs+=("$f"); done
+  export _CUCC="$CUCC" _OBJ="$objd"
+  export _INC="${INC[*]}" _KCF="$KERNEL_CFLAGS"
+  printf '%s\n' "${srcs[@]}" | \
+    xargs -P "${BUILD_JOBS:-$(nproc)}" -I{} bash -c \
+      '"$_CUCC" -O3 -std=c++17 -fPIC $_INC $_KCF -c "{}" -o "$_OBJ/$(basename "{}" .cu).o"'
+  "$CUCC" -O3 -std=c++17 -fPIC -shared -Wl,-soname,megakernel.so "${INC[@]}" \
+    -o "$OUT/megakernel.so" "$objd"/*.o
   echo "built: $PWD/$OUT/megakernel.so"
 }
 

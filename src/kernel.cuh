@@ -16,7 +16,7 @@
 #include "compute.cuh"
 #include "combine.cuh"
 
-__global__ void __launch_bounds__(1024) mega_empty_kernel() {}
+__global__ void __launch_bounds__(1024) mega_empty_kernel();
 
 
 // 计算链任务循环
@@ -111,31 +111,22 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     if (kTick) a.rwk->lf.pre_ticks[15] = clock64();
 }
 
+// [multi_compile] 显式实例化在 src/multi_compile/kernel_*.cu；此处抑制隐式实例化。
+extern template __global__ void mega_kernel<false, false, 0, MegaPhase::Both>(MegaArgs);
+extern template __global__ void mega_kernel<true, false, 0, MegaPhase::Both>(MegaArgs);
+extern template __global__ void mega_kernel<true, false, 48, MegaPhase::Both>(MegaArgs);
+extern template __global__ void mega_kernel<true, false, 64, MegaPhase::Both>(MegaArgs);
+
 // ---------------------------------------------------------------- REDUCE --
 // REDUCE：每 token 2 个 block 列分半
 __global__ void __launch_bounds__(256) mega_reduce_kernel(
-                                   const uint8_t* self, const ranks_data* remote,
-                                   float* y, int R,
-                                   int tokens,
-                                   int64_t rows_off,
-                                   int64_t topk_idx_off, int64_t weights_off,
-                                   local_flags* lf, ranks_flags* rf,
-                                   int64_t task_ready_idx,
-                                   int max_spins
+    const uint8_t* self, const ranks_data* remote, float* y, int R, int tokens,
+    int64_t rows_off, int64_t topk_idx_off, int64_t weights_off,
+    local_flags* lf, ranks_flags* rf, int64_t task_ready_idx, int max_spins
 #if MX_DBG_COUNT
-                                   ,
-                                   unsigned long long* exec_ctr = nullptr,
-                                   int dbg_count = 0
+    , unsigned long long* exec_ctr, int dbg_count
 #endif
-) {
-    reduce_body(self, remote, y, R, tokens, rows_off,
-                topk_idx_off, weights_off, lf, rf, task_ready_idx,
-                max_spins
-#if MX_DBG_COUNT
-                , mx_ctr_open(dbg_count, exec_ctr)
-#endif
-    );
-}
+);
 
 // =============================================================================
 // [集71] host 侧接口：计数缓冲清零 / 打印
