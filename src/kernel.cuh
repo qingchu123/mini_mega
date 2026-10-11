@@ -16,16 +16,10 @@
 #include "compute.cuh"
 #include "combine.cuh"
 
-// 空 kernel（M0 基准：测 launch/graph 地板）
-// __launch_bounds__ 覆盖 bench 全部启动线程数（G0=32 / G1/G2=512 或 1024），
-// 固定 AOT 编译上限，避免按实际 block 大小重复编译。
 __global__ void __launch_bounds__(1024) mega_empty_kernel() {}
 
 
-// 计算链任务循环（tail 类型由调用点按运行期开关选择）
-// [FRAG-ALWAYS] 去掉 kFragCap：fragment（A/f2 4-line 快路径）分支恒编译。
-// [FRAG-INT] fragment 缓冲改为 kernel 内部（rwk->ld.frag_a/frag2），不再由 host 传入；
-//   运行期是否真走由 S.frag_all 决定（见 compute.cuh 的 S.frag_all）。
+// 计算链任务循环
 template <bool kSmallOnly = false, int kCap = 0,
           MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs* a,
@@ -36,32 +30,22 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs* a,
     dispatch_pull_body<kSmallOnly, kCap, kPhase>(a, cycle, a_smem, b_smem, ctr);
 }
 
-// 主 kernel（单轮）。
-//   kWithCompute=false：只跑前序（M1 验证）；true：完整任务循环（M2/M3）；
-//   kWithCompute=true 且 combine_rows_off>=0：任务尾接 COMBINE（M3）
-// [L1L2-SPLIT] kPhase：Both=原合并；L1=只跑前序+DISPATCH+L1；L2=只跑 L2+tail
-//   （prologue 行为由 a.skip_prologue 驱动：L2 发射时 host 置 2 = 跳过
-//   route/publish/xbar、轻量 task_setup）。
+// 主 kernel。kWithCompute=false 只跑前序；kPhase 见 dispatch（Both/L1/L2）。
 template <bool kWithCompute,
           bool kSmallOnly = false, int kCap = 0,
           MegaPhase kPhase = MegaPhase::Both>
 __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
-    // 相位时间戳（block0 tid0；[6]=入口 [0]=route后 [1]=publish后 [2]=xbar后 [3]=setup后）
     const bool kTick = (blockIdx.x == 0) && (threadIdx.x == 0);
-    // [集71] 计数缓冲归一（运行期开关折叠成单指针判空；编译期关闭时恒 nullptr，
-    //   该局部量无人读取即被优化器消除，不进入任何 kernel 参数/寄存器）
 #if MX_DBG_COUNT
     unsigned long long* ctr = mx_ctr_open(a.dbg_count, a.exec_ctr);
 #else
     unsigned long long* ctr = nullptr;
 #endif
-    // [集71] kernel 启动次数（block0 tid0）+ 参与 block 数（每 block tid0）
     if (threadIdx.x == 0) {
         if (blockIdx.x == 0) MX_CTR_ADD(ctr, kCtrKernelLaunch, 1);
         MX_CTR_ADD(ctr, kCtrKernelBlocks, 1);
     }
-    // [R24] A-smem 双缓冲（kernel 作用域）；L1 B-smem 流水已删除。
-    // dispatch 参数中的 b_smem 暂保留，供调用边界兼容，但始终为 nullptr。
+    // A-smem 双缓冲（kernel 作用域）
     union __align__(16) ABShared {
         uint8_t a[2][R24_MT * R24_KS * 512];
     };
@@ -69,15 +53,12 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     __shared__ MegaArgs s_a;
     if (threadIdx.x == 0) s_a = a;
     if (kTick) a.rwk->lf.pre_ticks[6] = clock64();
-    // 0) [M_CYCLE] 预清 ct2=(c+2)%M_CYCLE 槽（本轮 copy c 尚未定，用 current_time
-    //   [b][0] 派生；入口全 block 同为 L ⇒ c 一致）。ct1 留给下一轮，本轮不碰。
     mx_preclear_ct2(&a.rwk->lf, &a.unk->rf, /*skip_xbar=*/a.skip_prologue >= 2);
     __syncthreads();
     if (!a.skip_prologue) {
         // 1) PROLOGUE：ROUTE_BUILD + PUBLISH_COUNTS（仅 block0）
         if (blockIdx.x == 0) {
-            const int route_cycle =
-                (int)(a.rwk->lf.current_time[0][0] % M_CYCLE);
+            const int route_cycle = (int)(a.rwk->lf.current_time[0][0] % M_CYCLE);
             route_build_body(a.topk_idx, &a.rwk->ld.route_slot_counts[0],
                              a.unk_peers, route_cycle, a.R, a.rank,
                              a.tokens, a.slot_capacity, 0, 0, ctr);
@@ -91,12 +72,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         // [R38] 复用前序：路由/计数持久，跳过 ROUTE/PUBLISH（数据与 node0 相同）。
         if (kTick) a.rwk->lf.pre_ticks[0] = a.rwk->lf.pre_ticks[1] = clock64();
     }
-    // 2) XBAR_ROUTE_READY（全 grid，mode3：转置 + warp 并行发布）：每节点保留，
-    //    既是 route/publish 可见性门，也是跨 rank 的每节点对齐（防漂移）。
+    // 2) XBAR_ROUTE_READY（每节点：可见性门 + 跨 rank 对齐）
     if (a.skip_prologue >= 2) {
-        // 诊断模式：连 xbar 也跳过，仅推进 xbar 相位计数。
-        // [L1L2-SPLIT] L2 阶段：xbar 相位计数不由 L2 推进 —— 每 round 仅 L1 前序
-        //   前进一次，使 ct0/ct1 单步同步（combine/REDUCE 的 cyc/epoch 对齐）。
         if constexpr (kPhase != MegaPhase::L2) {
             if (threadIdx.x == 0) a.rwk->lf.current_time[blockIdx.x][0] += 1;
         }
@@ -106,10 +83,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
                               a.xrelease_idx, a.rwk->lf.dbg, a.max_spins, 0, ctr);
     }
     if (kTick) a.rwk->lf.pre_ticks[2] = clock64();
-    // 3) TASK_SETUP（block0 leader：checksum -> prefix -> 窗口表 -> task_ready）
-    // [L1L2-SPLIT] L2 阶段：改用静态任务划分（见 dispatch_pull_body），
-    //   不重臂 task_counter/task_ready、不推进 current_time[1]（每 round 仅 L1
-    //   前序 +1）；prefix 由本 round L1 的 task_setup 持久化，L2 只读。
+    // 3) TASK_SETUP（block0 leader 建 prefix/窗口表，其余等 task_ready）
     if constexpr (kPhase == MegaPhase::L2) {
         if (kTick) a.rwk->lf.pre_ticks[3] = clock64();
     } else if (a.skip_prologue) {
@@ -129,15 +103,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     if (kTick) a.rwk->lf.pre_ticks[3] = clock64();
     // 4) 任务循环（DISPATCH -> L1 -> L2 -> tail(COMBINE)）
     if (kWithCompute) {
-        // [M_CYCLE] 任务循环 / COMBINE / REDUCE 用的 copy c：task_setup 结束时
-        //   current_time[b][1] 已自增到 L+1，故 (ct-1)%M_CYCLE = L%M_CYCLE，与
-        //   xbar/task_setup 所用 c 一致。COMBINE 完成标记与 REDUCE 等待须同片。
+        // [M_CYCLE] copy c（与 xbar/task_setup 同片）
         const int cyc = (int)((a.rwk->lf.current_time[blockIdx.x][1] - 1) % M_CYCLE);
-        // [集33] tail 实例统一：任务循环恒用 CombineTail，combine 关闭时
-        //   （combine_rows_off<0）融合能力置 false 且 tail 为空操作。这样
-        //   mega_kernel<..., NoTaskTail> 不再实例化第二份重型任务体
-        //   （原 NoTaskTail 运行期从不执行，却占整核寄存器/代码布局 collateral；
-        //   71 机 TPR=16 −7µs，TPR=256 中性）。
         mega_dispatch_loop<kSmallOnly, kCap, kPhase>(
             &s_a, cyc, &s_ab.a[0][0], nullptr, ctr);
     }
@@ -145,9 +112,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
 }
 
 // ---------------------------------------------------------------- REDUCE --
-// 独立 kernel：每 token 2 个 block 列分半（grid=32 覆盖 TPR=16）
-// [集71] 末尾两个参数为带默认值的可选项：老调用点（bench.cu）不传即 nullptr，
-//        编译期 MX_DBG_COUNT=0 时统计代码整体消除。
+// REDUCE：每 token 2 个 block 列分半
 __global__ void __launch_bounds__(256) mega_reduce_kernel(
                                    const uint8_t* self, const ranks_data* remote,
                                    float* y, int R,
