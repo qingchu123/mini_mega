@@ -1501,8 +1501,40 @@ __device__ R19_BIG_ATTR void r19_big_task(
                         S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
                         out_col_base, S.l1_k_out);
+                // [TAIL-MT] 尾块按精确活跃 tile 数选档（原仅 5/8）：count∈65..127
+                //   原先一律用 MTAct=8（按 128 行算）→ 白算（TPR 84/90 台阶）。
+                else if (l1_act == 2)
+                    r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 2, kR24BPF>(
+                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
+                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
+                        out_col_base, S.l1_k_out);
+                else if (l1_act == 3)
+                    r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 3, kR24BPF>(
+                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
+                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
+                        out_col_base, S.l1_k_out);
+                else if (l1_act == 4)
+                    r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 4, kR24BPF>(
+                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
+                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
+                        out_col_base, S.l1_k_out);
                 else if (l1_act == 5)
                     r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 5, kR24BPF>(
+                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
+                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
+                        out_col_base, S.l1_k_out);
+                else if (l1_act == 6)
+                    r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 6, kR24BPF>(
+                        a_smem, fbase, S.mt_total, S.w1, e, full, count,
+                        S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
+                        out_col_base, S.l1_k_out);
+                else if (l1_act == 7)
+                    r24_l1_big<R19_L1_MT, R24_KS, R19_L1_BATCH, true, 7, kR24BPF>(
                         a_smem, fbase, S.mt_total, S.w1, e, full, count,
                         S.k_in, S.l1_n_total, S.l1_block_n, lane, warp,
                         kComputeWarps, S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2,
@@ -1655,8 +1687,39 @@ __device__ R19_BIG_ATTR void r19_big_task(
                         S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
                         S.l2_k_out, fuse.on ? &fuse : nullptr);
+                // [TAIL-MT] 同 L1：按精确活跃 tile 选档，消除 count∈65..127 的 MTAct=8 白算
+                else if (l2_act == 2)
+                    r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 2, kR24BPF>(
+                        a_smem, f2, S.mt_total, w2_e, full, count,
+                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
+                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                else if (l2_act == 3)
+                    r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 3, kR24BPF>(
+                        a_smem, f2, S.mt_total, w2_e, full, count,
+                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
+                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                else if (l2_act == 4)
+                    r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 4, kR24BPF>(
+                        a_smem, f2, S.mt_total, w2_e, full, count,
+                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
+                        S.l2_k_out, fuse.on ? &fuse : nullptr);
                 else if (l2_act == 5)
                     r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 5, kR24BPF>(
+                        a_smem, f2, S.mt_total, w2_e, full, count,
+                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
+                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                else if (l2_act == 6)
+                    r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 6, kR24BPF>(
+                        a_smem, f2, S.mt_total, w2_e, full, count,
+                        S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
+                        kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
+                        S.l2_k_out, fuse.on ? &fuse : nullptr);
+                else if (l2_act == 7)
+                    r24_l2_big<R19_L2_MT, R24_KS, R19_L2_BATCH, true, 7, kR24BPF>(
                         a_smem, f2, S.mt_total, w2_e, full, count,
                         S.l1_k_out, S.l2_k_out, S.l1_block_n, lane, warp,
                         kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
