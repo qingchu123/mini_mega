@@ -598,91 +598,11 @@ __device__ __forceinline__ void l2_gemm_body(
 }
 
 // ------------------------------------------------------------- 任务信息 --
-// 任务尾钩子（T3 COMBINE 用）收到的本任务上下文。
-struct TaskDesc {
-    int task;         // 全 grid 任务号
-    int e;            // expert（本 rank 本地号）
-    int w;            // 窗口号
-    int slice;        // 物理 slice 号 [0, nslice_eff)
-    int count;        // 本窗口实际行数
-    int pool_slot;    // e*ring + w%ring
-    unsigned epoch;   // 本窗 epoch（task_ready 旗值）
-    // [R35] 波量化粗化：每物理任务覆盖 merge 个逻辑 slice（几何用 nslice_eff）
-    int nslice_eff;   // = kNSlice / merge
-    int merge;        // 1（未粗化）或 2/4/…
-};
 
 #include "combine.cuh"
 
-// [R29] tail → 融合上下文获取/回写（默认无融合；kernel.cuh 对 CombineTail 特化）。
-//   任务体在进入 r24 L2 路径且 staging 有效时激活 fuse.on，并在任务尾把该状态
-//   写回 tail，供 CombineTail 选择"只写标记"路径。
-template <typename T>
-struct R29TailFuse {
-    static __device__ __forceinline__ CombineFuseCtx get(const T&) {
-        return CombineFuseCtx{};
-    }
-};
-template <typename T>
-struct R29TailFuseSet {
-    static __device__ __forceinline__ void on(T&, const CombineFuseCtx&) {}
-};
 
-// --------------------------------------------------- COMBINE 任务尾适配器 --
-// 在任务循环 tail 处按 TaskDesc 更新 CombineCtx 并执行本任务 slice 的推送。
-struct CombineTail {
-    CombineCtx ctx;
-    const uint8_t* out_base;  // ffn_out staging 全区基址（BF16）
-    int nwarps;
-    CombineFuseCtx fuse;      // [R29] 融合推送上下文（capable 由 kernel 置位）
-    // [集71] 内部执行次数统计（编译期默认关；运行期 nullptr 关闭）
-    //   条件编译：CombineTail 是 mega_kernel 的**按值模板实参**（进 kernel 参数
-    //   缓冲），关闭态必须不占位，否则参数缓冲布局变化会改变设备码字节。
-#if MX_DBG_COUNT
-    unsigned long long* ctr = nullptr;
-#endif
-    __device__ __forceinline__ void operator()(const TaskDesc& d) const {
-        if (ctx.rows_off < 0) {
-            // [集71] COMBINE 跳过（combine 关闭）
-            if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrCombineSkip, 1);
-            return;
-        }   // [集33] combine 关闭：空操作
-        // [集71] COMBINE 实际执行推送次数
-        if (threadIdx.x == 0) MX_CTR_ADD(ctr, kCtrCombineExec, 1);
-        CombineCtx c = ctx;
-        c.slice = d.slice;
-        // epoch 已在 ctx 里按 64 位 current_time 设定
-        c.nslice_eff = d.nslice_eff;   // [R35] 粗化几何
-        c.merge = d.merge;
-        const int lane = (int)(threadIdx.x % 64);
-        const int warp = (int)(threadIdx.x / 64);
-        if (fuse.on) {
-            // [R29] 数据已在 L2 各列块推完，任务尾只写完成标记
-            combine_mark_rows(c, d.count, lane, warp, nwarps);
-        } else {
-            combine_push_pair(c, out_base, d.count, lane, warp, nwarps);
-        }
-    }
-};
 
-// [R29] 融合上下文获取特化（任务体据此判断是否走融合推送）
-template <>
-struct R29TailFuse<CombineTail> {
-    static __device__ __forceinline__ CombineFuseCtx get(const CombineTail& t) {
-        CombineFuseCtx f = t.fuse;
-        f.c = &t.ctx;
-        return f;
-    }
-};
-// [R29] 任务尾回写实际融合状态（供 CombineTail 选择只写标记路径）
-template <>
-struct R29TailFuseSet<CombineTail> {
-    static __device__ __forceinline__ void on(CombineTail& t,
-                                              const CombineFuseCtx& f) {
-        t.fuse = f;
-        t.fuse.c = &t.ctx;
-    }
-};
 
 // 大/小 count 任务体（独立 __noinline__ 函数；此位置已可见 L1/L2 body 定义）
 #include "compute_big.cuh"
@@ -718,7 +638,8 @@ __device__ __forceinline__ void dispatch_pull_body(
         const uint8_t* w1, int l1_n_total, int l1_block_n, int l1_k_out,
         uint8_t* ffn_hidden, float* l1_chk,
         const uint8_t* w2, uint16_t* l2_out, int l2_k_out, float* l2_chk,
-        int rep, int n_reps, CombineTail tail,
+        int rep, int n_reps,
+        int64_t combine_rows_off, unk_data* const* unk_peers, uint64_t epoch,
         const int* prefix_ptr = nullptr, unsigned long long* pt = nullptr,
         uint8_t* a_smem = nullptr, uint8_t* b_smem = nullptr,
         uint8_t* frag_a = nullptr, uint8_t* frag2 = nullptr,
@@ -816,6 +737,9 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.l2_k_out = l2_k_out;
     S.l2_chk = l2_chk;
     S.pt = pt;
+    S.combine_rows_off = combine_rows_off;
+    S.unk_peers = unk_peers;
+    S.epoch = epoch;
     // [R21] A fragment 副本（放在 ffn_hidden 的空槽）启用条件：
     //   单波（每 block 恰 1 任务，sibling 组固定）+ 每 expert 单窗（win_cap
     // [R34][FRAG-INT] fragment 的 m 维长度 = ceil(win_cap/16)（win_cap 允许非 16
@@ -898,15 +822,15 @@ __device__ __forceinline__ void dispatch_pull_body(
         // [R31] kSmallOnly 实例：大任务体不实例化（小核专用路径）
         if constexpr (kSmallOnly) {
             r19_small_task<kPhase>(S, task, e, w, count, slice,
-                                             epoch, data_slot, pfx, tail,
+                                             epoch, data_slot, pfx,
                                              a_smem, b_smem);
         } else if (count > kM) {
             r19_big_task<kCap, kPhase>(S, task, e, w, count, slice,
-                                                 epoch, data_slot, pfx, tail,
+                                                 epoch, data_slot, pfx,
                                                  a_smem, b_smem);
         } else {
             r19_small_task<kPhase>(S, task, e, w, count, slice,
-                                             epoch, data_slot, pfx, tail,
+                                             epoch, data_slot, pfx,
                                              a_smem, b_smem);
         }
         // ---- 任务尾 l2_done 递增（仅后续窗口会复用该槽或多轮时）----

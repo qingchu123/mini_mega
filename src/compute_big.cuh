@@ -294,6 +294,9 @@ struct R19Sched {
     int l2_k_out;
     float* l2_chk;
     unsigned long long* pt;
+    int64_t combine_rows_off;   // tail(COMBINE) 需要（来自 a）
+    unk_data* const* unk_peers;
+    uint64_t epoch;             // = current_time[0][1]
     bool poolfrag_ok; // [R23] pool 槽直接按 native-fragment 序落盘（免 F_A 副本）
     // [R35] 波量化粗化：本任务的逻辑 slice 数（merge）与物理 slice 数
     //   （nslice_eff = kNSlice/merge）。几何公式用 nslice_eff；
@@ -1278,21 +1281,36 @@ __device__ __forceinline__ void r19_l1_pub_wait(
     if (kTick) S.pt[5] = clock64();
 }
 
+__device__ __forceinline__ CombineCtx cm_build_ctx(const R19Sched& S) {
+    CombineCtx c;
+    c.meta = reinterpret_cast<const int*>(S.self + S.meta_off);
+    c.weights = reinterpret_cast<const float*>(S.self + S.w_off);
+    c.peer_bases = S.peer_bases;
+    c.unk_peers = S.unk_peers;
+    c.rows_off = S.combine_rows_off;
+    c.epoch = S.epoch;
+    c.block_idx = (int)blockIdx.x;
+    c.staging_cap = S.win_cap;
+    c.cycle = S.cycle;
+    return c;
+}
 __device__ __forceinline__ void r19_tail_common(
-        const R19Sched& S, CombineTail tail, int task, int e, int w, int count,
-        int slice, unsigned epoch, int pool_slot) {
-    (void)S;
-    TaskDesc td;
-    td.task = task;
-    td.e = e;
-    td.w = w;
-    td.slice = slice;
-    td.count = count;
-    td.pool_slot = pool_slot;
-    td.epoch = epoch;
-    td.nslice_eff = S.nslice_eff;   // [R35]
-    td.merge = S.merge;
-    tail(td);
+        const R19Sched& S, const CombineCtx& ctx, bool fused, int task, int e,
+        int w, int count, int slice, unsigned epoch, int pool_slot) {
+    (void)S; (void)task; (void)e; (void)w; (void)pool_slot; (void)epoch;
+    if (ctx.rows_off >= 0) {
+        const int lane = (int)(threadIdx.x % 64);
+        const int warp = (int)(threadIdx.x / 64);
+        CombineCtx c = ctx;
+        c.slice = slice;
+        c.nslice_eff = S.nslice_eff;
+        c.merge = S.merge;
+        if (fused)
+            combine_mark_rows(c, count, lane, warp, 8);
+        else
+            combine_push_pair(c, reinterpret_cast<const uint8_t*>(S.l2_out),
+                              count, lane, warp, 8);
+    }
     __syncthreads();
 }
 
@@ -1308,7 +1326,7 @@ __device__ __forceinline__ void r19_tail_common(
 template <int kCap = 0, MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
-        unsigned epoch, int pool_slot, const int* pfx, CombineTail tail,
+        unsigned epoch, int pool_slot, const int* pfx,
         uint8_t* a_smem, uint8_t* b_smem) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
@@ -1321,8 +1339,12 @@ __device__ R19_BIG_ATTR void r19_big_task(
     //   count<=64、寄存器预算有裕量；均衡大档（kCap=0）保持 2，避免 TPR=256 回退。
     constexpr int kR24BPF = (kCap > 0) ? 4 : R24_BPF;
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
-    // [L1L2-SPLIT] L2 阶段不需要 fuse 上下文（R29 融合推送是 L2 段内的事，L1 不读）
-    CombineFuseCtx fuse = R29TailFuse<CombineTail>::get(tail);
+    // [tail 内联] ctx/fuse 由 S 现构造（CombineTail 已去除）
+    const CombineCtx cctx = cm_build_ctx(S);
+    CombineFuseCtx fuse;
+    fuse.capable = (cctx.rows_off >= 0);
+    fuse.c = &cctx;
+    fuse.out_base = reinterpret_cast<const uint8_t*>(S.l2_out);
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
     r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx);
@@ -1333,6 +1355,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
     const uint8_t* pool_w = pool + (size_t)pool_slot * S.pool_stride * S.k_in;
+    const CombineCtx cctx = cm_build_ctx(S);
     const int g_l1 = (S.l1_n_total / S.l1_block_n) / S.nslice_eff;
     const int g0_l1 = slice * g_l1;
     // [集71] L1 阶段执行次数（count>0 的任务，tid0 计一次）
@@ -1528,7 +1551,6 @@ __device__ R19_BIG_ATTR void r19_big_task(
 #else
         fuse.on = false;   // 回退：L2 不推送，任务尾走整段推送
 #endif
-        R29TailFuseSet<CombineTail>::on(tail, fuse);
         if (count <= 32 && g_l2 % 6 == 0) {
             // [R34] 同 L1：小档单批（A 只装一遍，B 一遍）
 #if CM_FRAG_L2
@@ -1655,7 +1677,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
 #endif
     // [L1L2-SPLIT] COMBINE tail 依赖 L2 输出 → L1 阶段不执行
     if constexpr (kPhase != MegaPhase::L1)
-        r19_tail_common(S, tail, task, e, w, count, slice, epoch, pool_slot);
+        r19_tail_common(S, cctx, fuse.on, task, e, w, count, slice, epoch, pool_slot);
 }
 // ============================================================================
 // 小 count（count<=kM）任务体：与基线逐字一致的热路径，独立 __noinline__
@@ -1665,11 +1687,12 @@ __device__ R19_BIG_ATTR void r19_big_task(
 template <MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_SMALL_ATTR void r19_small_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
-        unsigned epoch, int pool_slot, const int* pfx, CombineTail tail,
+        unsigned epoch, int pool_slot, const int* pfx,
         uint8_t* a_smem, uint8_t* b_smem) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
+    const CombineCtx cctx = cm_build_ctx(S);
     (void)b_smem;
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
@@ -1678,6 +1701,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
     const uint8_t* pool_w = pool + (size_t)pool_slot * S.pool_stride * S.k_in;
+    const CombineCtx cctx = cm_build_ctx(S);
     const int g_l1 = (S.l1_n_total / S.l1_block_n) / S.nslice_eff;
     const int g0_l1 = slice * g_l1;
     // [集71] L1 阶段执行次数（count>0 的任务，tid0 计一次）
@@ -1800,5 +1824,5 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     __syncthreads();
     // [L1L2-SPLIT] COMBINE tail 依赖 L2 输出 → L1 阶段不执行
     if constexpr (kPhase != MegaPhase::L1)
-        r19_tail_common(S, tail, task, e, w, count, slice, epoch, pool_slot);
+        r19_tail_common(S, cctx, false, task, e, w, count, slice, epoch, pool_slot);
 }

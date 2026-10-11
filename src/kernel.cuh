@@ -95,7 +95,7 @@ struct MegaArgs {
 template <bool kSmallOnly = false, int kCap = 0,
           MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
-                                                   CombineTail tail, int cycle,
+                                                   int cycle,
                                                    uint8_t* a_smem = nullptr,
                                                    uint8_t* b_smem = nullptr,
                                                    unsigned long long* ctr = nullptr) {
@@ -109,7 +109,8 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs& a,
         a.l1_prog_idx, a.rwk->lf.out_processed, a.rwk->lf.dbg, a.max_spins, a.w1,
         2 * a.l1_k_out /*l1_n_total*/, kL1BlockN /*l1_block_n*/, a.l1_k_out,
         a.ffn_hidden, a.rwk->lf.l1_chk, a.w2,
-        a.l2_out, a.l2_k_out, a.rwk->lf.l2_chk, /*rep=*/0, /*n_reps=*/1, tail,
+        a.l2_out, a.l2_k_out, a.rwk->lf.l2_chk, /*rep=*/0, /*n_reps=*/1,
+        a.combine_rows_off, a.unk_peers, (uint64_t)a.rwk->lf.current_time[0][1],
         a.prefix_ptr, a.rwk->lf.pre_ticks, a_smem, b_smem,
         a.rwk->ld.frag_a[0], a.rwk->ld.frag2[0], ctr);
 }
@@ -214,45 +215,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         //   mega_kernel<..., NoTaskTail> 不再实例化第二份重型任务体
         //   （原 NoTaskTail 运行期从不执行，却占整核寄存器/代码布局 collateral；
         //   71 机 TPR=16 −7µs，TPR=256 中性）。
-        {
-            CombineTail tail;
-            if (a.combine_rows_off >= 0) {
-                tail.ctx.meta =
-                    reinterpret_cast<const int*>(a.self + a.meta_off);
-                tail.ctx.weights =
-                    reinterpret_cast<const float*>(a.self + a.w_off);
-                tail.ctx.peer_bases = a.peer_bases;
-                tail.ctx.unk_peers = a.unk_peers;
-                tail.ctx.rows_off = a.combine_rows_off;
-                tail.ctx.staging_cap = a.win_cap;
-                tail.ctx.block_idx = (int)blockIdx.x;
-                tail.ctx.cycle = cyc;   // [M_CYCLE] combine_sums 片
-                tail.ctx.epoch = (uint64_t)a.rwk->lf.current_time[0][1];
-                tail.out_base = reinterpret_cast<const uint8_t*>(a.l2_out);
-                tail.nwarps = 8;
-                // [R29] 融合推送能力 + 上下文（on 由任务体在 r24 L2 路径激活）
-                tail.fuse.capable = true;
-                tail.fuse.out_base = tail.out_base;
-                tail.fuse.c = &tail.ctx;
-            } else {
-                // [集33] combine 关闭：同一 tail 实例走空操作（rows_off<0）
-                tail.ctx.rows_off = a.combine_rows_off;
-                tail.ctx.staging_cap = a.win_cap;
-                tail.ctx.block_idx = (int)blockIdx.x;
-                tail.ctx.cycle = cyc;   // [M_CYCLE]（combine 关闭，仅占位）
-                tail.ctx.epoch = (uint64_t)a.rwk->lf.current_time[0][1];
-                tail.out_base = nullptr;
-                tail.nwarps = 8;
-                tail.fuse.capable = false;
-            }
-            // [集71] 计数缓冲下传（CombineTail 统计 COMBINE 执行/跳过次数）
-#if MX_DBG_COUNT
-            tail.ctr = ctr;
-#endif
-            mega_dispatch_loop<kSmallOnly, kCap, kPhase>(
-                a, tail, cyc, &s_ab.a[0][0], nullptr,
-                ctr);
-        }
+        mega_dispatch_loop<kSmallOnly, kCap, kPhase>(
+            a, cyc, &s_ab.a[0][0], nullptr, ctr);
     }
     if (kTick) a.rwk->lf.pre_ticks[15] = clock64();
 }
