@@ -143,39 +143,6 @@ void dbg_capture_launch(const MegaLaunchArgs& a, mcStream_t stream) {
         stream_is_capturing(stream), nullptr);
 }
 
-// [L1L2-SPLIT] 运行期开关：MX_L1L2_SPLIT=1 时 launch_compute 拆成
-//   L1/L2 两个 kernel（同 stream 顺序）。首次调用读 env 定型（graph capture
-//   期间只读 env、无设备操作，合法）。
-int mx_l1l2_split() {
-    static const int v = [] {
-        const char* e = std::getenv("MX_L1L2_SPLIT");
-        return (e != nullptr && *e != '\0' && *e != '0') ? 1 : 0;
-    }();
-    return v;
-}
-
-// 按 win_cap 分档发射指定 phase 的计算 kernel。
-//   skip_override < 0 → 沿用 a.skip_prologue（L1）；>=0 → 强制（L2 用 2：
-//   跳过 route/publish/xbar、轻量 task_setup，前序数据由本 round 的 L1 写好）。
-template <MegaPhase ph>
-void launch_phase_impl(const MegaLaunchArgs& a, mcStream_t stream,
-                       int skip_override) {
-    MegaLaunchArgs b = a;
-    if (skip_override >= 0) b.skip_prologue = skip_override;
-    if (a.win_cap <= 48)
-        mega_l1<true, NoTaskTail, false, 48, ph>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b),
-                                                            NoTaskTail{});
-    else if (a.win_cap <= 64)
-        mega_l1<true, NoTaskTail, false, 64, ph>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b),
-                                                            NoTaskTail{});
-    else
-        mega_l1<true, NoTaskTail, false, 0, ph>
-            <<<a.grid, a.threads, (size_t)a.smem, stream>>>(to_mega_args(b),
-                                                            NoTaskTail{});
-}
-
 }  // namespace
 
 void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream) {
@@ -183,28 +150,9 @@ void launch_prelude(const MegaLaunchArgs& a, mcStream_t stream) {
         to_mega_args(a), NoTaskTail{});
 }
 
-void launch_l1(const MegaLaunchArgs& a, mcStream_t stream) {
-    dbg_capture_launch(a, stream);
-    launch_phase_impl<MegaPhase::L1>(a, stream, /*skip_override=*/-1);
-}
-
-void launch_l2(const MegaLaunchArgs& a, mcStream_t stream) {
-    // L2 前序恒走 skip=2：route/publish/xbar 由本 round 的 L1 完成，
-    //   轻量 task_setup 重臂 task_counter/task_ready 并推进 current_time[1]
-    //   （combine/REDUCE 的 cyc/epoch 均由此派生，见 combine.cuh:496-508）。
-    launch_phase_impl<MegaPhase::L2>(a, stream, /*skip_override=*/2);
-}
-
 void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
     // [MEGA_DEBUG=4] 采集 kernel（mega 之前；默认关，零开销）
     dbg_capture_launch(a, stream);
-    // [L1L2-SPLIT] 拆分模式：L1 → L2 两个 launch（同 stream；graph capture
-    //   下两节点依次录入，replay 顺序不变）。
-    if (mx_l1l2_split()) {
-        launch_phase_impl<MegaPhase::L1>(a, stream, /*skip_override=*/-1);
-        launch_phase_impl<MegaPhase::L2>(a, stream, /*skip_override=*/2);
-        return;
-    }
     // [FRAG-INT] fragment 缓冲为 kernel 内部（rwk->ld），host 不再传入。fragment
     //   分支恒编译（[FRAG-ALWAYS]），运行期按 frag_all/几何自动启用。
     // [OPT-TK-CAP] 按 win_cap 选编译期 count 上界实例（kCap=48/64）：不可达的重档
@@ -258,10 +206,6 @@ void dump_kernel_resources() {
     q("kCap64", (const void*)mega_l1<true, NoTaskTail, false, 64>);
     q("full",   (const void*)mega_l1<true>);
     q("empty",  (const void*)mega_l1<false>);
-    q("L1full", (const void*)mega_l1<true, NoTaskTail, false, 0,
-                                        MegaPhase::L1>);
-    q("L2full", (const void*)mega_l1<true, NoTaskTail, false, 0,
-                                        MegaPhase::L2>);
 }
 }  // namespace fp8mega
 
