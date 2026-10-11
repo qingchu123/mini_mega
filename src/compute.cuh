@@ -575,6 +575,25 @@ __device__ __forceinline__ void l2_gemm_body(
     if (checksum != nullptr && lane == 0) atomicAdd(checksum, acc_chk);
 }
 
+// [regspill] 中/小档 L2 GEMM body 隔离 shim：__noinline__ 独立寄存器/栈，避免其
+//   acc（单批最多 96 floats）传染 r19_big_task。forceinline 的 l2_gemm_body 会内联
+//   进本 shim，即该档独立帧。small task 的调用点仍走内联 l2_gemm_body。
+//   -DR19_L2BODY_ISO=__forceinline__ 可回退成基线（shim 内联 = 无隔离）。
+#ifndef R19_L2BODY_ISO
+#define R19_L2BODY_ISO __noinline__
+#endif
+template <int kPrefetch = 4, int kNTiles = kNTilesPerWarp, int kMTiles = 1,
+          int kBatch = 6, bool kUseFrag = false>
+__device__ R19_L2BODY_ISO void l2_gemm_body_iso(
+        const uint8_t* a_pool, const uint8_t* w2, int count, int k_in,
+        int n_total, int block_n, int lane, int warp, int nwarps,
+        float* checksum, int n_group_begin, int n_group_count, uint16_t* out,
+        int k_out, const uint8_t* f2 = nullptr, int mt_total = 0) {
+    l2_gemm_body<kPrefetch, kNTiles, kMTiles, kBatch, kUseFrag>(
+        a_pool, w2, count, k_in, n_total, block_n, lane, warp, nwarps,
+        checksum, n_group_begin, n_group_count, out, k_out, f2, mt_total);
+}
+
 // ------------------------------------------------------------- 任务信息 --
 
 #include "combine.cuh"

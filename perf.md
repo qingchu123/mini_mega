@@ -696,3 +696,48 @@ local=1984B —— 拆分确实降低了单核 local/栈，但两者仍 **regs=2
 **正确性**：`check --smoke` **PASS**（8 用例，含 TPR=16/24/32/128 与 graph×50；D 的 49..63 掩码路径覆盖）。
 
 **结论**：中段两处 −22~24%，其余无回退。大 count（>64）保持 r24 MT8 async 两段式不变。
+
+## [261011_2018] 寄存器 spill 治理：大档 L1/L2 选择性 noinline 隔离 — 内核 local −17%，性能中性偏升
+
+> 背景：生产核 `mega_kernel<true>` 每线程 **regs=256（顶格）+ local≈3.0KB**，溢出真实存在
+> （见 `reg_spill.md`）。根因结构性：核心 GEMM 体的 `acc`（MT8/B2 达 **128 floats**）+
+> A/B 预取环 + forceinline 的 L1/L2 body 叠加，超出 256 寄存器预算。
+> 禁用（`-DR19_L1BIG_ISO/__forceinline__`）则 r19_big_task 的 acc 峰值传染进任务体。
+
+改动（`src/common.cuh`、`src/compute_big.cuh`、`src/compute.cuh`）：
+
+1. **E1s·L1**：`r19_big_task` 内 **kMT>=2** 的 L1 档改经 `r19_l1_big_iso`（`__noinline__` shim，
+   `R19_L1BIG_ISO`）隔离；small task 的 kMT=1 热路径保持内联。
+2. **L2**：`r19_big_task` 内中/小档 L2 body 改经 `l2_gemm_body_iso`（`__noinline__` shim，
+   `R19_L2BODY_ISO`）隔离（acc 单批最多 96 floats）；small task 调用点保持内联。
+
+**内核资源**（`MT_DUMP_RES=1`，`-s 1 -tprs 16`）：
+
+| 版本 | regs | local（栈帧/溢出） |
+|---|---:|---:|
+| 基线 | 256 | **3096 B** |
+| 仅 L1 隔离（E1s） | 256 | 2856 B |
+| **L1+L2 隔离（本改）** | 256 | **2568 B（−17%）** |
+
+静态反汇编（`mxobjdump`+`frame.py`）：`r19_big_task` 栈帧 **1344 → 528 B**（−61%，
+栈 ld/st 905→497）；`r24_l2_big<8,8,2,true,8,2>` 640 B（noinline，内部 acc+推送）。
+
+**A/B**（`mybench -R 32 -s 1 -tprs 8,16,32,64,128,256 -nodes 3 -replays 2`，与基线交错 3 次均值）：
+
+| TPR | 基线 us | L1+L2 iso us | 变化 |
+|---:|---:|---:|---:|
+| 8 | 342.0 | 342.9 | +0.3% |
+| 16 | 361.4 | 358.1 | −0.9% |
+| 32 | 517.8 | 482.8 | **−6.8%** |
+| 64 | 630.2 | 622.2 | −1.3% |
+| 128 | 959.0 | 950.5 | −0.9% |
+| 256 | 1692.5 | 1668.7 | −1.4% |
+
+**-s2 top50**（TK 实录，交错 2 次）：基线 mean **792.9µs** → **771.9µs（−2.6%）**。
+
+**正确性**：`check --smoke` **PASS**（8 用例，含 TPR=32 graph×50）。
+
+**结论**：spill 显著下降（内核 local −17%、最重的任务体 −61%），且性能**中性偏升**
+（中档 −6.8%、TK −2.6%，无档回退 >2%）。溢出的剩余部分在 `r24_l2_big`（noinline 自包含，
+acc=128 结构性），强行再降（降 acc/拆 kernel）已证净回退（`reg_spill.md` §10）。
+可用 `-DR19_L1BIG_ISO=__forceinline__` / `-DR19_L2BODY_ISO=__forceinline__` 回退。

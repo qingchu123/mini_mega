@@ -374,6 +374,22 @@ __device__ __forceinline__ void r19_l1_big(
         atomicAdd(checksum, acc_chk + (float)count * 0.0f);
 }
 
+// [regspill] 大档 L1（kMT>=2）隔离 shim：__noinline__ 独立寄存器/栈，避免其
+//   acc 峰值（最多 128 floats）传染 r19_big_task。forceinline 的 r19_l1_big 会
+//   内联进本 shim，故 shim 函数体即该档的独立帧。small task 的 kMT=1 不走此路。
+template <int kMT, int kPF, int kBatch>
+__device__ R19_L1BIG_ISO void r19_l1_big_iso(
+        const uint8_t* pool, const uint8_t* fbase, int mt_total,
+        const uint8_t* w1, int expert, int count, int k_hidden, int n_total,
+        int block_n, int lane, int warp, int nwarps, float* checksum,
+        int n_group_begin, int n_group_count, uint8_t* ffn_out, uint8_t* ffn2,
+        int out_col_base, int k_out, int m_tile_base = 0) {
+    r19_l1_big<kMT, kPF, kBatch>(
+        pool, fbase, mt_total, w1, expert, count, k_hidden, n_total, block_n,
+        lane, warp, nwarps, checksum, n_group_begin, n_group_count, ffn_out,
+        ffn2, out_col_base, k_out, m_tile_base);
+}
+
 // ============================================================================
 // [R24] L1 的 A 走 smem：warp 协作 bsm 异步搬运（__builtin_mxc_ldg_b128_bsm）。
 //   每 stage = kKS 个 K step × kMT 个 M-tile；smem 布局同 F_A [j][m][row][32B]，
@@ -1276,7 +1292,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
         if (count <= 32 && g_l1 % 4 == 0) {
             // [L1TUNE-B] 17..32 档：MT2/PF1（同 1 组权重、acc 减半）替代 MT4/PF2。
             //   实测 TPR24 630→483（−23%，docs/15/16）。count≤16 走 small 档。
-            r19_l1_big<2, 1, 4>(
+            r19_l1_big_iso<2, 1, 4>(
                 pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                 (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
@@ -1284,7 +1300,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // [R35] NSLICE=8 等 g_l1=2 几何：单批 2 组小档（A 装载一遍、MT2
             //   runtime 裁剪），与 NSLICE=4 的 <2,kNT,2,4> 同构按比例缩小；
             //   避免落入 r19_l1_big<4,...> 的 MT4 档（A 读 2× + M 空转）。
-            r19_l1_big<4, R19_L1_PF, 2>(
+            r19_l1_big_iso<4, R19_L1_PF, 2>(
                 pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                 (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
@@ -1314,7 +1330,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
             }
 #endif
             if (!med_r24) {
-                r19_l1_big<3, R19_L1_PF, 4>(
+                r19_l1_big_iso<3, R19_L1_PF, 4>(
                 pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                 (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
@@ -1322,7 +1338,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
         } else if (count <= 48 && g_l1 % 2 == 0 && g_l1 >= 2) {
             // [OPT-NS8] NSLICE=8 时 g_l1=2：33..48 档用 MT3/B2（A 装一遍、
             //   runtime M 裁剪），避免落入 r19_l1_big<4,...> 的 MT4 慢档。
-            r19_l1_big<3, R19_L1_PF, 2>(
+            r19_l1_big_iso<3, R19_L1_PF, 2>(
                 pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                 (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
@@ -1435,7 +1451,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // 叠成两份大 acc 实例（同一 noinline 任务体寄存器/栈按最坏路径分配，
             // MT8 全档回退实测栈 1880B→2688B、71 机 TPR=128 回归 +4.7%；固定
             // MT4 回退后栈 2072B、TPR=128 回归收窄至 +2.8%）。
-            r19_l1_big<4, R19_L1_PF, 4>(
+            r19_l1_big_iso<4, R19_L1_PF, 4>(
                 pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                 (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);
@@ -1492,13 +1508,13 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // [R34] 同 L1：小档单批（A 只装一遍，B 一遍）
 #if CM_FRAG_L2
             if (f2 != nullptr)
-                l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, true>(
+                l2_gemm_body_iso<CM_L2_PF, kNTilesPerWarp, 2, 6, true>(
                     ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out,
                     kL1BlockN, lane, warp, kComputeWarps, S.l2_chk,
                     g0_l2, g_l2, out_slot, S.a->l2_k_out, f2, S.mt_total);
             else
 #endif
-                l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 2, 6, false>(
+                l2_gemm_body_iso<CM_L2_PF, kNTilesPerWarp, 2, 6, false>(
                     ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
                     S.a->l2_k_out, nullptr, 0);
@@ -1507,13 +1523,13 @@ __device__ R19_BIG_ATTR void r19_big_task(
             //   避免落入 r19_l2_big<4,PF,3> 的 MT4 档（M 空转）。
 #if CM_FRAG_L2
             if (f2 != nullptr)
-                l2_gemm_body<2, kNTilesPerWarp, 2, 3, true>(
+                l2_gemm_body_iso<2, kNTilesPerWarp, 2, 3, true>(
                     ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
                     S.a->l2_k_out, f2, S.mt_total);
             else
 #endif
-                l2_gemm_body<2, kNTilesPerWarp, 2, 3>(
+                l2_gemm_body_iso<2, kNTilesPerWarp, 2, 3>(
                     ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
                     S.a->l2_k_out);
@@ -1533,13 +1549,13 @@ __device__ R19_BIG_ATTR void r19_big_task(
             if (!med_r24) {
 #if CM_FRAG_L2
             if (f2 != nullptr)
-                l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, true>(
+                l2_gemm_body_iso<CM_L2_PF, kNTilesPerWarp, 3, 3, true>(
                     ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out,
                     kL1BlockN, lane, warp, kComputeWarps, S.l2_chk,
                     g0_l2, g_l2, out_slot, S.a->l2_k_out, f2, S.mt_total);
             else
 #endif
-                l2_gemm_body<CM_L2_PF, kNTilesPerWarp, 3, 3, false>(
+                l2_gemm_body_iso<CM_L2_PF, kNTilesPerWarp, 3, 3, false>(
                     ffn_slot, w2_e, count, S.a->l1_k_out, S.a->l2_k_out, kL1BlockN,
                     lane, warp, kComputeWarps, S.l2_chk, g0_l2, g_l2, out_slot,
                     S.a->l2_k_out, nullptr, 0);

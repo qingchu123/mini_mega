@@ -42,6 +42,14 @@ constexpr int kRecvStride = (kEPR + 1 + 3) & ~3;
 #define R19_GEMM_ATTR __noinline__
 #endif
 
+// [regspill] r19_big_task 内大档 L1（kMT>=2）经 __noinline__ shim 隔离：让各档
+//   acc（最多 128 floats）独立寄存器/栈，避免其峰值传染任务体；small task 的
+//   kMT=1 热路径仍内联。默认 __noinline__（已实测 local 3636->3092B，perf 中性）；
+//   -DR19_L1BIG_ISO=__forceinline__ 可回退成基线（shim 内联 = 无隔离）。
+#ifndef R19_L1BIG_ISO
+#define R19_L1BIG_ISO __noinline__
+#endif
+
 // [BF16-IN] 输入 x 为 bf16（模型直接喂）：prologue 本地 fold 成 fp8 写独立区
 //   （layout prefolded_input_tokens），peer 只 pull fp8（体积减半）。0=原 fp8xfp8。
 #ifndef MX_IN_BF16
