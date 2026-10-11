@@ -29,6 +29,7 @@
 #include "host_layout.cuh"
 #include "bench_check.cuh"
 #include "megakernel.h"
+#include "win_select.cuh"   // [自适应选窗] mxk::select_win
 
 namespace mt {
 
@@ -78,13 +79,15 @@ inline Geo make_geo(int R, int max_tokens, int win) {
     return g;
 }
 
-// 每 launch 的窗口容量。已验证正确：win == slot == max_tokens。
-//   自适应窗（win<slot）在当前内核会令部分 launch 的 REDUCE/graph 失败（见 test/mega_common.cuh 注释与
-//   test/77.correctness/测试流程.md），其精确位置在 COMBINE/L2 窗槽 stride 关系，尚未根治。
-//   现行策略在此保持等式约束；adaptive 已停用不构成行为变化。
+// 每 launch 的窗口容量：按 (per_expert, max_tokens) 用 win_select.cuh 的代价模型选。
+//   [261011] 自适应窗（win<slot，多窗/多波）经全量 `check --all`（win=32..128）验证
+//   **正确**（762/762 PASS）；此前"win<slot 会失败"的判断是 MT_FORCE_WIN 脚手架布局
+//   不一致造成的假象，已在 test/check.cu 修正。
+//   候选 {32,48,64,96,128} ∩ [win_min, max_tokens]；无合法候选时取 max_tokens。
+//   注：win=128 对均衡、win=48 对 TK 不均衡更优（见 docs/11、perf_now.md）。
 inline int choose_win_cap_counts(const std::vector<int>& per_expert, int max_tokens) {
-    (void)per_expert;
-    return max_tokens;
+    std::vector<uint32_t> c(per_expert.begin(), per_expert.end());
+    return mxk::select_win(c.data(), (int)c.size(), max_tokens, /*win_min=*/32);
 }
 
 // 逐专家计数（展平为 [E]，E = R*EPR）

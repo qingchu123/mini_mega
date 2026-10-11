@@ -897,6 +897,8 @@ int main(int argc, char** argv) {
         Spec warm = mt::balanced_spec(R, 16);
         warm.win = mt::choose_win_cap_counts(warm.per_expert, e.geo.max_tokens);
         if (const char* fw = std::getenv("MT_FORCE_WIN")) warm.win = std::atoi(fw);
+        // 预热 win 必须 ≤ 全局布局 win_global（否则 stride>分配 → 越界）
+        warm.win = std::min(warm.win, win_global);
         mt::Routes wr = mt::balanced_routes(R, 16);
         std::vector<float> y;
         run_eager(e, warm, wr, &y);
