@@ -1390,8 +1390,9 @@ __device__ R19_BIG_ATTR void r19_big_task(
                             ((S.k_in / 32) % R24_KS == 0) &&
                             (g_l1 % R19_L1_BATCH == 0);
         if (count <= 32 && g_l1 % 4 == 0) {
-            // [A/B] TPR 17..32 档：r19<4,2,4>（MT4 权重复用）替代 paired<2,2,2,4>
-            r19_l1_big<4, R19_L1_PF, 4>(
+            // [L1TUNE-B] 17..32 档：MT2/PF1（同 1 组权重、acc 减半）替代 MT4/PF2。
+            //   实测 TPR24 630→483（−23%，docs/15/16）。count≤16 走 small 档。
+            r19_l1_big<2, 1, 4>(
                 pool_w, fbase, S.mt_total, S.w1, e, count, S.k_in,
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
@@ -1442,22 +1443,38 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
         } else if (count > 48 && count <= 64 && fbase != nullptr &&
-                   (count % (4 * kM) == 0) &&
                    ((S.k_in / 32) % R24_KS == 0)) {
-            // [OPT-64] 49..64 档改走 r24 A-smem（MT4 无掩码）：A 经 bsm 异步搬运
+            // [L1TUNE-D] 49..64 档走 r24 A-smem：整块(64)无掩码、49..63 尾块掩码。
+            //   原条件仅 count%64==0 进入，49..63 掉进 r19 慢回退（TPR54 826→653，docs/16）。
             // [OPT-KCAP-REMOVE] win_cap<=64 用 BPF=4，均衡大档 BPF=2。
-            if (S.win_cap <= 64) {
-                r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, 4>(
-                    a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                    S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
-                    S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                    S.l1_k_out);
+            if (count % (4 * kM) == 0) {
+                if (S.win_cap <= 64) {
+                    r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, 4>(
+                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
+                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                        S.l1_k_out);
+                } else {
+                    r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, R24_BPF>(
+                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
+                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                        S.l1_k_out);
+                }
             } else {
-                r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, R24_BPF>(
-                    a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
-                    S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
-                    S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                    S.l1_k_out);
+                if (S.win_cap <= 64) {
+                    r24_l1_big<4, R24_KS, R19_L1_BATCH, true, 4, 4>(
+                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
+                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                        S.l1_k_out);
+                } else {
+                    r24_l1_big<4, R24_KS, R19_L1_BATCH, true, 4, R24_BPF>(
+                        a_smem, fbase, S.mt_total, S.w1, e, 0, count, S.k_in,
+                        S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
+                        S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                        S.l1_k_out);
+                }
             }
         } else if (kAsync) {
             // [R34] 全块（无掩码，原 async 快路径）+ 尾块（kMask=true）两段式：
