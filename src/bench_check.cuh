@@ -152,6 +152,7 @@ static bool validate_publish(const ProdLayout& L, int R, int tokens, int rank,
     const int E = R * kEPR;
     const int cap = (int)L.slot_capacity;
     if (recv_off < 0) recv_off = L.expert_recv_counts_off;
+    if (rd != nullptr) recv_stride = (int)(sizeof(rd->expert_recv_counts[0][0]) / sizeof(uint32_t));
     std::vector<uint32_t> recv((size_t)R * recv_stride, 0);
     CHECK(mcSetDevice(rank));
     if (rd != nullptr)

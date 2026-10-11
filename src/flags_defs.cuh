@@ -79,7 +79,7 @@ struct alignas(256) ranks_flags {
     // 跨 rank ROUTE_READY barrier，转置布局 xbar_barrier[c][src][dst]
     // （与原 sym 内 barrier_slots 的 src*R+dst 语义一致，行 stride 用 kGrid）。
     // [M_CYCLE] 旋转维：本轮只用 copy c。
-    alignas(256) uint32_t xbar_barrier[M_CYCLE][kGrid][kGrid];
+    alignas(256) uint32_t xbar_barrier[M_CYCLE][kGrid][2 * kGrid];
 
     // 跨 rank COMBINE 完成标记：combine_sums[c][k][token][slice] = epoch。
     // 取代原 sym::combine_sums（uint32 区）；行 stride = kMaxCombineRows。
@@ -128,7 +128,7 @@ struct alignas(256) rwk_data {
 struct alignas(256) ranks_data {
 
     alignas(256) uint32_t src_index_table[M_CYCLE][kEPR][kRanks][kMaxTPR];
-    alignas(256) uint32_t expert_recv_counts[M_CYCLE][kRanks][(((kEPR + 1) + 3) / 4) * 4];
+    alignas(256) uint32_t expert_recv_counts[M_CYCLE][kRanks][64];
     alignas(256) uint16_t combine_rows[M_CYCLE][kTopk][kMaxTPR][kHidden];
 
 };

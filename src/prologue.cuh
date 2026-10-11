@@ -230,7 +230,7 @@ __device__ __forceinline__ void route_build_body(
 __device__ __forceinline__ void publish_counts_body(
         const int* rsc_ptr, unk_data* const* unk_peers, int cycle, int R, int rank,
         unsigned epoch,
-        int recv_stride = (int)((kEPR + 1 + 3) & ~3), int tid_base = 0,
+        int recv_stride = (int)kRecvStride, int tid_base = 0,
         unsigned long long* ctr = nullptr) {
     const int E = R * kEPR;
     const int tid = threadIdx.x - tid_base;
@@ -271,7 +271,7 @@ __device__ __forceinline__ int task_setup_body(
         int slot_capacity, int64_t prefix_off, local_flags* lf,
         int64_t task_ready_idx, int64_t task_counter_idx, int64_t l2_done_idx,
         int* out_total, int* dbg,
-        int max_spins, int recv_stride = (int)((kEPR + 1 + 3) & ~3),
+        int max_spins, int recv_stride = (int)kRecvStride,
         bool reset_ring = true, int tid_base = 0, volatile int* sb_cnt = nullptr,
         int smem_off = 0, int* prefix_ptr = nullptr,
         uint32_t* ck_dbg = nullptr, unsigned long long* ctr = nullptr) {

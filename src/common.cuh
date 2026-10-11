@@ -33,7 +33,7 @@ constexpr int kM = 16;               // M tile 行数
 // L1 N tile 宽（生产 block_n；原 MegaArgs.l1_block_n 的固定值）
 constexpr int kL1BlockN = 256;
 // recv 行宽（word）：与 layout 的 ((EPR+1)+3)&~3 一致（原 MegaArgs.recv_stride）
-constexpr int kRecvStride = (kEPR + 1 + 3) & ~3;
+constexpr int kRecvStride = 64;   // recv 行宽（word）= 256B/4（256B 缓存行对齐，避免跨 rank false sharing）
 
 // [OPT-GEMM-ATTR] 重型 GEMM 档函数属性：__noinline__ 让每个档独立寄存器/栈
 //   分配，调用者（任务体/内核）只承担控制流与调用约定，避免最坏路径的 acc/
