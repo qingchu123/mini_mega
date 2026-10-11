@@ -552,6 +552,82 @@ __device__ __noinline__ void r19_l1_splitk_iso(
 }
 
 // ============================================================================
+// [BALANCE·docs/20 §4.2b] 跨 block K 切：一段（kseg）的 L1 部分和 + 最后段归约。
+//   与 r19_l1_splitk_iso 的区别：段不再由同一 block 顺序执行，而是不同 block
+//   各跑一段（part 已由 owner 清零），全部段对 part 做 FP32 atomicAdd；
+//   l1_part_cnt atomic 判最后一段 → r19_l1_reduce（SwiGLU→FP8→ffn/frag2）→
+//   由该段发布 l1_prog（owner 在任务体下方只等不发布）。
+// ============================================================================
+#if R19_BLOCK_KSPLIT
+template <int kMT>
+__device__ __noinline__ void r19_l1_ksplit_iso(
+        const uint8_t* pool_w, const uint8_t* fbase, int mt_total,
+        const uint8_t* w1, int expert, int count, int k_hidden, int n_total,
+        int block_n, int lane, int warp, int nwarps, int n_group_begin,
+        int n_group_count, int out_col_base, int k_out, float* part,
+        uint32_t* cnt, uint8_t* ffn_out, uint8_t* ffn2, int kseg,
+        uint32_t* bar_flags, int l1_prog_idx, int pool_slot, int slice,
+        unsigned gen, int nslice_eff, long long max_spins, int* dbg) {
+    (void)nslice_eff; (void)max_spins; (void)dbg;
+    const int chunk = (k_hidden / 32) / kNK;   // 每 K 段 step 数
+    __shared__ int s_last;
+    // 所有段一律 atomicAdd（part 已由 owner 清零）；l1_seg 传 1 → 走 atomicAdd 分支。
+    r19_l1_big<kMT, R19_L1_PF, 4>(
+        pool_w, fbase, mt_total, w1, expert, count, k_hidden, n_total,
+        block_n, lane, warp, nwarps, nullptr, n_group_begin, n_group_count,
+        nullptr, nullptr, out_col_base, k_out, /*m_tile_base=*/0,
+        /*k_step_begin=*/kseg * chunk, /*k_steps=*/chunk,
+        /*l1_part=*/part, /*l1_seg=*/1, /*l1_row0=*/0);
+    __syncthreads();
+    if (lane == 0 && warp == 0) {
+        __threadfence();
+        const unsigned old = atomicAdd(cnt, 1u);
+        s_last = (old == (unsigned)(kNK - 1));
+    }
+    __syncthreads();
+    if (s_last) {
+        __threadfence();
+        r19_l1_reduce<kMT>(part, count, block_n, lane, warp, nwarps,
+                           out_col_base, k_out, ffn_out, ffn2, mt_total);
+        __syncthreads();
+        if (threadIdx.x == 0)
+            l1_progress_publish(bar_flags, l1_prog_idx, pool_slot, slice, gen,
+                                nslice_eff);
+    }
+}
+
+// [BALANCE·docs/20 §4.2b] owner 的 L1 入口等待：等齐本窗全部 nslice_eff 个
+//   slice 的 l1_prog 旗（由各 slice 的最后 K 段发布），不自行发布。
+__device__ __forceinline__ void r19_l1_wait_all(
+        const R19Sched& S, int pool_slot, int w) {
+    const int tid = threadIdx.x;
+#ifdef NO_GEN_FIX
+    const unsigned gen = (unsigned)S.epoch;
+#else
+    const unsigned gen =
+        (unsigned)S.epoch + (unsigned)(w / (kRing > 0 ? kRing : 1));
+#endif
+    __syncthreads();
+    if (tid == 0) {
+        for (int s2 = 0; s2 < S.nslice_eff; ++s2) {
+            long long spin = 0;
+            while (*(volatile const uint32_t*)(S.bar_flags + S.a->l1_prog_idx +
+                                               (size_t)pool_slot *
+                                                   S.nslice_eff +
+                                               s2) != gen) {
+                if (++spin > S.a->max_spins) {
+                    if (S.dbg != nullptr) atomicAdd(S.dbg + 4, 1);
+                    break;
+                }
+            }
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+#endif
+
+// ============================================================================
 // [R24] L1 的 A 走 smem：warp 协作 bsm 异步搬运（__builtin_mxc_ldg_b128_bsm）。
 //   每 stage = kKS 个 K step × kMT 个 M-tile；smem 布局同 F_A [j][m][row][32B]，
 //   双缓冲（stage st 消费时 st+1 在飞）；B 直装 + 预取环 kBPF。[R34] 支持任意
@@ -1113,8 +1189,13 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
 template <MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void r19_pull_flags(
         const R19Sched& S, int task, int e, int w, int count, int slice,
-        unsigned epoch, int pool_slot, const int* pfx) {
+        unsigned epoch, int pool_slot, const int* pfx, int kseg = 0) {
     const int tid = threadIdx.x;
+    // [BALANCE·docs/20 §4.2b] 跨 block K 切：仅 owner（kseg==0）执行 pull/staging/
+    //   分片旗；其余 K 段只等待分片旗（数据由 owner 搬齐）。未启用时 own≡true，
+    //   行为与原实现逐字一致。
+    const bool own = R19_BLOCK_KSPLIT ? (kseg == 0) : true;
+    (void)kseg;
     const int warp = tid / 64;
     const int lane = tid % 64;
     const int nwarps = (int)(blockDim.x / 64);
@@ -1161,6 +1242,7 @@ __device__ __forceinline__ void r19_pull_flags(
     const int wchunk = (count + nwarps - 1) / nwarps;
     const int wlo = warp * wchunk;
     const int whi = (wlo + wchunk < count) ? (wlo + wchunk) : count;
+    if (own)
     for (int s2 = wlo + half; s2 < whi; s2 += 2) {
         const int global_row = s_row_off + s2;
         int src = 0;
@@ -1257,6 +1339,25 @@ __device__ __forceinline__ void r19_pull_flags(
             }
         }
     }
+#if R19_BLOCK_KSPLIT
+    // [BALANCE·docs/20 §4.2b] owner 在置分片旗前把本 (slot,slice) 的部分和缓冲清零：
+    //   之后各 K 段用 FP32 atomicAdd 累加，无需区分「首写」。清零在分片旗之前、
+    //   经同一 fence 序列发布，wait-all 后各段可见。仅 K 切开启且为真窗口时做。
+    if (own && kseg == 0 && S.a->win_cap <= R19_BLOCK_KSPLIT_WINMAX &&
+        (kNK > 1) && S.frag_all) {
+        float* part = S.l1_partial +
+            ((size_t)pool_slot * kNSlice + slice) * kMaxTPR * kL1SliceCols;
+        const int n4 = (count * kL1SliceCols) / 4;
+        uint4* p4 = reinterpret_cast<uint4*>(part);
+        const uint4 z4{0u, 0u, 0u, 0u};
+        for (int i = tid; i < n4; i += (int)blockDim.x) p4[i] = z4;
+        // 段完成计数也必须每代清零（槽跨 ring 复用；否则 reduce 触发条件
+        //   old==kNK-1 只在第一代成立）。由 owner 在置分片旗前清零，可见性同 part。
+        if (tid == 0)
+            *reinterpret_cast<volatile uint32_t*>(
+                S.l1_part_cnt + (size_t)pool_slot * kNSlice + slice) = 0u;
+    }
+#endif
     // [L1L2-SPLIT] 以下 flush/分片旗/wait-all 仅 Both/L1（L2 的输入齐备性由
     //   kernel 边界保证：L1 kernel 全部完成后 L2 kernel 才启动）。
     if constexpr (kPhase != MegaPhase::L2) {
@@ -1265,7 +1366,8 @@ __device__ __forceinline__ void r19_pull_flags(
 #endif
         __syncthreads();
         // ---- 分片就绪旗（本 slice 的 K 片已落 pool；L1 消费）----
-        if (tid == 0) {
+        // [BALANCE·docs/20 §4.2b] 非 owner（kseg>0）不置旗；旗由各 slice 的 owner 置。
+        if (own && tid == 0) {
 #ifndef PULL_FENCE_MIN
             __threadfence();
 #endif
@@ -1289,7 +1391,8 @@ __device__ __forceinline__ void r19_pull_flags(
         // 编号，同窗全部 slice 旗由本窗 nslice_eff 个物理任务写满。
         if (count > 0 && tid == 0) {
             for (int s2 = 0; s2 < S.nslice_eff; ++s2) {
-                if (s2 == slice) continue;
+                // owner 跳过自己已置的 slice；非 owner 必须等自己 slice 的 owner。
+                if (s2 == slice && own) continue;
                 long long spin = 0;
                 // [集71] wait-all（分片就绪旗）等待轮次
                 MX_CTR_ADD(S.ctr, kCtrWaitAllSlice, 1);
@@ -1396,7 +1499,7 @@ __device__ __forceinline__ void r19_tail_common(
 template <MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
-        unsigned epoch, int pool_slot, const int* pfx,
+        int kseg, unsigned epoch, int pool_slot, const int* pfx,
         uint8_t* a_smem, uint8_t* b_smem) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
@@ -1405,6 +1508,9 @@ __device__ R19_BIG_ATTR void r19_big_task(
     // [R38] win_cap<=64（tk/长尾）r24 用更深 B 预取环(4)，均衡大档保持 R24_BPF(2)。
     constexpr int kR24BPF = R24_BPF;
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
+    // [BALANCE·docs/20 §4.2b] 本窗是否走跨 block K 切（小窗 + frag 可用 + 开关）。
+    const bool ksplit = R19_BLOCK_KSPLIT && (S.a->win_cap <= R19_BLOCK_KSPLIT_WINMAX) &&
+                        (kNK > 1) && S.frag_all;
     // [tail 内联] ctx/fuse 由 S 现构造（CombineTail 已去除）
     const CombineCtx cctx = cm_build_ctx(S);
     CombineFuseCtx fuse;
@@ -1413,7 +1519,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     fuse.out_base = reinterpret_cast<const uint8_t*>(S.a->l2_out);
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
-    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx);
+    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx, kseg);
 #if R24_DIAG_PHASE
     const unsigned long long t_l1s = (tid == 0) ? clock64() : 0ull;
 #endif
@@ -1446,6 +1552,32 @@ __device__ R19_BIG_ATTR void r19_big_task(
         // 行主序 ffn_hidden 仅 bench 数值校验读 slot0；fragment 时其余槽只写 F2
         if ((kFragNew && CM_FRAG_L2) && pool_slot != 0)
             ffn_slot = nullptr;
+#if R19_BLOCK_KSPLIT
+        // [BALANCE·docs/20 §4.2b] 跨 block K 切：本任务只算一个 K 段的部分和，
+        //   最后一段归约 + 发布 l1_prog；owner（kseg==0）在下方等 l1_prog。
+        //   要求 A 走 fragment（fbase）以便按全局 K step 定位；否则退回原链。
+        if (ksplit && fbase != nullptr) {
+            const int part_slot = e * kRing + (w % kRing);
+            float* part = S.l1_partial +
+                ((size_t)part_slot * kNSlice + slice) * kMaxTPR * kL1SliceCols;
+            uint32_t* cnt = S.l1_part_cnt + (size_t)part_slot * kNSlice + slice;
+            const unsigned gen =
+                epoch + (unsigned)(w / (kRing > 0 ? kRing : 1));
+            #define R19_KSPLIT_CALL(KMT)                                          \
+                r19_l1_ksplit_iso<KMT>(                                           \
+                    pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,        \
+                    (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,    \
+                    g0_l1, g_l1, out_col_base, S.a->l1_k_out, part, cnt,          \
+                    ffn_slot, ffn2, kseg, S.bar_flags, (int)S.a->l1_prog_idx,     \
+                    pool_slot, slice, gen, (int)S.nslice_eff, S.a->max_spins,     \
+                    S.dbg)
+            if (count <= 16) R19_KSPLIT_CALL(1);
+            else if (count <= 32) R19_KSPLIT_CALL(2);
+            else if (count <= 48) R19_KSPLIT_CALL(3);
+            else R19_KSPLIT_CALL(4);
+            #undef R19_KSPLIT_CALL
+        } else
+#endif
 #if L1_SPLITK
         // [BALANCE·docs/20 §4.2] split-K 路径：块内跑 kNK 个 K 段 + 归约。
         //   要求 A 走 fragment（fbase）以便按全局 K step 定位；否则退回原链。
@@ -1647,9 +1779,22 @@ __device__ R19_BIG_ATTR void r19_big_task(
 #endif
     // [L1L2-SPLIT] l1_prog 发布+等待是合并路径内的 L1→L2 依赖。拆分后由
     //   L1 kernel 的 slice_flags + kernel 边界保证 → 编译期跳过。
+    // [BALANCE·docs/20 §4.2b] K 切：仅 owner（kseg==0）等 l1_prog（不发布，发布由
+    //   各 slice 的最后 K 段完成）；非 owner 已由下方 return 结束。
     if constexpr (kPhase == MegaPhase::Both) {
-        r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
+#if R19_BLOCK_KSPLIT
+        if (ksplit)
+            { if (kseg == 0) r19_l1_wait_all(S, pool_slot, w); }
+        else
+#endif
+            r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
     }   // end if constexpr (kPhase == MegaPhase::Both)
+#if R19_BLOCK_KSPLIT
+    // 非 owner 的 K 段只做部分和：到此结束（不跑 L2/tail，不发布 l2_done）。
+    if constexpr (kPhase != MegaPhase::L1) {
+        if (ksplit && kseg != 0) return;
+    }
+#endif
 #if R24_DIAG_PHASE
     const unsigned long long t_l2s = (tid == 0) ? clock64() : 0ull;
 #endif
@@ -1840,16 +1985,19 @@ __device__ R19_BIG_ATTR void r19_big_task(
 template <MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_SMALL_ATTR void r19_small_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
-        unsigned epoch, int pool_slot, const int* pfx,
+        int kseg, unsigned epoch, int pool_slot, const int* pfx,
         uint8_t* a_smem, uint8_t* b_smem) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
+    const bool ksplit = R19_BLOCK_KSPLIT && (S.a->win_cap <= R19_BLOCK_KSPLIT_WINMAX) &&
+                        (kNK > 1) && S.frag_all;
+    (void)a_smem;
     const CombineCtx cctx = cm_build_ctx(S);
     (void)b_smem;
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
-    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx);
+    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx, kseg);
     // ---- L1：小 count 档位（与基线实例选择一致）----
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
@@ -1875,6 +2023,23 @@ __device__ R19_SMALL_ATTR void r19_small_task(
             if (CM_FRAG_L2 && CM_FRAG_F2) ffn2 = S.frag2 + soff * f2sz;
         }
         if ((kFragNew && CM_FRAG_L2) && pool_slot != 0) ffn_slot = nullptr;
+#if R19_BLOCK_KSPLIT
+        // [BALANCE·docs/20 §4.2b] 跨 block K 切（count<=16 → MT1）。
+        if (ksplit && fbase != nullptr) {
+            const int part_slot = e * kRing + (w % kRing);
+            float* part = S.l1_partial +
+                ((size_t)part_slot * kNSlice + slice) * kMaxTPR * kL1SliceCols;
+            uint32_t* cnt = S.l1_part_cnt + (size_t)part_slot * kNSlice + slice;
+            const unsigned gen =
+                epoch + (unsigned)(w / (kRing > 0 ? kRing : 1));
+            r19_l1_ksplit_iso<1>(
+                pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
+                (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
+                g0_l1, g_l1, out_col_base, S.a->l1_k_out, part, cnt, ffn_slot,
+                ffn2, kseg, S.bar_flags, (int)S.a->l1_prog_idx, pool_slot,
+                slice, gen, (int)S.nslice_eff, S.a->max_spins, S.dbg);
+        } else
+#endif
 #if L1_SPLITK
         // [BALANCE·docs/20 §4.2] 小档 split-K：同 big（fbase 必需）。
         if (fbase != nullptr) {
@@ -1917,8 +2082,18 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     }   // end if (CM_L1_GATE)
     }   // end if constexpr (kPhase != MegaPhase::L2)  —— L1 段（small）
     if constexpr (kPhase == MegaPhase::Both) {
-        r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
+#if R19_BLOCK_KSPLIT
+        if (ksplit)
+            { if (kseg == 0) r19_l1_wait_all(S, pool_slot, w); }
+        else
+#endif
+            r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
     }   // end if constexpr (kPhase == MegaPhase::Both)
+#if R19_BLOCK_KSPLIT
+    if constexpr (kPhase != MegaPhase::L1) {
+        if (ksplit && kseg != 0) return;
+    }
+#endif
     // ---- L2：小 count（与基线实例选择一致）----
     if constexpr (kPhase != MegaPhase::L1) {
     const int g_l2 = (S.a->l2_k_out / kL1BlockN) / S.nslice_eff;

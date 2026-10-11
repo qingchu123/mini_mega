@@ -89,7 +89,7 @@ scripts/build.sh all       # = so bench mybench check（不含 whl）
 
 ```bash
 # 性能（mybench）
-scripts/run.sh mybench -R 32 -s 1 -tprs 1,4,16,32,33,64,128,256,512   # 均衡（默认场景）
+scripts/run.sh mybench -R 32 -s 1 -tprs 1,2,4,6,8,12,18,24,30,36,42,48,54,60,66,72,78,84,90,128,256   # 均衡（默认场景）
 scripts/run.sh mybench -R 32 -s 2 -top 50                              # TK 实录前 50 个
 scripts/run.sh mybench -R 32 -s 2 -cases 804900,807500                 # 指定 TK launch
 
@@ -218,6 +218,91 @@ REDUCE 按自身 `nslice_eff` 等待会漏槽 → 4M 级自旋超时（多节点
 12 窗×4 片的小任务摊满 32 block。均衡测例保持原粗化（零回归）。
 目标 853000 **1295 → ~1034µs（再降 20.2%）**；804400=967、804300=877。正确性
 （含强制 merge=1）R=2/R=32 全 `[总体] PASS`（见 `perf.md` v6）。
+
+## 块级代价感知 LPT（`-s2` 不均衡专项，默认关）
+
+新增编译开关 `R19_BLOCK_LPT`（默认 0，`-DR19_BLOCK_LPT=1` 开启）。动机：`-s2`
+每 rank 内各 block 的 L1+L2 GEMM 代价（∝ 窗口行数）差异大，而现有 FCFS
+（`atomicAdd(task_counter)`）只均衡任务「个数」。开启后 `dispatch_pull_body` 在
+tid0 建表阶段对 `raw_tasks = s_cum[kEPR]*kNSlice` 个任务按代价
+`cost=min(c_e-w*win_cap, win_cap)` 做**降序稳定计数排序**（smem `s_order`），
+领号仍是原 `atomicAdd`，但 `task = s_order[counter]`（降序发放 + 动态领取 ≈ LPT）。
+每任务解码 `(e,w,slice)`、`pool_slot`、ring 门、`l1_prog`/`l2_done` 协议完全不变
+（`src/compute.cuh:679-726`, `:772-788`）。
+
+- 正确性：开关开/关均 `check --all` **762/762 PASS**（含 win=32..128 自适应窗）。
+- 性能（R=32, `-s1 tprs 32/128/256` 与 `-s2 top50 replays=3`，两次均值）：
+  | 指标 | OFF(基线) | ON | 变化 |
+  |---|---:|---:|---:|
+  | s1 TPR32 | 488.8 | 496.4 | −1.6% |
+  | s1 TPR128 | 944.6 | 964.6 | −2.1% |
+  | s1 TPR256 | 1673.4 | 1692.9 | −1.2% |
+  | s2 top50 mean | 765.2 | 766.5 | ±0.2%（中性） |
+- 结论：**未达 ~400µs 目标**。根因是**任务量化**：s2 每 rank 重任务切片数常为
+  32 的非整数倍（如 rank28 有 44 个满窗切片 / 32 block → 鸽笼必有 12 block 做
+  2 个满窗），LPT 只能压低较空 block、无法降低最忙 block 的上界，故墙时不变。
+  最忙 block 的 L1 max/min 由基线 2.51× 变为 2.71×（未收敛）。真正要降需**更细
+  粒度派发**（每窗按 `kNK` 切 K 段，`raw_tasks = s_cum*kNSlice*kNK`）后再 LPT。
+
+## `-s2` 细粒度派发实验（NS=8 与跨 block K 切，均默认关、零行为变更）
+
+时间标签 `[261012_03_04]`。承接上节：直接尝试两种「更细粒度」派发，**结论均为
+净回退**（未达 ~400µs），开关默认关、关时逐字等价基线。改动仅
+`src/compute.cuh`、`src/compute_big.cuh`。
+
+### Stage 1：N 切 NS=8（`-DKNSLICE_OVERRIDE=8` ± `-DR19_BLOCK_LPT=1`）
+
+- 原理：把每窗任务数由 4 增到 8（N 组更细）。每片 A 重读 ×N、权重不重读、无需归约。
+- 实测（R=32，`-s1 tprs 32/128/256 -nodes 3 -replays 2`；`-s2 top50 -replays 3`）：
+
+  | 指标 | 基线 NS=4 | NS=8 | NS=8+LPT |
+  |---|---:|---:|---:|
+  | s1 TPR32 | 485.4 | 743.6 | 762.9 |
+  | s1 TPR128 | 946.1 | 1208.8 | 1225.0 |
+  | s1 TPR256 | 1678.6 | 2239.6 | 2277.8 |
+  | s2 top50 mean | 767.9 | 1086.8 | — |
+
+- **否决**：s1 回退 +28~53%、s2 回退 +42%。根因：N 切把 A 装载次数放大 NS 倍，
+  且每窗协议任务数翻倍；「更细」的收益被访存放大吞掉。
+
+### Stage 2：跨 block K 切（`-DR19_BLOCK_KSPLIT=1`，`R19_BLOCK_KSPLIT_WINMAX=64`）
+
+- 实现（`src/compute.cuh` + `src/compute_big.cuh`）：把每个 `(e,w,slice)` 的 L1 沿
+  K=H 再切 `kNK` 段、跨 block 派发（`raw_tasks = s_cum[kEPR]*kNSlice*kNK`，
+  仅在 `win_cap ≤ 64`（TK/长尾小窗）+ fragment 可用时启用；大窗走原路径）。
+  - **owner（kseg==0）**执行 pull/权重 staging/分片旗、等 `l1_prog`、跑 L2/tail、
+    发布 `l2_done`；其余段只算 K 部分和 —— 严禁每段跑协议。
+  - 各段把 gate/up 原值以 **FP32 atomicAdd** 累加到 `l1_partial[slot][slice]`；
+    owner 在置分片旗前把该部分和缓冲与 `l1_part_cnt[slot][slice]` 清零（每代一次）。
+  - `l1_part_cnt` 的 atomicAdd 判「最后一段」（`old==kNK-1`）→ `r19_l1_reduce`
+    （SwiGLU→FP8→ffn_hidden/frag2）→ 由该段发布 `l1_prog`。
+  - 新增函数：`r19_l1_ksplit_iso<kMT>`（`compute_big.cuh:556-625` 区）、
+    `r19_l1_wait_all`（owner 只等不发布）；`r19_pull_flags` 增加 `kseg` 参数
+    （非 owner 跳过 pull、只等分片旗）；任务体 `r19_big/small_task` 增加 `kseg` 并
+    按 owner 决定 L2/tail。
+- 正确性：开/关均 `check --all` **762/762 PASS**；`check --smoke` **8/8 PASS**
+  （K 切开启 <10s）。
+- 性能（R=32，同口径）：
+
+  | `kNK` | s2 top50 mean | 相对基线 |
+  |---:|---:|---:|
+  | 1（基线） | 767.9 | — |
+  | 2 | 1003.6 | +31% |
+  | 4 | 1419.1 | +85% |
+  | 8 | 1970.2 | +157% |
+
+  s1（`kNK=8`）：TPR32 = 1246.8（+157%）、TPR128 = 979.1（win=128 未启用 K 切，
+  ≈基线）、TPR256 = 1690.5（≈基线）。
+- **否决**：K 切随段数单调变差。根因（实测 + 分析）：
+  1. **每窗任务数 = NS×NK 把窗口「独占」整张 grid**（32 任务/窗），窗口由基线
+     「8 窗并行」退化为「1 窗串行」；窗内 pull→各段→reduce→L2 的串行段无法被
+     其它窗的延迟掩盖。`kNK` 越小任务/窗越少、并行窗越多，回退越小 —— 但始终为负。
+  2. **FP32 部分和 atomicAdd 流量**：每 `(e,w,slice)` 写 `count×kL1SliceCols×4B`
+     ×`kNK` 次（另加清零/读回）。小窗（`count≤48`）下这是不可忽略的 HBM 原子流量。
+  3. 块级 L1 max/min：804900 rank28 由 K 切的 2.22×（min 212k / max 472k）
+     **未收敛到目标 ≲1.2×**：段代价仍 ∝ 窗口行数，且 FCFS 按窗连续发牌。
+- 结论：**未接近 400µs**；两阶段均默认关（`R19_BLOCK_KSPLIT=0` 编译期消除，
+  关时 `check --all` 762/762、s1/s2 与基线逐字一致）。
 
 ## torch 层（pybind + Python 包，可安装 wheel）
 

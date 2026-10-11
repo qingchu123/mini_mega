@@ -741,3 +741,46 @@ local=1984B —— 拆分确实降低了单核 local/栈，但两者仍 **regs=2
 （中档 −6.8%、TK −2.6%，无档回退 >2%）。溢出的剩余部分在 `r24_l2_big`（noinline 自包含，
 acc=128 结构性），强行再降（降 acc/拆 kernel）已证净回退（`reg_spill.md` §10）。
 可用 `-DR19_L1BIG_ISO=__forceinline__` / `-DR19_L2BODY_ISO=__forceinline__` 回退。
+
+## [261012_03_04] `-s2` 细粒度派发（NS=8 / 跨 block K 切）— 净回退，默认关闭
+
+> 动机：`R19_BLOCK_LPT`（NS=4）因任务量化无法压低最忙 block 上界（见 README
+> 「块级代价感知 LPT」）。尝试两种更细粒度派发，目标 `-s2 top50` 765→~400µs。
+> 改动仅 `src/compute.cuh` / `src/compute_big.cuh`；开关默认关（关时逐字等价基线）。
+> 口径：`test/mybench -R 32`；s1 = `-s1 tprs 32,128,256 -nodes 3 -replays 2`，
+> s2 = `-s2 top50 -nodes 20 -replays 3`，us_mean（跨 rank）。
+
+**Stage 1：N 切 NS=8**（`-DKNSLICE_OVERRIDE=8`，±`-DR19_BLOCK_LPT=1`）
+
+| 指标 | 基线 NS=4 | NS=8 | NS=8+LPT |
+|---|---:|---:|---:|
+| s1 TPR32 | 485.4 | 743.6 | 762.9 |
+| s1 TPR128 | 946.1 | 1208.8 | 1225.0 |
+| s1 TPR256 | 1678.6 | 2239.6 | 2277.8 |
+| s2 top50 mean | 767.9 | 1086.8 | — |
+
+→ s1 +28~53%、s2 +42%，**否决**（N 切使 A 装载 ×N + 协议任务 ×2）。
+
+**Stage 2：跨 block K 切**（`-DR19_BLOCK_KSPLIT=1`，`win_cap≤64` 启用）
+
+任务 = `(e,w,slice,kseg)`，`raw_tasks=s_cum[kEPR]*kNSlice*kNK`；owner(kseg0) 跑
+pull/staging/分片旗/L2/tail，其余段只做 K 部分和（FP32 atomicAdd → `l1_partial`，
+`l1_part_cnt` 判最后段 → `r19_l1_reduce` → 发 `l1_prog`）。
+
+| `kNK` | s2 top50 mean | s1 TPR32 | s1 TPR128 | s1 TPR256 |
+|---:|---:|---:|---:|---:|
+| 1（基线） | 767.9 | 485.4 | 946.1 | 1678.6 |
+| 2 | 1003.6 | — | — | — |
+| 4 | 1419.1 | — | — | — |
+| 8 | 1970.2 | 1246.8 | 979.1 | 1690.5 |
+
+块级 L1（804900 / rank28）：基线满窗块 ~383k–416k；K 切(kNK=8) min 212k /
+max 472k（ratio **2.22×**，未收敛 ≲1.2×）。
+
+→ K 切随段数单调变差，**否决**。根因：①每窗 NS×NK 个任务把窗口独占整张 grid，
+由基线「8 窗并行」退化为「1 窗串行」，窗内 pull→段→reduce→L2 的串行段无法被其它
+窗掩盖（kNK 越小回退越小）；②FP32 部分和 atomicAdd 流量在小窗下不可忽略；
+③段代价仍 ∝ 行数 + FCFS 按窗连发，块级未收敛。
+
+**正确性**：关 `check --all` **762/762**（79s）；开 `check --all` **762/762**（119s）；
+`check --smoke` 开/关均 8/8 PASS（<10s）。**未接近 400µs**；两开关保持默认关。

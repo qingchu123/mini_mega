@@ -116,6 +116,20 @@ struct MegaArgs {
 #ifndef R19_BLOCK_LPT
 #define R19_BLOCK_LPT 0
 #endif
+// [BALANCE·docs/20 §4.2b] 跨 block K 切（默认 0 = 关闭，行为逐字不变）：
+//   把每个 (e,w,slice) 的 L1 再沿 K=H 切成 kNK 段，跨 block 派发
+//   （raw_tasks = s_cum[kEPR]*kNSlice*kNK）。每段只算自己 K 段的 gate/up 部分和，
+//   以 FP32 atomicAdd 累加到 l1_partial[slot][slice]；l1_part_cnt[slot][slice]
+//   由各段 atomicAdd，最后一段（owner 之外）触发 r19_l1_reduce（SwiGLU→FP8）
+//   并发布 l1_prog。pull/切片旗/L1 回写/L2/tail/COMBINE 每个 (e,w,slice) 仅由
+//   owner（kseg==0）执行一次，其余段只做 K 部分和 —— 严禁每段都跑协议。
+//   仅当 win_cap <= R19_BLOCK_KSPLIT_WINMAX 时启用（长尾/TK 小窗），大窗走原路径。
+#ifndef R19_BLOCK_KSPLIT
+#define R19_BLOCK_KSPLIT 0
+#endif
+#ifndef R19_BLOCK_KSPLIT_WINMAX
+#define R19_BLOCK_KSPLIT_WINMAX 64
+#endif
 #if CM_SKIP_GEMM || CM_SKIP_L1
 #define CM_L1_GATE (false)
 #else
@@ -647,7 +661,7 @@ __device__ __forceinline__ void dispatch_pull_body(
     int* s_count = reinterpret_cast<int*>(smem_raw);   // EPR：每专家总行数
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）
     int* s_prefix = s_cum + kEPR + 1;                  // EPR*(R+1)：全 experts src 前缀
-    __shared__ int s_task, s_expert, s_window, s_count_w, s_slice;
+    __shared__ int s_task, s_expert, s_window, s_count_w, s_slice, s_kseg;
     __shared__ unsigned s_epoch;
     // prefix_ptr 非空时用独立前缀表缓冲（与 task_setup_body 的 prefix_ptr 对齐）
     const int* prefix = (prefix_ptr != nullptr)
@@ -671,7 +685,25 @@ __device__ __forceinline__ void dispatch_pull_body(
         }
     }
     __syncthreads();
+#if R19_BLOCK_KSPLIT
+    // [BALANCE·docs/20 §4.2b] 跨 block K 切：任务 = (e,w,slice,kseg)，共 x kNk。
+    //   运行时再按 win_cap + fragment 可用门控（大窗/无 frag 走原整段 L1）：
+    //   ksw 为真时 raw_tasks 含 kNK，否则退化回 kNSlice（解码按 ksw 分支）。
+    const int mt_total_ks = (win_cap + 15) >> 4;
+#if defined(CM_NO_FRAGALL)
+    const bool frag_ok_ks = false;
+#else
+    const bool frag_ok_ks = (frag_a != nullptr) && (frag2 != nullptr) &&
+                            (a->l1_k_out > 0) && (mt_total_ks > 0) &&
+                            (win_cap > 0);
+#endif
+    const bool ksw = (win_cap <= R19_BLOCK_KSPLIT_WINMAX) && (kNK > 1) &&
+                     frag_ok_ks;
+    const int kseg_n = ksw ? kNK : 1;
+    const int raw_tasks = s_cum[kEPR] * kNSlice * kseg_n;
+#else
     const int raw_tasks = s_cum[kEPR] * kNSlice;
+#endif
     // merge 机制已去除：固定 merge=1（不粗化），nslice_eff=kNSlice。
     const int merge = 1;
     const int nslice_eff = kNSlice / merge;
@@ -693,7 +725,11 @@ __device__ __forceinline__ void dispatch_pull_body(
         if (lpt_ok) {
             // 1) 每任务代价 = min(count_e - w*win_cap, win_cap)（∝ L1/L2 行数）
             for (int i = tid; i < raw_tasks; i += (int)blockDim.x) {
+#if R19_BLOCK_KSPLIT
+                const int tw = i / (nslice_eff * kseg_n);
+#else
                 const int tw = i / nslice_eff;
+#endif
                 int lo = 0, hi = kEPR - 1;
                 while (lo < hi) {
                     const int mid = (lo + hi) >> 1;
@@ -787,8 +823,17 @@ __device__ __forceinline__ void dispatch_pull_body(
 #endif
             if (s_task < total_tasks) {
                 // [R35] 物理任务 → 窗号/物理 slice（每任务覆盖 merge 个逻辑 slice）
+                // [BALANCE·docs/20 §4.2b] K 切开启时任务再含 kseg（尾维）。
+#if R19_BLOCK_KSPLIT
+                const int base = s_task / kseg_n;
+                const int kseg = s_task % kseg_n;
+                const int tw = base / nslice_eff;
+                const int slice = base % nslice_eff;
+                s_kseg = kseg;
+#else
                 const int tw = s_task / nslice_eff;
                 const int slice = s_task % nslice_eff;
+#endif
                 s_slice = slice;
                 int lo = 0, hi = kEPR - 1;
                 while (lo < hi) {
@@ -822,6 +867,11 @@ __device__ __forceinline__ void dispatch_pull_body(
         const int count = s_count_w;
         const int slice = s_slice;
         const unsigned epoch = s_epoch;
+        // [BALANCE·docs/20 §4.2b] K 段号（未启用时为 0）。
+        int kseg = 0;
+#if R19_BLOCK_KSPLIT
+        if (ksw) kseg = s_kseg;
+#endif
         // [L1L2-SPLIT] 旗槽（ring，容量 EPR*ring）与数据槽（拆分下每窗口独占）：
         //   slot_win = ceil(kMaxTPR/win_cap) 覆盖 count<=kMaxTPR 的全部窗口；
         //   Both 下两者相同（e*ring + w%ring），行为逐字不变。
@@ -832,11 +882,11 @@ __device__ __forceinline__ void dispatch_pull_body(
         const int* pfx = s_prefix + e * (R + 1);
         // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
         if (count > kM) {
-            r19_big_task<kPhase>(S, task, e, w, count, slice,
+            r19_big_task<kPhase>(S, task, e, w, count, slice, kseg,
                                                  epoch, data_slot, pfx,
                                                  a_smem, b_smem);
         } else {
-            r19_small_task<kPhase>(S, task, e, w, count, slice,
+            r19_small_task<kPhase>(S, task, e, w, count, slice, kseg,
                                              epoch, data_slot, pfx,
                                              a_smem, b_smem);
         }
@@ -847,6 +897,9 @@ __device__ __forceinline__ void dispatch_pull_body(
         if constexpr (kPhase == MegaPhase::Both) {
             h_pub = (s_count[e] > (w + ring) * win_cap) || n_reps > 1;
         }
+        // [BALANCE·docs/20 §4.2b] K 切下仅 owner（kseg==0）发布 l2_done：每窗口
+        //   仍恰好 nslice_eff 次，ring 门 target 语义不变；非 owner 不发布。
+        if (kseg != 0) h_pub = false;
         if (h_pub) __threadfence();
         if (tid == 0) {
             if (h_pub)
