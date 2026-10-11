@@ -692,37 +692,21 @@ template <MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void dispatch_pull_body(
         const MegaArgs* a, int cycle, uint8_t* a_smem = nullptr,
         uint8_t* b_smem = nullptr, unsigned long long* ctr = nullptr) {
-    const uint8_t* self = a->self;
-    const ranks_data* remote = &a->unk->rd;
-    uint8_t* const* peer_bases = a->peer_bases;
-    const int R = a->R, rank = a->rank, win_cap = a->win_cap;
-    const int pool_stride = a->win_cap, tbl_cap = a->slot_capacity;
-    const int k_in = kHidden, topk = kTopk, ring = kRing;
-    const int64_t prefix_off = a->prefix_off, x_off = a->x_off;
-    const int64_t weights_off = a->weights_off, pool_off = a->pool_off;
-    const int64_t w_off = a->w_off, meta_off = a->meta_off;
-    uint8_t* pool_ptr = a->pool_ptr;
+    // [S-SHRINK] 只保留循环/派生所需局部；其余纯 a-> 直接读 smem（任务体经 S.a）。
+    const uint8_t* self = a->self;                 // pool_base / prefix 回退
+    const int R = a->R, win_cap = a->win_cap;      // s_prefix / 窗口前缀
+    const int ring = kRing;
+    uint8_t* pool_ptr = a->pool_ptr;               // pool_base
     uint32_t* bar_flags = a->rwk->lf.bar[cycle];
     const int64_t task_counter_idx = a->task_counter_idx;
     const int64_t l2_done_idx = a->l2_done_idx;
     const int64_t task_ready_idx = a->task_ready_idx;
-    const int64_t slice_flags_idx = a->slice_flags_idx;
-    const int64_t l1_prog_idx = a->l1_prog_idx;
     int* out_processed = a->rwk->lf.out_processed;
     int* dbg = a->rwk->lf.dbg;
     const int max_spins = a->max_spins;
-    const uint8_t* w1 = a->w1;
-    const int l1_n_total = 2 * a->l1_k_out, l1_block_n = kL1BlockN;
-    const int l1_k_out = a->l1_k_out;
-    uint8_t* ffn_hidden = a->ffn_hidden;
     float* l1_chk = a->rwk->lf.l1_chk;
-    const uint8_t* w2 = a->w2;
-    uint16_t* l2_out = a->l2_out;
-    const int l2_k_out = a->l2_k_out;
     float* l2_chk = a->rwk->lf.l2_chk;
     const int rep = 0, n_reps = 1;
-    const int64_t combine_rows_off = a->combine_rows_off;
-    unk_data* const* unk_peers = a->unk_peers;
     const uint64_t epoch = (uint64_t)a->rwk->lf.current_time[0][1];
     const int* prefix_ptr = a->prefix_ptr;
     unsigned long long* pt = a->rwk->lf.pre_ticks;
@@ -737,11 +721,10 @@ __device__ __forceinline__ void dispatch_pull_body(
     // prefix_ptr 非空时用独立前缀表缓冲（与 task_setup_body 的 prefix_ptr 对齐）
     const int* prefix = (prefix_ptr != nullptr)
         ? prefix_ptr
-        : reinterpret_cast<const int*>(self + prefix_off);
+        : reinterpret_cast<const int*>(self + a->prefix_off);
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
-    (void)rank;   // 预留：本 rank 号（当前寻址全部经 self/peer_bases 完成）
     (void)warp; (void)lane;
     // 相位计时（可选，默认 nullptr 不改变原行为）：仅 block0 的首个任务由 tid0 记录
     const bool kTick = (pt != nullptr) && (blockIdx.x == 0) && (tid == 0);
@@ -784,7 +767,7 @@ __device__ __forceinline__ void dispatch_pull_body(
     // [A-RWK] pool 基址：显式传入（普通显存）或回退对称区 self+pool_off
     S.pool_base = (pool_ptr != nullptr)
                       ? pool_ptr
-                      : const_cast<uint8_t*>(self) + pool_off;
+                      : const_cast<uint8_t*>(self) + a->pool_off;
     S.bar_flags = bar_flags;
     S.dbg = dbg;
     S.l1_chk = l1_chk;
@@ -799,7 +782,7 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.frag_all = false;
 #else
     S.frag_all = (frag_a != nullptr) && (frag2 != nullptr) &&
-                 (l1_k_out > 0) && (mt_total > 0) && (win_cap > 0);
+                 (a->l1_k_out > 0) && (mt_total > 0) && (win_cap > 0);
 #endif
     S.epoch = epoch;
     S.merge = merge;
