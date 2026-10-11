@@ -873,7 +873,26 @@ __device__ __forceinline__ void r91_small_l1_big_opt(
         atomicAdd(checksum, acc_chk);
 }
 
-#include "mega_l1.cuh"
+__device__ __forceinline__ void mega_l1_gemm(
+        uint8_t* s_mem, const uint8_t* fbase, int mt_total, const uint8_t* w1,
+        int expert, int count, int k_hidden, int n_total, int block_n,
+        int lane, int warp, int nwarps, float* checksum,
+        int n_group_begin, int n_group_count, uint8_t* ffn_out, uint8_t* ffn2,
+        int out_col_base, int k_out) {
+    if (count <= 0) return;
+#define MEGA_L1_CALL(MT)                                                       \
+    r91_small_l1_big_opt<MT, 2, 2, true, MT>(                                  \
+        s_mem, fbase, mt_total, w1, expert, 0, count, k_hidden, n_total,       \
+        block_n, lane, warp, nwarps, checksum, n_group_begin, n_group_count,   \
+        ffn_out, ffn2, out_col_base, k_out)
+    if (count <= 16) MEGA_L1_CALL(1);
+    else if (count <= 32) MEGA_L1_CALL(2);
+    else if (count <= 48) MEGA_L1_CALL(3);
+    else if (count <= 64) MEGA_L1_CALL(4);
+    else MEGA_L1_CALL(8);
+#undef MEGA_L1_CALL
+}
+
 
 // ---------------------------------------------------------------------- L2 --
 template <int kMT, int kPF, int kBatch>
@@ -1531,7 +1550,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
         if ((kFragNew && CM_FRAG_L2) && pool_slot != 0)
             ffn_slot = nullptr;
         // [MEGA_L1] 统一 L1 入口（r91）
-        mega_l1(a_smem, fbase, S.mt_total, S.w1, e, count, S.k_in,
+        mega_l1_gemm(a_smem, fbase, S.mt_total, S.w1, e, count, S.k_in,
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
                 S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
     }   // end if (CM_L1_GATE)
@@ -1755,7 +1774,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         }
         if ((kFragNew && CM_FRAG_L2) && pool_slot != 0) ffn_slot = nullptr;
         // [MEGA_L1] 统一 L1 入口（r91）
-        mega_l1(a_smem, fbase, S.mt_total, S.w1, e, count, S.k_in,
+        mega_l1_gemm(a_smem, fbase, S.mt_total, S.w1, e, count, S.k_in,
                 S.l1_n_total, S.l1_block_n, lane, warp, kComputeWarps,
                 S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.l1_k_out);
     }   // end if (CM_L1_GATE)
