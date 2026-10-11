@@ -106,17 +106,17 @@ int main() {
     std::printf("r19_l2_big 单block扫描 K=I=2048 N=6组x256 block_n=256 8warp grid=1 "
                 "REP=%d (us/launch)\n", REP);
     std::printf("%-5s %9s %9s %9s %9s %9s %9s %9s\n", "M",
-                "2,1,3", "3,1,3", "4,1,3", "4,2,3", "6,1,3", "3,2,3", "6,1,6");
+                "4,1,3", "4,2,3", "4,4,3", "4,2,4", "5,2,3", "8,2,2", "3,2,3");
 
     for (int M : Ms) {
         int t[7];
-        t[0] = bench(k_l2<2,1,3>, M, kGL2);
-        t[1] = bench(k_l2<3,1,3>, M, kGL2);
-        t[2] = bench(k_l2<4,1,3>, M, kGL2);
-        t[3] = bench(k_l2<4,2,3>, M, kGL2);
-        t[4] = bench(k_l2<6,1,3>, M, kGL2);
-        t[5] = bench(k_l2<3,2,3>, M, kGL2);
-        t[6] = bench(k_l2<6,1,6>, M, kGL2);
+        t[0] = bench(k_l2<4,1,3>, M, kGL2);
+        t[1] = bench(k_l2<4,2,3>, M, kGL2);
+        t[2] = bench(k_l2<4,4,3>, M, kGL2);
+        t[3] = bench(k_l2<4,2,4>, M, kGL2);
+        t[4] = bench(k_l2<5,2,3>, M, kGL2);
+        t[5] = bench(k_l2<8,2,2>, M, kGL2);
+        t[6] = bench(k_l2<3,2,3>, M, kGL2);
         std::printf("%-5d %9d %9d %9d %9d %9d %9d %9d\n",
                     M, t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
     }
@@ -126,9 +126,9 @@ int main() {
     std::printf("%-5s %-16s %9s\n", "M", "variant", "us");
     for (int M : {16, 32}) {
         std::printf("%-5d %-16s %9d\n", M, "l2_body<2,1,6>", bench(k_l2small<2,1,6>, M, kGL2));
-        std::printf("%-5d %-16s %9d\n", M, "l2_body<2,2,3>", bench(k_l2small<2,2,3>, M, kGL2));
+        std::printf("%-5d %-16s %9d\n", M, "r19_l2<1,1,6>",  bench(k_l2<1,1,6>, M, kGL2));
         std::printf("%-5d %-16s %9d\n", M, "r19_l2<2,1,3>",  bench(k_l2<2,1,3>, M, kGL2));
-        std::printf("%-5d %-16s %9d\n", M, "r19_l2<2,2,3>",  bench(k_l2<2,2,3>, M, kGL2));
+        std::printf("%-5d %-16s %9d\n", M, "r19_l2<1,1,3>",  bench(k_l2<1,1,3>, M, kGL2));
     }
 
     // N 缩放（M=64）
