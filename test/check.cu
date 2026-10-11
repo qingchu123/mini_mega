@@ -864,8 +864,8 @@ int main(int argc, char** argv) {
     const char* fwin = std::getenv("MT_FORCE_WIN");   // 调试：强制某个 win，用于最小复现
     for (auto& p : plan) {
         p.first.win = mt::choose_win_cap_counts(p.first.per_expert, max_tokens);
-        // [MT_FORCE_WIN] 扩展：原仅 TK 用例；对拍需要均衡用例指定同一 win，故两类都生效
-        if (fwin && p.first.kind == 1) p.first.win = std::atoi(fwin);
+        // [MT_FORCE_WIN] 调试：对所有用例（含均衡）强制同一 win（多窗/多波复现）
+        if (fwin) p.first.win = std::atoi(fwin);
         win_global = std::max(win_global, p.first.win);
     }
     Env e;
@@ -896,6 +896,7 @@ int main(int argc, char** argv) {
     {
         Spec warm = mt::balanced_spec(R, 16);
         warm.win = mt::choose_win_cap_counts(warm.per_expert, e.geo.max_tokens);
+        if (const char* fw = std::getenv("MT_FORCE_WIN")) warm.win = std::atoi(fw);
         mt::Routes wr = mt::balanced_routes(R, 16);
         std::vector<float> y;
         run_eager(e, warm, wr, &y);
