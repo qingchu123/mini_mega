@@ -285,7 +285,7 @@ static int gs_seq_rank0(const mt::Routes& routes, int R, int win, int ex) {
             if (v == gex) ++c;
         cg[ge] = c;
     }
-    std::vector<int> ge_list(mxk::kGsMaxWin), gw_list(mxk::kGsMaxWin);
+    std::vector<int> ge_list(mxk::kGsMemberCap), gw_list(mxk::kGsMemberCap);
     // 与设备同门控：组倾斜（max·kGE > 3·Σ）才启用 gs 重分配；否则基线槽。
     int mx = 0;
     long long sum = 0;
@@ -293,9 +293,10 @@ static int gs_seq_rank0(const mt::Routes& routes, int R, int win, int ex) {
         if (cg[i] > mx) mx = cg[i];
         sum += cg[i];
     }
-    if (!((sum > 0) && ((long long)mx * kGE > 3LL * sum))) return -2;
+    if (!((sum > 0) && ((long long)mx * kGE > (long long)MX_GS_SKEW_NUM * sum)))
+        return -2;
     const int n = mxk::gs_schedule_member(cg, win, /*member=*/0, ge_list.data(),
-                                          gw_list.data(), mxk::kGsMaxWin);
+                                          gw_list.data(), mxk::kGsMemberCap);
     const int target_ge = mxk::gs_ge_of_expert(R, ex);
     for (int i = 0; i < n; ++i)
         if (ge_list[i] == target_ge && gw_list[i] == 0) return i;

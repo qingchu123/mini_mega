@@ -696,14 +696,14 @@ __device__ __forceinline__ void dispatch_pull_body(
     //   把本组 32 专家的窗口 LPT 分配给组内 4 个 rank；本 rank 的窗口列表存 smem。
     //   均衡（不倾斜）时保持逐字基线路径，避免为均衡负载引入远端读开销。
     const bool gs_cap = MX_GROUP_SCHED && (a->R % kGroupRanks == 0) &&
-                        (mxk::gs_nGroups(a->R) >= 2);
+                        (mxk::gs_nGroups(a->R) >= 1);
     bool gs_on = false;
 #if MX_GROUP_SCHED
     const int gs_grp = mxk::gs_group_of_rank(a->R, a->rank);
     const int gs_mem = mxk::gs_member_of_rank(a->R, a->rank);
     int* s_gscount = s_prefix + kGE * (a->R + 1);
     int* s_ge = s_gscount + kGE;
-    int* s_gw = s_ge + mxk::kGsMaxWin;
+    int* s_gw = s_ge + mxk::kGsMemberCap;
     if (gs_cap) {
         // 组倾斜判定：并行统计本组 4 个 owner 的 32 专家总计数（1024 次 FG 读，
         //   blockDim 线程并行 + smem atomicAdd；均衡负载下这是唯一额外开销）。
@@ -717,6 +717,7 @@ __device__ __forceinline__ void dispatch_pull_body(
             const int o = mxk::gs_rank_of_member(a->R, gs_grp, m);
             const int v =
                 (int)a->unk_peers[o]->rd.expert_recv_counts[cycle][r][le];
+            s_prefix[ge * (a->R + 1) + r] = v;   // 暂存原值，供后续原地建前缀
             atomicAdd(&s_gscount[ge], v);
         }
         __syncthreads();
@@ -727,29 +728,29 @@ __device__ __forceinline__ void dispatch_pull_body(
                 if (s_gscount[i] > mx) mx = s_gscount[i];
                 sum += s_gscount[i];
             }
-            s_gsskew = (sum > 0) && ((long long)mx * kGE > 3LL * sum);
+            s_gsskew = (sum > 0) &&
+                       ((long long)mx * kGE > (long long)MX_GS_SKEW_NUM * sum);
         }
         __syncthreads();
         gs_on = s_gsskew != 0;
         if (gs_on) {
-            // 组内前缀：s_prefix[ge*(R+1)+src] = Σ_{r'<src} owner(ge) 收行数
-            //   （仅 gs 激活时构建；4 rank 读同一批 owner ⇒ 分配全局一致）。
-            for (int i = tid; i < kGE; i += (int)blockDim.x) {
-                const int m = i / kEPR;
-                const int le = i % kEPR;
-                const int o = mxk::gs_rank_of_member(a->R, gs_grp, m);
+            // 原地把暂存的原值转成前缀和（s_prefix[ge*(R+1)+src]=Σ_{r'<src} 计数）；
+            //   无需再读 peer FG（省一遍串行远端读）。
+            for (int ge = tid; ge < kGE; ge += (int)blockDim.x) {
                 int c = 0;
                 for (int r = 0; r < a->R; ++r) {
-                    s_prefix[i * (a->R + 1) + r] = c;
-                    c += (int)a->unk_peers[o]->rd.expert_recv_counts[cycle][r][le];
+                    const int v = s_prefix[ge * (a->R + 1) + r];
+                    s_prefix[ge * (a->R + 1) + r] = c;
+                    c += v;
                 }
-                s_prefix[i * (a->R + 1) + a->R] = c;
+                s_prefix[ge * (a->R + 1) + a->R] = c;
+                s_gscount[ge] = c;
             }
             __syncthreads();
             // 单线程桶式 LPT（无 scratch，O(cost × 窗口数)，开销可忽略）。
             if (tid == 0)
                 s_nwin = mxk::gs_schedule_member(s_gscount, a->win_cap, gs_mem,
-                                                 s_ge, s_gw, mxk::kGsMaxWin);
+                                                 s_ge, s_gw, mxk::kGsMemberCap);
             __syncthreads();
         }
     }

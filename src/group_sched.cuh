@@ -21,6 +21,35 @@
 
 namespace mxk {
 
+// [调优] 组倾斜判定阈值：max·kGE > MX_GS_SKEW_NUM·Σ 时启用 gs（默认 3，与 win_select
+//   同族）。=0 表示恒启用（均衡组也重分配，仅用于实验）。
+#ifndef MX_GS_SKEW_NUM
+#define MX_GS_SKEW_NUM 3
+#endif
+// [调优] LPT 代价模型：0=ceil(rows/16)（默认）；1=rows（更细粒度）。
+#ifndef MX_GS_COST_MODEL
+#define MX_GS_COST_MODEL 0
+#endif
+
+__host__ __device__ inline int gs_cost_of(int rows) {
+#if MX_GS_COST_MODEL == 1
+    return rows;
+#elif MX_GS_COST_MODEL == 2
+    return (rows + 15) / 16 + 4;   // 每窗固定开销项（实验）
+#else
+    return (rows + 15) / 16;
+#endif
+}
+__host__ __device__ inline int gs_max_cost(int win_cap) {
+#if MX_GS_COST_MODEL == 1
+    return win_cap;
+#elif MX_GS_COST_MODEL == 2
+    return (win_cap + 15) / 16 + 4;
+#else
+    return (win_cap + 15) / 16;
+#endif
+}
+
 // 组内窗口任务（window 粒度；4 个 slice 共享同一窗口的 pool/协议）。
 struct GsWin {
     int ge;     // 组内专家序 [0, kGE)
@@ -121,6 +150,13 @@ __host__ __device__ inline void gs_assign(const GsWin* t, int n, int* member_of,
 // 窗口数上界（用于 smem/scratch 下界）：ge 数 × max(1, ceil(kMaxTPR/16))（win 下界 16）。
 constexpr int kGsMaxWin = kGE * ((kMaxTPR + 15) / 16);
 
+// [MX_GROUP_SCHED] 单 rank（member）窗口列表容量上界：LPT 均衡后各 member 窗口数
+//   ≈ 组总窗口/kGroupRanks + 单个大专家窗口数；兼顾 kGroupRanks=32（全组）时 smem 受限。
+#ifndef MX_GS_MEMBER_CAP
+#define MX_GS_MEMBER_CAP 512
+#endif
+constexpr int kGsMemberCap = MX_GS_MEMBER_CAP;
+
 // 桶式无 scratch LPT：直接算出 member 名下的窗口序列（按分配顺序 = cost 降序、
 //   同 cost 内 (ge,w) 升序，与 gs_enum+gs_sort+gs_assign 等价）。
 //   cost 只取 [1, ceil(win/16)]，逐 cost 降序扫描全部窗口即可，无需暂存全部任务。
@@ -130,7 +166,7 @@ __host__ __device__ inline int gs_schedule_member(
         int cap) {
     long long load[kGroupRanks];
     for (int m = 0; m < kGroupRanks; ++m) load[m] = 0;
-    const int maxcost = (win_cap + 15) / 16;
+    const int maxcost = gs_max_cost(win_cap);
     int nout = 0;
     for (int cost = maxcost; cost >= 1; --cost) {
         for (int ge = 0; ge < kGE; ++ge) {
@@ -140,7 +176,7 @@ __host__ __device__ inline int gs_schedule_member(
                 int rows = c - w * win_cap;
                 if (rows > win_cap) rows = win_cap;
                 if (rows < 0) rows = 0;
-                if ((rows + 15) / 16 != cost) continue;
+                if (gs_cost_of(rows) != cost) continue;
                 const int owner = ge / kEPR;
                 long long minl = load[0];
                 for (int m = 1; m < kGroupRanks; ++m)

@@ -1704,3 +1704,33 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
   收益被抵消；默认 4。
 - 未达 <500µs：wall 由最忙 block 的**单个大窗任务**决定，rank 级重分配有上限；后续需配合
   更细粒度切片或 K 切（`R19_BLOCK_KSPLIT`）进一步缩短单任务。
+
+## [261013_00_16] agent/peerbuf/stage3b：组内均衡调参扫描 — `-s2 top50` 564.6µs（group-4 最优），550µs 目标需更细粒度单任务
+
+> 目标：在 stage3（571µs）基础上继续压低 `-s2 top50`。本轮做参数扫描 + 廉价优化，
+> 默认 `MX_GROUP_SCHED=0` 逐字不变；以下均为 gs 路径（`-DMX_GROUP_SCHED=1`）。
+
+### 1. 改动（默认保持基线）
+- 组倾斜门控阈值参数化 `MX_GS_SKEW_NUM`（默认 3）；代价模型 `MX_GS_COST_MODEL`
+  （0=ceil(rows/16) 默认；1=rows；2=+4 固定项）；单 rank 窗口表容量 `MX_GS_MEMBER_CAP`。
+- 组计数探测的并行读**顺带缓存原值**，前缀和改为 smem 原地转换（省一遍串行远端读）。
+- `gs_cap` 放宽到 `nGroups>=1`（支持 `-DMX_GROUP_RANKS=32` 全组实验）。
+
+### 2. 扫描结果（`-s2 top50 -replays 3`，mean µs）
+
+| 配置 | mean |
+|---|---:|
+| **stage3b 默认（group-4, cost=ceil16, skew=3）** | **564.6** |
+| skew 阈值 1 | 569.4 |
+| cost=rows | 1104（回退） |
+| cost=ceil16+4 | 611（回退） |
+| `MX_GROUP_RANKS=8`（组 8，权重 2.75GB） | 598 |
+| `MX_GROUP_RANKS=32`（全组，权重 10GB） | 948（权重体积致 cache/TLB 回退，s1 也大退） |
+| 强制 win=64（runtime） | 578 |
+
+### 3. 结论
+- **group-4 为最优组规模**；组越大权重体积越大，远端/缓存代价压过均衡收益。
+- 550µs 在当前「组内 4-rank 窗口重分配」框架下未达成：模拟显示组 4 最大负载仍为理想 2.2×，
+  wall 由最忙 block 的**单个大窗（≤64 行）任务**决定；rank 级重分配对该单任务无效。
+- 跨组均衡被**权重复制边界**阻断（helper 只能读本组 w1g/w2g；读远端/全量权重均回退）。
+- 后续需**缩短单任务**：M 维切分（同窗多 block 分摊行）或 K 切（`R19_BLOCK_KSPLIT`）与 gs 组合。
