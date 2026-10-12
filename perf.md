@@ -906,3 +906,64 @@ s2 的 win_global 由 128 降到 64，额外收紧 ffn/l2 缓冲。
 收益来自：① 去掉旧模型在倾斜负载误选的 128（7 例全负收益）；② ring 下限避免
 最忙专家的串行台阶。距逐 case oracle（729.7）仍差 2.9%，该空间需关键路径级信息，
 非 `c_e` 聚合量可廉价预测。**距终极 400µs 仍远**，本任务仅覆盖 win 维度。
+
+## [261012_09_40] 方向1：B（权重）smem 异步双缓冲（`R24_BSMEM_B`，默认关）— 中性偏负
+
+> 动机：诊断（同会话消融）显示 `-s2 top50` 中 **B 装载裸露 ≈211µs（28%）**
+> （`R24_DIAG_NOB` 755.5→544.1，nodes=3 replays=1），L1≈352µs/L2≈172µs，
+> 聚合 MMA 利用率仅 ~2.5%（延迟/同步受限）。目标：把 B 也走 smem 异步双缓冲以
+> 隐藏其装载延迟，向 400µs 靠近。
+> 口径：`test/mybench -R 32`；s1 = `-s1 tprs 32,128,256 -nodes 3 -replays 2`，
+> s2 = `-s2 top50 -replays 3`，us_mean（跨 rank）。改动仅 `src/compute_big.cuh`、
+> `src/kernel.cuh`。开关默认关（关时逐字等价基线）。
+
+### 1. 实现（`src/compute_big.cuh`）
+
+- `r24_l1_big` / `r24_l2_big` 增加编译期模板参 `int kBsmB=0`（环深）。`kBsmB>0` 时：
+  - 新 `r24_issue_b<kBatch>`（每 kstep 每线程发 `kBatch` 个 16B `__builtin_mxc_ldg_b128_bsm`，
+    源地址与 `r19_load_b16` 逐字一致）；`r24_lds_b<kBatch>` 从 smem LDS.128 读 B。
+  - B 环 smem 紧接 A 双缓冲之后（实例偏移 `2*kMT*kKS*512`）；`kABSharedBytes` 默认
+    保持 A 双缓冲 64KB 不变、开启时放大到 112KB（med L1 `<3,16,4>` = 48KB A+64KB B）。
+  - 分档：仅 `win_cap<=64`（tk/长尾）的 r24 实例传 `kBsmB=R24_BRING(=2)`；均衡大档
+    （`count>64`，MT8）保持直装。
+- **关键坑（硬件队列）**：`ldg_b128_bsm` 的拷贝计入 **gvmcnt**，**不是 bsmcnt**。
+  `arrive(4096)=bsmcnt(0)` 等不到 B → 早期版本出现非确定性 NaN/错值（`check` 间歇 FAIL）。
+  正解：`R24_WAIT_BSM_N(N) = __builtin_mxc_arrive(64 + N) = gvmcnt(N)`；标准段允许
+  「环深-1」个 kstep 的 B 在飞、尾部 `gvmcnt(0)` 全等。A 的可见性仍由 stage 顶
+  `bsmcnt(0)+__syncthreads()` 保证。（`mxobjdump` 反汇编确认 `arrive` 的计数器选择位。）
+
+### 2. 正确性
+
+- 默认关：`check --all` **762/762 PASS**（76.7s）、`check --smoke` **8/8 PASS**（<10s），
+  s1/s2 与基线逐字一致。
+- 开启（`-DR24_BSMEM_B=1`）：`check --all` **762/762 PASS**（77.8s）、`check --smoke`
+  **8/8 PASS**（<10s，多次复跑稳定）。
+
+### 3. 性能（同会话基线 s2=749.5）
+
+| 场景 | 默认（直装 B） | B-smem 环2 | 变化 |
+|---|---:|---:|---:|
+| **s2 top50 mean** | **749.5** | **763.1** | **+1.8%** |
+| s1 TPR32 | 482.1 | 483.5 | +0.3% |
+| s1 TPR128 | 947.4 | 967.9 | +2.2% |
+| s1 TPR256 | 1686.2 | 1681.0 | −0.3% |
+
+`s2` 微回退 >5% 阈值内；环深 1（全等，无预取）= 864µs（更差，证明预取有效但被开销抵消）。
+
+### 4. B 延迟隐藏诊断（`R24_DIAG_NOB`，nodes=3 replays=1）
+
+| 口径 | base | NOB | B 暴露 |
+|---|---:|---:|---:|
+| 默认（直装 B） | 755.5 | 544.1 | **211.4µs** |
+| B-smem 环2 | 769.9 | 677.3 | **92.6µs** |
+
+→ B-smem 确实把「B 延迟暴露」砍掉 **~119µs**，但 **NOB 地板抬升 133µs**
+（544→677）——B 经 smem 多一遍「bsm 写 + LDS 读」，占用 smem 端口带宽；且 smem
+从 66KB 增到 115KB、L1 carveout 缩小。净结果为负。
+
+### 5. 结论
+
+**B 是带宽受限（≈191µs @1.4TB/s）而非可隐藏延迟**：smem 双缓冲隐藏了延迟，却
+以等量的 smem 端口流量为代价，净中性偏负。要压低 B 需**减少权重字节/提高复用**
+（窗口/布局类），而非掩盖延迟。**未接近 400µs**；开关默认关
+（`R24_BSMEM_B=0` 编译期消除，关时 `check --all` 762/762、s1/s2 逐字等价基线）。

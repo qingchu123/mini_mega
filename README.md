@@ -304,6 +304,26 @@ tid0 建表阶段对 `raw_tasks = s_cum[kEPR]*kNSlice` 个任务按代价
 - 结论：**未接近 400µs**；两阶段均默认关（`R19_BLOCK_KSPLIT=0` 编译期消除，
   关时 `check --all` 762/762、s1/s2 与基线逐字一致）。
 
+## 方向1：B（权重）smem 异步双缓冲（`-DR24_BSMEM_B=1`，默认关）
+
+时间标签 `[261012_09_40]`。动机：消融 `R24_DIAG_NOB` 显示 B 装载裸露 ≈211µs
+（占 `-s2 top50` 的 28%）。实现：`r24_l1_big`/`r24_l2_big` 增加编译期 `kBsmB`
+环深；B 经 `__builtin_mxc_ldg_b128_bsm` 搬入 smem 环、`r24_lds_b` 读，与 A 的 bsm
+流水对齐。**关键坑**：该 builtin 的拷贝计入 **gvmcnt**（非 bsmcnt！）——`arrive(4096)`
+等不到 B，必须 `arrive(64+N)=gvmcnt(N)`；A 可见性仍由 stage 顶 `bsmcnt(0)+__syncthreads`
+保证。smem：默认保持 A 双缓冲 64KB 不变，开启时扁平数组放大到 112KB（A 48KB+B 64KB）。
+```sh
+scripts/build.sh so check mybench           # 默认关：逐字等价基线
+KERNEL_CFLAGS="-DR24_BSMEM_B=1" scripts/build.sh so check mybench
+```
+- 正确性：关 `check --all` **762/762**；开 `check --all` **762/762**；`check --smoke` 均
+  **8/8 PASS**（<10s）。
+- 性能：s2 top50 **749.5→763.1µs（+1.8%）**；s1 TPR 32/128/256 = 483.5/967.9/1681.0
+  （基线 482.1/947.4/1686.2）。**净回退，默认关**。
+- 诊断：B-smem 把 `NOB` 暴露从 **211µs 降到 93µs**（延迟确实被隐藏 ~118µs），但
+  `NOB` 地板由 544→677µs（+133µs）——B 经 smem 多一遍写+读，占用 smem 端口带宽。
+  B 实为**带宽受限**（≈191µs@1.4TB/s），隐藏延迟不减少字节数。详见 `perf.md`。
+
 ## torch 层（pybind + Python 包，可安装 wheel）
 
 时间标签 `[261006_12_40]`（未提交 git）。新增 `torch/`：pybind11 扩展

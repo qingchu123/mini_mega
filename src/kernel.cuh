@@ -42,10 +42,12 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         if (blockIdx.x == 0) MX_CTR_ADD(ctr, kCtrKernelLaunch, 1);
         MX_CTR_ADD(ctr, kCtrKernelBlocks, 1);
     }
-    // A-smem 双缓冲（kernel 作用域）
-    union __align__(16) ABShared {
-        uint8_t a[2][R24_MT * R24_KS * 512];
+    // A-smem 双缓冲 + [D1]B-smem 环（kernel 作用域，同一扁平数组）
+    struct __align__(16) ABShared {
+        uint8_t raw[kABSharedBytes];
     };
+    static_assert(kABSharedBytes >= 2 * R24_MT * R24_KS * 512,
+                  "AB 共享数组须容纳最大 A 双缓冲");
     __shared__ ABShared s_ab;
     __shared__ MegaArgs s_a;
     if (threadIdx.x == 0) s_a = a;
@@ -103,7 +105,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         // [M_CYCLE] copy c（与 xbar/task_setup 同片）
         const int cyc = (int)((a.rwk->lf.current_time[blockIdx.x][1] - 1) % M_CYCLE);
         mega_dispatch_loop<kPhase>(
-            &s_a, cyc, &s_ab.a[0][0], nullptr, ctr);
+            &s_a, cyc, &s_ab.raw[0], nullptr, ctr);
     }
     if (kTick) a.rwk->lf.pre_ticks[15] = clock64();
 }

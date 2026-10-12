@@ -656,6 +656,45 @@ __device__ __forceinline__ void r19_l1_wait_all(
 #define R24_MT ((R19_L1_MT > R19_L2_MT) ? R19_L1_MT : R19_L2_MT)
 #endif
 
+// ============================================================================
+// [D1·B-smem] B（权重）经 smem 异步双缓冲（默认关，R24_BSMEM_B=0 → 逐字等价）。
+//   开启时 r24_*_big 的 B 也用 __builtin_mxc_ldg_b128_bsm 搬入 smem 环，与 A 的
+//   bsm 异步流水对齐；B fragment 由 smem LDS.128 读，从而把 B 的装载从寄存器
+//   scoreboard 摘除（诊断：B 裸露 ≈211µs，见 perf.md）。
+//   环深 R24_BRING（2 的幂，默认 2）；每 kstep 每线程发 kBatch 个 16B bsm。
+//   **等待队列**：该 builtin 的拷贝计入 gvmcnt（不是 bsmcnt！实测 arrive(4096)
+//   =bsmcnt(0) 等不到它，必须 arrive(64+N)=gvmcnt(N)），标准段允许「环深-1」个
+//   kstep 的 B 在飞、尾部 gvmcnt(0) 全等；A 的可见性仍由 stage 顶 bsmcnt(0)+
+//   __syncthreads() 保证。
+//   smem 预算：A 双缓冲后紧接 B 环（实例偏移 = 2*kMT*kKS*512），全局数组取各
+//   实例最大值（med L1 <3,16,4> = 48KB A + 64KB B = 112KB，见 kABSharedBytes）。
+//   [结论] 实测 s2 top50 中性偏负（+1.8%，763 vs 749µs）：B 为带宽受限而非可
+//   隐藏延迟，故默认关（见 perf.md）。
+// ============================================================================
+#ifndef R24_BSMEM_B
+#define R24_BSMEM_B 0
+#endif
+#ifndef R24_BRING
+#define R24_BRING 2
+#endif
+// B 环 smem 字节数 = 环深 × kBatch 组 × kComputeWarps warp × 1024B/kstep/warp
+#define R24_BSM_BYTES(kBatch) ((R24_BRING) * (kBatch) * kComputeWarps * 1024)
+// kernel 作用域 A+B 共享数组字节数。默认（B 关）保持原 A 双缓冲 64KB 不变，避免
+//   缩小 L1 carveout 拖慢 B 直装；仅 R24_BSMEM_B=1 时放大到 med L1 <3,16,4> 需求。
+#if R24_BSMEM_B
+#define kABSharedBytes (2 * 3 * 16 * 512 + R24_BSM_BYTES(4))
+#else
+#define kABSharedBytes (2 * R24_MT * R24_KS * 512)
+#endif
+// B 的 bsm 拷贝计入 gvmcnt 队列（实测 bsmcnt(0) 不能等它；gvmcnt(N) 才行）。
+//   N = 允许在飞的每线程 16B 拷贝笔数（0 = 全等）。
+#define R24_WAIT_BSM_N(N) __builtin_mxc_arrive(64 + (N))
+// 主循环 B 等待阈值：标准段允许「环深-1」个 kstep 的 B 在飞（不含 A）；可用
+//   -DR24_BSM_WAITSTD=0 强制每 kstep 全等（调试/校验收敛）。
+#ifndef R24_BSM_WAITSTD
+#define R24_BSM_WAITSTD ((kBRing - 1) * kBatch)
+#endif
+
 // 把一个 stage 的 A 协作搬入 smem（每线程 kMT*kKS*32/512 片 16B）
 template <int kMT, int kKS, bool kMask = false, int kMTAct = kMT>
 __device__ __forceinline__ void r24_issue_a(
@@ -699,8 +738,45 @@ __device__ __forceinline__ R19Frag r24_lds_a(const uint8_t* sbuf, int j, int m) 
         ((lane >> 4) & 3) * 8);
 }
 
+// [D1·B-smem] 把一个 kstep 的 B（kBatch 组 × warp 私有 32N×32K tile）bsm 异步搬
+//   入 smem 环槽 s。源地址与 r19_load_b16 逐字一致（lane*16 偏移），数值不变。
+template <int kBatch>
+__device__ __forceinline__ void r24_issue_b(
+        uint8_t* bmem, int s, const uint8_t* w, const int* nbase, int kstep,
+        int k_hidden) {
+    const int lane = (int)(threadIdx.x & 63);
+    const int warp = (int)(threadIdx.x >> 6);
+    const size_t n_tiles = (size_t)(k_hidden >> 5);
+    #pragma unroll
+    for (int q = 0; q < kBatch; ++q) {
+        uint8_t* d = bmem +
+            (((size_t)s * kBatch + q) * kComputeWarps + warp) * 1024 +
+            (size_t)lane * 16;
+#ifdef R24_DIAG_NOB
+        *reinterpret_cast<R19Frag2*>(d) = R19Frag2{0u, 0u, 0u, 0u};
+#else
+        const uint8_t* g = w +
+            ((size_t)(nbase[q] >> 5) * n_tiles + (size_t)kstep) * 1024 +
+            (size_t)lane * 16;
+        __builtin_mxc_ldg_b128_bsm(d, const_cast<uint8_t*>(g), 0, -1, true,
+                                   true, false, true);
+#endif
+    }
+}
+
+// [D1·B-smem] 从环槽 s 读第 q 组的 B fragment（lane 私有 16B）
+template <int kBatch>
+__device__ __forceinline__ R19Frag2 r24_lds_b(const uint8_t* bmem, int s,
+                                              int q) {
+    const int lane = (int)(threadIdx.x & 63);
+    const int warp = (int)(threadIdx.x >> 6);
+    return *reinterpret_cast<const R19Frag2*>(
+        bmem + (((size_t)s * kBatch + q) * kComputeWarps + warp) * 1024 +
+        (size_t)lane * 16);
+}
+
 template <int kMT, int kKS, int kBatch, bool kMask = false, int kMTAct = kMT,
-          int kBPF = R24_BPF>
+          int kBPF = R24_BPF, int kBsmB = 0>
 __device__ R19_GEMM_ATTR void r24_l1_big(
         uint8_t* s_mem, const uint8_t* fbase, int mt_total, const uint8_t* w1,
         int expert, int c0_begin, int c0_end, int k_hidden, int n_total,
@@ -717,6 +793,13 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
     const int n_per_warp = block_n / nwarps;
     const uint8_t* w_e = w1 + (size_t)expert * n_total * k_hidden;
     float acc_chk = 0.0f;
+    // [D1·B-smem] B 环 smem 紧接 A 双缓冲之后（实例偏移）；仅 kBsmB>0 时使用。
+    constexpr int kBRing = (kBsmB > 0) ? kBsmB : 1;
+    uint8_t* bmem = s_mem + 2 * kBufBytes;
+    static_assert(kBsmB == 0 ||
+                  (2 * kBufBytes + kBRing * kBatch * kComputeWarps * 1024 <=
+                   kABSharedBytes),
+                  "A+B smem 超预算");
     // [R34] 任意行区间 [c0_begin,c0_end)：整块 kMT*16 行 + 尾块 cc（cc 可 <
     //   kMT*16，A 越界行为垃圾数据，消费端按 row<cc 掩码丢弃 → 数值等价零填充）
     for (int c0 = c0_begin; c0 < c0_end; c0 += kMT * kM) {
@@ -732,6 +815,71 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
             nbase[q] = (g0 + q) * block_n + warp * n_per_warp;
         r24_issue_a<kMT, kKS, kMask, kMTAct>(s_mem, fbase, k_step_begin,
                                         mt_total, m_abs0);
+        R19Acc acc[kBatch][kMT][kNT];
+        #pragma unroll
+        for (int q = 0; q < kBatch; ++q)
+            #pragma unroll
+            for (int m = 0; m < kMT; ++m)
+                #pragma unroll
+                for (int t = 0; t < kNT; ++t)
+                    acc[q][m][t] = R19Acc{0.f, 0.f, 0.f, 0.f};
+        if constexpr (kBsmB > 0) {
+            // B 走 smem 环：每个 stage 顶部预取本 stage 前 kBRing 个 kstep，
+            //   循环内按 bsmcnt 精确等待「仅 B」的在飞数（A 由 stage 顶 wait-all
+            //   保证），尾部改 bsmcnt(0) 全等以覆盖预取不足段。
+            for (int st = 0; st < nstage; ++st) {
+                R24_WAIT_BSM();          // 排空 A(st) 与上一 stage 残留 B
+                __syncthreads();
+                if (st + 1 < nstage)
+                    r24_issue_a<kMT, kKS, kMask, kMTAct>(
+                        s_mem + ((st + 1) & 1) * kBufBytes, fbase,
+                        k_step_begin + (st + 1) * kKS, mt_total, m_abs0);
+                const uint8_t* sb = s_mem + (st & 1) * kBufBytes;
+                #pragma unroll
+                for (int p = 0; p < kBRing; ++p) {
+                    const int gp = st * kKS + p;
+                    if (gp < k_iters)
+                        r24_issue_b<kBatch>(bmem, gp & (kBRing - 1), w_e, nbase,
+                                            k_step_begin + gp, k_hidden);
+                }
+                #pragma unroll
+                for (int j = 0; j < kKS; ++j) {
+                    const int g = st * kKS + j;
+                    // 精确等待 B(g)：标准段允许 B(g+1..g+kBRing-1) 在飞，
+                    //   尾部无后续预取 → 全等（bsmcnt 0）。
+                    if (g + kBRing < k_iters)
+                        R24_WAIT_BSM_N(R24_BSM_WAITSTD);
+                    else
+                        R24_WAIT_BSM_N(0);
+                    // [D1] gvmcnt 等待已保证本线程拷贝完成
+                    R19Frag a_pipe[kMT];
+                    #pragma unroll
+                    for (int m = 0; m < kMT; ++m) {
+                        if (kMask && (m >= kMTAct)) continue;   // [R36] 越界 tile
+                        a_pipe[m] = r24_lds_a<kMT>(sb, j, m);
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < kMT; ++m) {
+                        if (kMask && (m >= kMTAct)) continue;   // [R36] 越界 tile
+                        #pragma unroll
+                        for (int q = 0; q < kBatch; ++q) {
+                            const R19Frag2 bp =
+                                r24_lds_b<kBatch>(bmem, g & (kBRing - 1), q);
+                            const R19Frag b0 = {bp[0], bp[1]};
+                            const R19Frag b1 = {bp[2], bp[3]};
+                            acc[q][m][0] = __builtin_mxc_mma_16x16x32f8(
+                                a_pipe[m], b0, acc[q][m][0]);
+                            acc[q][m][1] = __builtin_mxc_mma_16x16x32f8(
+                                a_pipe[m], b1, acc[q][m][1]);
+                        }
+                    }
+                    const int nk = g + kBRing;
+                    if (nk < k_iters)
+                        r24_issue_b<kBatch>(bmem, nk & (kBRing - 1), w_e, nbase,
+                                            k_step_begin + nk, k_hidden);
+                }
+            }
+        } else {
         R19Frag2 b_pair[kBPF][kBatch];
         #pragma unroll
         for (int sp = 0; sp < kBPF; ++sp) {
@@ -741,14 +889,6 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
                 b_pair[sp][q] = R19_LDB(w_e, nbase[q],
                                         (k_step_begin + sp) * kKStep, k_hidden);
         }
-        R19Acc acc[kBatch][kMT][kNT];
-        #pragma unroll
-        for (int q = 0; q < kBatch; ++q)
-            #pragma unroll
-            for (int m = 0; m < kMT; ++m)
-                #pragma unroll
-                for (int t = 0; t < kNT; ++t)
-                    acc[q][m][t] = R19Acc{0.f, 0.f, 0.f, 0.f};
         for (int st = 0; st < nstage; ++st) {
             // 等 stage st 的 bsm 完成 + 发布
             R24_WAIT_BSM();
@@ -792,6 +932,7 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
                 }
             }
         }
+        }   // end kBsmB
         // SwiGLU + FP8 量化回写（与 r19_l1_tile 同构）
         #pragma unroll
         for (int pi = 0; pi < kBatch / 2; ++pi) {
@@ -974,7 +1115,7 @@ __device__ __forceinline__ void r19_l2_big(
 // [R24] L2 的 A 走 smem：f2 已是 fragment 布局，复用 r24_issue_a / r24_lds_a。
 // g0 批次在外层：每批一次完整 K 流水（与 r19_l2_big 的 A 读次数相同）。
 template <int kMT, int kKS, int kBatch, bool kMask = false, int kMTAct = kMT,
-          int kBPF = R24_BPF>
+          int kBPF = R24_BPF, int kBsmB = 0>
 __device__ R19_GEMM_ATTR void r24_l2_big(
         uint8_t* s_mem, const uint8_t* f2, int mt_total, const uint8_t* w2,
         int c0_begin, int c0_end, int k_in, int n_total, int block_n, int lane,
@@ -989,6 +1130,13 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
     const int n_per_warp = block_n / nwarps;
     (void)n_total;
     float acc_chk = 0.0f;
+    // [D1·B-smem] B 环 smem 紧接 A 双缓冲之后（实例偏移）；仅 kBsmB>0 时使用。
+    constexpr int kBRing = (kBsmB > 0) ? kBsmB : 1;
+    uint8_t* bmem = s_mem + 2 * kBufBytes;
+    static_assert(kBsmB == 0 ||
+                  (2 * kBufBytes + kBRing * kBatch * kComputeWarps * 1024 <=
+                   kABSharedBytes),
+                  "A+B smem 超预算");
 #if R30_PUSH_DEFER || R30_DEFER1
     // [R30] 推送流水：上一 (c0,g) 列块的行/列区间，延迟到本列块 stage 循环
     //   首 barrier 之后发出（fabric 排空与后续 MMA 重叠；PUSH_DEFER 分片、
@@ -1022,14 +1170,6 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
                 nbase[q] = (g0 + q) * block_n + warp * n_per_warp;
             r24_issue_a<kMT, kKS, kMask, kMTAct>(s_mem, f2, 0, mt_total,
                                             m_abs0);
-            R19Frag2 b_pair[kBPF][kBatch];
-            #pragma unroll
-            for (int sp = 0; sp < kBPF; ++sp) {
-                if (sp >= k_iters) break;
-                #pragma unroll
-                for (int q = 0; q < kBatch; ++q)
-                    b_pair[sp][q] = R19_LDB(w2, nbase[q], sp * kKStep, k_in);
-            }
             R19Acc acc[kBatch][kMT][kNT];
             #pragma unroll
             for (int q = 0; q < kBatch; ++q)
@@ -1038,6 +1178,83 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
                     #pragma unroll
                     for (int t = 0; t < kNT; ++t)
                         acc[q][m][t] = R19Acc{0.f, 0.f, 0.f, 0.f};
+            if constexpr (kBsmB > 0) {
+            for (int st = 0; st < nstage; ++st) {
+                R24_WAIT_BSM();
+                __syncthreads();
+                if (st + 1 < nstage)
+                    r24_issue_a<kMT, kKS, kMask, kMTAct>(s_mem + ((st + 1) & 1) * kBufBytes,
+                                          f2, (st + 1) * kKS, mt_total,
+                                          m_abs0);
+#if R30_PUSH_DEFER
+                if (fuse != nullptr && pend_hi > pend_lo) {
+                    const int nrp = pend_hi - pend_lo;
+                    const int per = (nrp + nstage - 1) / nstage;
+                    const int lo = pend_lo + st * per;
+                    const int hi = (lo + per < pend_hi) ? (lo + per) : pend_hi;
+                    if (hi > lo)
+                        combine_push_chunk_rows(*fuse, lo, hi, pend_c0,
+                                                pend_c1, lane, warp, nwarps);
+                }
+#elif R30_DEFER1
+                if (st == 0 && fuse != nullptr && pend_hi > pend_lo) {
+                    combine_push_chunk_rows(*fuse, pend_lo, pend_hi, pend_c0,
+                                            pend_c1, lane, warp, nwarps);
+                    pend_hi = 0;
+                }
+#endif
+                const uint8_t* sb = s_mem + (st & 1) * kBufBytes;
+                #pragma unroll
+                for (int p = 0; p < kBRing; ++p) {
+                    const int gp = st * kKS + p;
+                    if (gp < k_iters)
+                        r24_issue_b<kBatch>(bmem, gp & (kBRing - 1), w2, nbase,
+                                            gp, k_in);
+                }
+                #pragma unroll
+                for (int j = 0; j < kKS; ++j) {
+                    const int g = st * kKS + j;
+                    if (g + kBRing < k_iters)
+                        R24_WAIT_BSM_N(R24_BSM_WAITSTD);
+                    else
+                        R24_WAIT_BSM_N(0);
+                    // [D1] gvmcnt 等待已保证本线程拷贝完成
+                    R19Frag a_pipe[kMT];
+                    #pragma unroll
+                    for (int m = 0; m < kMT; ++m) {
+                        if (kMask && (m >= kMTAct)) continue;   // [R36] 越界 tile
+                        a_pipe[m] = r24_lds_a<kMT>(sb, j, m);
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < kMT; ++m) {
+                        if (kMask && (m >= kMTAct)) continue;   // [R36] 越界 tile
+                        #pragma unroll
+                        for (int q = 0; q < kBatch; ++q) {
+                            const R19Frag2 bp =
+                                r24_lds_b<kBatch>(bmem, g & (kBRing - 1), q);
+                            const R19Frag b0 = {bp[0], bp[1]};
+                            const R19Frag b1 = {bp[2], bp[3]};
+                            acc[q][m][0] = __builtin_mxc_mma_16x16x32f8(
+                                a_pipe[m], b0, acc[q][m][0]);
+                            acc[q][m][1] = __builtin_mxc_mma_16x16x32f8(
+                                a_pipe[m], b1, acc[q][m][1]);
+                        }
+                    }
+                    const int nk = g + kBRing;
+                    if (nk < k_iters)
+                        r24_issue_b<kBatch>(bmem, nk & (kBRing - 1), w2, nbase,
+                                            nk, k_in);
+                }
+            }
+            } else {
+            R19Frag2 b_pair[kBPF][kBatch];
+            #pragma unroll
+            for (int sp = 0; sp < kBPF; ++sp) {
+                if (sp >= k_iters) break;
+                #pragma unroll
+                for (int q = 0; q < kBatch; ++q)
+                    b_pair[sp][q] = R19_LDB(w2, nbase[q], sp * kKStep, k_in);
+            }
             for (int st = 0; st < nstage; ++st) {
                 R24_WAIT_BSM();
                 __syncthreads();
@@ -1098,6 +1315,7 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
                     }
                 }
             }
+            }   // end kBsmB
             #pragma unroll
             for (int q = 0; q < kBatch; ++q) {
                 #pragma unroll
@@ -1507,6 +1725,8 @@ __device__ R19_BIG_ATTR void r19_big_task(
     // 档位运行期选（无编译期 kCap）；重型 r24_* 用 R19_GEMM_ATTR=__noinline__ 隔离。
     // [R38] win_cap<=64（tk/长尾）r24 用更深 B 预取环(4)，均衡大档保持 R24_BPF(2)。
     constexpr int kR24BPF = R24_BPF;
+    // [D1·B-smem] 仅 tk/长尾（win_cap<=64）B 实例开启 smem 环；均衡大档保持直装。
+    constexpr int kBsmB = (R24_BSMEM_B) ? R24_BRING : 0;
     (void)a_smem;  // [R24] kernel 作用域 A-smem（由调用方声明；小任务不用）
     // [BALANCE·docs/20 §4.2b] 本窗是否走跨 block K 切（小窗 + frag 可用 + 开关）。
     const bool ksplit = R19_BLOCK_KSPLIT && (S.a->win_cap <= R19_BLOCK_KSPLIT_WINMAX) &&
@@ -1628,7 +1848,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 // [OPT-KCAP-REMOVE] win_cap<=64（tk/长尾）用更深 B 预取环(4)；
                 //   均衡大档保持 R24_BPF(2)。运行期等价原 kCap>0 编译期选择。
                 if (S.a->win_cap <= 64) {
-                    r24_l1_big<3, 16, CM_L1_BATCH, true, 3, 4>(
+                    r24_l1_big<3, 16, CM_L1_BATCH, true, 3, 4, kBsmB>(
                         a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
                         (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                         S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
@@ -1663,7 +1883,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // [OPT-KCAP-REMOVE] win_cap<=64 用 BPF=4，均衡大档 BPF=2。
             if (count % (4 * kM) == 0) {
                 if (S.a->win_cap <= 64) {
-                    r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, 4>(
+                    r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, 4, kBsmB>(
                         a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
                         (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                         S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
@@ -1677,7 +1897,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 }
             } else {
                 if (S.a->win_cap <= 64) {
-                    r24_l1_big<4, R24_KS, R19_L1_BATCH, true, 4, 4>(
+                    r24_l1_big<4, R24_KS, R19_L1_BATCH, true, 4, 4, kBsmB>(
                         a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
                         (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
                         S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
@@ -1867,7 +2087,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
             bool med_r24 = false;
 #if CM_MED_R24
             if (f2 != nullptr && ((S.a->l1_k_out / 32) % 16 == 0)) {
-                r24_l2_big<3, 16, 3, true, 3, kR24BPF>(
+                r24_l2_big<3, 16, 3, true, 3, kR24BPF, kBsmB>(
                     a_smem, f2, S.mt_total, w2_e, 0, count, S.a->l1_k_out,
                     S.a->l2_k_out, kL1BlockN, lane, warp, kComputeWarps,
                     S.l2_chk, g0_l2, g_l2, out_slot, S.a->l2_k_out, nullptr);
@@ -1892,7 +2112,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
                    (count % (4 * kM) == 0) &&
                    ((S.a->l1_k_out / 32) % R24_KS == 0)) {
             // [OPT-64] 49..64 档 L2 同样走 r24 A-smem（MT4 无掩码）
-            r24_l2_big<4, R24_KS, 3, false, 4, kR24BPF>(
+            r24_l2_big<4, R24_KS, 3, false, 4, kR24BPF, kBsmB>(
                 a_smem, f2, S.mt_total, w2_e, 0, count, S.a->l1_k_out,
                 S.a->l2_k_out, kL1BlockN, lane, warp, kComputeWarps,
                 S.l2_chk, g0_l2, g_l2, out_slot, S.a->l2_k_out, nullptr);
