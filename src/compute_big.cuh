@@ -89,6 +89,12 @@ enum class MegaPhase : int { Both = 0, L1 = 1, L2 = 2 };
 #ifndef R19_L1_BATCH
 #define R19_L1_BATCH 2
 #endif
+// [BALANCE·r19balance] 49..64（满窗）档的 L1 N 组批宽：该档 kMT=4、g_l1=4，
+//   用 4 组一次覆盖整片 N（A 只装一遍；默认 R19_L1_BATCH=2 会装两遍）。
+//   仅当 g_l1 % R19_L1_BATCH64 == 0 时进入该档，否则回落原路径。
+#ifndef R19_L1_BATCH64
+#define R19_L1_BATCH64 4
+#endif
 #ifndef R19_L2_MT
 #define R19_L2_MT 8
 #endif
@@ -1885,13 +1891,24 @@ __device__ R19_BIG_ATTR void r19_big_task(
             // [L1TUNE-D] 49..64 档走 r24 A-smem：整块(64)无掩码、49..63 尾块掩码。
             //   原条件仅 count%64==0 进入，49..63 掉进 r19 慢回退（TPR54 826→653，docs/16）。
             // [OPT-KCAP-REMOVE] win_cap<=64 用 BPF=4，均衡大档 BPF=2。
+            // [BALANCE·r19balance] 满窗档 N 组批宽用 R19_L1_BATCH64（默认 4）：本档
+            //   kMT=4、g_l1=4，4 组一次覆盖整片 N → A 只装一遍（batch=2 时装两遍）。
+            //   g_l1 不是其倍数（如 NS=8 → g_l1=2）时回落原 R19_L1_BATCH 路径。
+            const bool kB64 = (g_l1 % R19_L1_BATCH64 == 0);
             if (count % (4 * kM) == 0) {
                 if (S.a->win_cap <= 64) {
-                    r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, 4, kBsmB>(
-                        a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
-                        (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
-                        S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                        S.a->l1_k_out);
+                    if (kB64)
+                        r24_l1_big<4, R24_KS, R19_L1_BATCH64, false, 4, 4, kBsmB>(
+                            a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                            (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
+                            S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                            S.a->l1_k_out);
+                    else
+                        r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, 4, kBsmB>(
+                            a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                            (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
+                            S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                            S.a->l1_k_out);
                 } else {
                     r24_l1_big<4, R24_KS, R19_L1_BATCH, false, 4, R24_BPF>(
                         a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
@@ -1901,11 +1918,18 @@ __device__ R19_BIG_ATTR void r19_big_task(
                 }
             } else {
                 if (S.a->win_cap <= 64) {
-                    r24_l1_big<4, R24_KS, R19_L1_BATCH, true, 4, 4, kBsmB>(
-                        a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
-                        (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
-                        S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
-                        S.a->l1_k_out);
+                    if (kB64)
+                        r24_l1_big<4, R24_KS, R19_L1_BATCH64, true, 4, 4, kBsmB>(
+                            a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                            (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
+                            S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                            S.a->l1_k_out);
+                    else
+                        r24_l1_big<4, R24_KS, R19_L1_BATCH, true, 4, 4, kBsmB>(
+                            a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
+                            (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps,
+                            S.l1_chk, g0_l1, g_l1, ffn_slot, ffn2, out_col_base,
+                            S.a->l1_k_out);
                 } else {
                     r24_l1_big<4, R24_KS, R19_L1_BATCH, true, 4, R24_BPF>(
                         a_smem, fbase, S.mt_total, S.a->w1, e, 0, count, kHidden,
