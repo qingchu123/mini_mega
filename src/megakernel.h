@@ -90,9 +90,8 @@ struct MegaLaunchArgs {
     uint8_t* ffn_hidden = nullptr;         // [FRAG-INT] frag 缓冲为 kernel 内部（rwk->ld）
     uint16_t* l2_out = nullptr;
     // l1_k_out/l2_k_out 已内联为常量 kIntermediate/kHidden（本子集固定）。
-    // -- flag 索引（layout 头）--
-    int64_t xrelease_idx = 0, task_ready_idx = 0, task_counter_idx = 0,
-            l2_done_idx = 0, slice_flags_idx = 0, l1_prog_idx = 0;
+    // flag 索引（xrelease/task_ready/task_counter/l2_done/slice_flags/l1_prog）
+    //   已内联为设备侧编译期常量 kBar*Idx（common.cuh；镜像 layout 头）。
 
     // ======================================================================
     // [3] 输出

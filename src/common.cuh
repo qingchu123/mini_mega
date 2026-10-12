@@ -45,6 +45,20 @@ constexpr int kL1BlockN = 256;
 // recv 行宽（word）：与 layout 的 ((EPR+1)+3)&~3 一致（原 MegaArgs.recv_stride）
 constexpr int kRecvStride = 64;   // recv 行宽（word）= 256B/4（256B 缓存行对齐，避免跨 rank false sharing）
 
+// 同步旗索引（冻结几何，原 MegaArgs 的 6 个 *_idx 字段）：
+//   host 侧 layout 头 include/deep_gemm/layout/mega_moe.cuh 的 kBar* 为唯一权威；
+//   kernel 侧不 include 该头（避免引入 cute 依赖），故在此镜像固定值。
+//   取值随 kMegaMoeMaxGridBlocks=64 / slice/l1 区各 1024 / l2done 256 推导：
+//     kBarXreleaseIdx=65、kBarSliceFlagsIdx=67、kBarL1ProgressIdx=1091、
+//     kBarL2DoneIdx=2115、kBarTaskReadyIdx=2499、kBarTaskCounterIdx=2501。
+//   布局头若改动，test/mega_common.cuh 的 static_assert 会在编译期失败。
+constexpr int64_t kBarXreleaseIdx = 65;
+constexpr int64_t kBarSliceFlagsIdx = 67;
+constexpr int64_t kBarL1ProgressIdx = 1091;
+constexpr int64_t kBarL2DoneIdx = 2115;
+constexpr int64_t kBarTaskReadyIdx = 2499;
+constexpr int64_t kBarTaskCounterIdx = 2501;
+
 // [OPT-GEMM-ATTR] 重型 GEMM 档函数属性：__noinline__ 让每个档独立寄存器/栈
 //   分配，调用者（任务体/内核）只承担控制流与调用约定，避免最坏路径的 acc/
 //   寄存器预算传染到其它档。可用 -DR19_GEMM_ATTR=__forceinline__ 回退实验。

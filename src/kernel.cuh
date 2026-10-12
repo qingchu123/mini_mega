@@ -82,7 +82,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         __syncthreads();
     } else {
         xbar_route_ready_body(&a.unk->rf, a.unk_peers, &a.rwk->lf, a.R, a.rank,
-                              a.xrelease_idx, a.rwk->lf.dbg, a.max_spins, 0, ctr);
+                              kBarXreleaseIdx, a.rwk->lf.dbg, a.max_spins, 0, ctr);
     }
     if (kTick) a.rwk->lf.pre_ticks[2] = clock64();
     // 3) TASK_SETUP（block0 leader 建 prefix/窗口表，其余等 task_ready）
@@ -90,8 +90,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         if (kTick) a.rwk->lf.pre_ticks[3] = clock64();
     } else {
         task_setup_body(a.self, &a.unk->rd, a.R, a.rank, a.slot_capacity,
-                        a.prefix_off, &a.rwk->lf, a.task_ready_idx,
-                        a.task_counter_idx, a.l2_done_idx,
+                        a.prefix_off, &a.rwk->lf, kBarTaskReadyIdx,
+                        kBarTaskCounterIdx, kBarL2DoneIdx,
                         a.rwk->lf.out_total, a.rwk->lf.dbg, a.max_spins,
                         kRecvStride, /*reset_ring=*/true, /*tid_base=*/0,
                         /*sb_cnt=*/nullptr, /*smem_off=*/0, a.prefix_ptr,

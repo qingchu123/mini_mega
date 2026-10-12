@@ -1354,3 +1354,55 @@ s2 稳定 −0.76%（3/3 轮均改善）；s1 三档在噪声内（TPR=32 单次
 s1 TPR256 −3.1% 且其余不回退。`pool_ptr`/`prefix_ptr`/`in_bf16`/`slot_capacity` 因
 torch 语义或运行期灵活性保留。距 500µs 仍远，主体仍为 L1 GEMM 与跨 block 分片。
 
+## [261012_15_53] r19balance：移除 `MegaArgs` 6 个 `*_idx` 字段（改编译期常量）— `s_a` smem −48B、`-s2 top50` 704.6→703.7µs（中性）
+
+> 目标：继续精简 `MegaArgs`（上一条 [261012_15_39] 已去 `l1_k_out`/`l2_k_out`/`y`/计数）。
+> 本轮把 6 个同步旗索引改为 kernel 侧编译期常量（host/torch 不再传），行为逐字不变。
+
+### 1. 改动
+
+- `src/common.cuh`：新增 `constexpr int64_t kBarXreleaseIdx=65`/`kBarSliceFlagsIdx=67`/
+  `kBarL1ProgressIdx=1091`/`kBarL2DoneIdx=2115`/`kBarTaskReadyIdx=2499`/
+  `kBarTaskCounterIdx=2501`（镜像 `include/deep_gemm/layout/mega_moe.cuh` 的 `kBar*`；
+  kernel 不 include 该头，避免引入 cute 依赖）。
+- `src/compute.cuh`：删 `MegaArgs` 的 6 个 `*_idx` 字段；`dispatch_pull_body` 使用点改常量。
+- `src/compute_big.cuh`（7 处 `S.a->`）、`src/kernel.cuh`（`a.*` → 常量）。
+- `src/megakernel.h`/`src/megakernel.cu`/`test/mega_common.cuh`/`torch/csrc/apis/mega.hpp`：
+  同步删字段与赋值；`to_mega_args`/`make_args`/`make_mega_args` 不再拷贝；
+  `mega_reduce_kernel` 的 `task_ready_idx` 直接用常量。
+- `test/mega_common.cuh`：加 6 条 `static_assert(kBar*Idx == deep_gemm::layout::kBar*)`
+  保证与布局头同源（torch 侧不 include 设备头，故不设断言，仅在常量处注明来源）。
+
+注：任务书给出的 `kBarTaskReadyIdx=1018`/`kBarTaskCounterIdx=1020` 为**旧硬编码值**；
+当前布局头（`kMegaMoeMaxGridBlocks=64`，slice/l1 区各 1024、l2done 256）实为
+`2499`/`2501`，否则 `static_assert` 失败且旗槽错位。本轮按布局头实际值冻结。
+
+### 2. 内核资源（`MT_DUMP_RES=1`，`-s1 -tprs 16 -nodes 1 -replays 1`）
+
+| 版本 | regs | local | smem(full) | smem(empty) |
+|---|---:|---:|---:|---:|
+| 基线（HEAD `a46c998`） | 256 | 2288 B | 66144 | 576 |
+| 本改 | 256 | **2288 B** | **66096（−48B）** | **528（−48B）** |
+
+`local` 不变（2288B）；`s_a` smem 恰减去 6×int64=48B。
+
+### 3. A/B（us_mean 跨 rank）
+
+| 场景 | 基线 | 本改 | 变化 |
+|---|---:|---:|---:|
+| **`-s2 top50` mean** | 704.57 | **703.67** | **−0.13%（噪声内）** |
+| s1 TPR=32 | 462 | 460.28 | ~0%（噪声） |
+| s1 TPR=128 | 943 | 912.02 | −3.3%（噪声方差大） |
+| s1 TPR=256 | 1626 | 1619.33 | −0.4%（噪声内） |
+
+### 4. 门禁
+
+- `check --smoke` **PASS 8/8**，6.77s（`timeout 10` 内）。
+- `check --all` **PASS 762/762**，73.4s（`timeout 400` 内）。
+
+### 5. 结论与遗留
+
+纯结构精简：`s_a` smem −48B、使用点少 6 次跨 noinline 结构体读，`local`/`regs` 与
+`-s2 top50` 均在噪声内。收益有限（索引本就在 smem），但为后续继续瘦身 `MegaArgs`
+铺路。距 500µs 仍远，主体仍为 L1 GEMM 与跨 block 分片任务量化。
+

@@ -90,12 +90,6 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.rwk = a.rwk;
     m.unk = a.unk;
     m.unk_peers = a.unk_peers;
-    m.xrelease_idx = a.xrelease_idx;
-    m.task_ready_idx = a.task_ready_idx;
-    m.task_counter_idx = a.task_counter_idx;
-    m.l2_done_idx = a.l2_done_idx;
-    m.slice_flags_idx = a.slice_flags_idx;
-    m.l1_prog_idx = a.l1_prog_idx;
     m.x_off = a.x_off;
     m.weights_off = a.weights_off;
     m.pool_off = a.pool_off;
@@ -210,7 +204,7 @@ void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
         a.self, a.unk ? &a.unk->rd : nullptr, a.y, a.R, a.tokens,
         a.combine_rows_off, a.topk_idx_off, a.weights_off,
         a.rwk ? &a.rwk->lf : nullptr, a.unk ? &a.unk->rf : nullptr,
-        a.task_ready_idx, a.max_spins);
+        kBarTaskReadyIdx, a.max_spins);
 }
 
 void launch_full(const MegaLaunchArgs& a, mcStream_t stream) {

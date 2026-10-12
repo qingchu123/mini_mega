@@ -619,7 +619,7 @@ __device__ __forceinline__ void r19_l1_wait_all(
     if (tid == 0) {
         for (int s2 = 0; s2 < S.nslice_eff; ++s2) {
             long long spin = 0;
-            while (*(volatile const uint32_t*)(S.bar_flags + S.a->l1_prog_idx +
+            while (*(volatile const uint32_t*)(S.bar_flags + kBarL1ProgressIdx +
                                                (size_t)pool_slot *
                                                    S.nslice_eff +
                                                s2) != gen) {
@@ -1706,7 +1706,7 @@ __device__ __forceinline__ void r19_pull_flags(
             //   kNSlice=16 因此无需改布局常量即可用。
             // [L1L2-SPLIT] 旗槽恒用 ring 索引（容量 256 不随数据槽扩容）。
             *reinterpret_cast<volatile uint32_t*>(
-                S.bar_flags + S.a->slice_flags_idx +
+                S.bar_flags + kBarSliceFlagsIdx +
                 (size_t)flag_slot * S.nslice_eff + slice) = gen;
 #ifndef PULL_FENCE_MIN
             __threadfence();
@@ -1726,7 +1726,7 @@ __device__ __forceinline__ void r19_pull_flags(
                 // [集71] wait-all（分片就绪旗）等待轮次
                 MX_CTR_ADD(S.ctr, kCtrWaitAllSlice, 1);
                 while (*(volatile const uint32_t*)(S.bar_flags +
-                                                   S.a->slice_flags_idx +
+                                                   kBarSliceFlagsIdx +
                                                    (size_t)flag_slot *
                                                        S.nslice_eff +
                                                    s2) != gen) {
@@ -1759,14 +1759,14 @@ __device__ __forceinline__ void r19_l1_pub_wait(
     if (tid == 0) {
         __threadfence();
         // [R36b] 同 slice 旗：flag 粒度=物理 slice（stride=nslice_eff）
-        l1_progress_publish(S.bar_flags, (int)S.a->l1_prog_idx, pool_slot, slice,
+        l1_progress_publish(S.bar_flags, (int)kBarL1ProgressIdx, pool_slot, slice,
                             gen, (int)S.nslice_eff);
         for (int s2 = 0; s2 < S.nslice_eff; ++s2) {
             if (s2 == slice) continue;
             long long spin = 0;
             // [集71] wait-all（l1_prog 旗）等待轮次
             MX_CTR_ADD(S.ctr, kCtrWaitAllL1Prog, 1);
-            while (*(volatile const uint32_t*)(S.bar_flags + S.a->l1_prog_idx +
+            while (*(volatile const uint32_t*)(S.bar_flags + kBarL1ProgressIdx +
                                                (size_t)pool_slot *
                                                    S.nslice_eff +
                                                s2) != gen) {
@@ -1904,7 +1904,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
                     a_smem, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                     (2 * kIntermediate), kL1BlockN, lane, warp, kComputeWarps,
                     g0_l1, g_l1, out_col_base, kIntermediate, part, cnt,
-                    ffn_slot, ffn2, kseg, S.bar_flags, (int)S.a->l1_prog_idx,
+                    ffn_slot, ffn2, kseg, S.bar_flags, (int)kBarL1ProgressIdx,
                     pool_slot, slice, gen, (int)S.nslice_eff, S.a->max_spins,
                     S.dbg);
             } else {
@@ -1913,7 +1913,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
                     pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,        \
                     (2 * kIntermediate), kL1BlockN, lane, warp, kComputeWarps,    \
                     g0_l1, g_l1, out_col_base, kIntermediate, part, cnt,          \
-                    ffn_slot, ffn2, kseg, S.bar_flags, (int)S.a->l1_prog_idx,     \
+                    ffn_slot, ffn2, kseg, S.bar_flags, (int)kBarL1ProgressIdx,     \
                     pool_slot, slice, gen, (int)S.nslice_eff, S.a->max_spins,     \
                     S.dbg)
             if (count <= 16) R19_KSPLIT_CALL(1);
@@ -2404,7 +2404,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
                 pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                 (2 * kIntermediate), kL1BlockN, lane, warp, kComputeWarps,
                 g0_l1, g_l1, out_col_base, kIntermediate, part, cnt, ffn_slot,
-                ffn2, kseg, S.bar_flags, (int)S.a->l1_prog_idx, pool_slot,
+                ffn2, kseg, S.bar_flags, (int)kBarL1ProgressIdx, pool_slot,
                 slice, gen, (int)S.nslice_eff, S.a->max_spins, S.dbg);
         } else
 #endif

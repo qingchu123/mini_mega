@@ -68,9 +68,7 @@ struct MegaArgs {
     const uint8_t* w2;            // [EPR][H][I] lane 序 packed tile
     uint8_t* ffn_hidden;          // [EPR][ring][win_cap][I] FP8
     uint16_t* l2_out;             // [kGrid][win_cap][H] BF16
-    // -- flag 索引（layout 头经 host 传入；kernel 不 include 该头）--
-    int64_t xrelease_idx, task_ready_idx, task_counter_idx, l2_done_idx;
-    int64_t slice_flags_idx, l1_prog_idx;
+    // -- flag 索引已内联为编译期常量 kBarXxxxIdx（common.cuh；镜像 layout 头）--
 
     // ======================================================================
     // [3] 输出
@@ -794,7 +792,7 @@ __device__ __forceinline__ void dispatch_pull_body(
                        ? (int)blockIdx.x
                         : atomicAdd(reinterpret_cast<int*>(
                                        a->rwk->lf.bar[cycle] +
-                                       a->task_counter_idx), 1));
+                                       kBarTaskCounterIdx), 1));
 #if R19_BLOCK_LPT
             // [BLOCK-LPT] 领到的号 counter 映射为降序排序后的任务 id（仅非 L2 路径）。
             const int task_lpt = (kPhase != MegaPhase::L2 && lpt_ok &&
@@ -830,14 +828,14 @@ __device__ __forceinline__ void dispatch_pull_body(
                 const int remain = s_count[lo] - s_window * a->win_cap;
                 s_count_w = remain < a->win_cap ? remain : a->win_cap;
                 s_epoch = *(volatile const uint32_t*)(a->rwk->lf.bar[cycle] +
-                                                      a->task_ready_idx);
+                                                      kBarTaskReadyIdx);
                 // [L1L2-SPLIT] ring 门等前代 L2 完成；拆分下前代 L2 在下一个
                 //   kernel（stream 顺序已保证），且数据槽不复用 → 编译期跳过。
                 if constexpr (kPhase == MegaPhase::Both) {
                     if (s_window >= kRing || rep > 0) {
                         // ring 门：target=(rep + w/ring)*nslice_eff（每物理任务 +1），
                         // 槽复用前等前代 L2 完成。[R35] 用 nslice_eff 匹配物理任务数。
-                        l2_gate_wait(a->rwk->lf.bar[cycle], (int)a->l2_done_idx,
+                        l2_gate_wait(a->rwk->lf.bar[cycle], (int)kBarL2DoneIdx,
                                      lo, s_window, rep, kRing, nslice_eff, slice,
                                      -1, 0u, a->rwk->lf.dbg, a->max_spins, ctr);
                     }
@@ -889,7 +887,7 @@ __device__ __forceinline__ void dispatch_pull_body(
         if (tid == 0) {
             if (h_pub)
                 atomicAdd(reinterpret_cast<uint32_t*>(
-                              a->rwk->lf.bar[cycle] + a->l2_done_idx +
+                              a->rwk->lf.bar[cycle] + kBarL2DoneIdx +
                               (size_t)(e * kRing + w % kRing)),
                           1u);
             ++processed;

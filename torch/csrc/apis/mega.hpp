@@ -237,12 +237,7 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
   a.rwk = b.rwk;
   a.unk = b.unk;
   a.unk_peers = b.d_unk_ptrs;
-  a.xrelease_idx = L::kBarXreleaseIdx;
-  a.task_ready_idx = L::kBarTaskReadyIdx;
-  a.task_counter_idx = L::kBarTaskCounterIdx;
-  a.l2_done_idx = L::kBarL2DoneIdx;
-  a.slice_flags_idx = L::kBarSliceFlagsIdx;
-  a.l1_prog_idx = L::kBarL1ProgressIdx;
+  // flag 索引已内联为设备侧编译期常量 kBar*Idx（src/common.cuh，镜像 layout 头）。
   a.x_off = b.L.x_off;
   a.weights_off = b.L.topk_weights_off;
   a.pool_off = b.L.expert_tokens_off;

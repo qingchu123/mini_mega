@@ -42,6 +42,14 @@ constexpr int64_t kL2DoneIdx = deep_gemm::layout::kBarL2DoneIdx;
 constexpr int64_t kTaskReadyIdx = deep_gemm::layout::kBarTaskReadyIdx;
 constexpr int64_t kTaskCounterIdx = deep_gemm::layout::kBarTaskCounterIdx;
 
+// [FROZEN-GEOM] 保证 kernel 侧编译期常量与 layout 头同源（布局头改动会在此报错）。
+static_assert(kBarXreleaseIdx == kXreleaseIdx, "kBarXreleaseIdx 与 layout 头不同源");
+static_assert(kBarSliceFlagsIdx == kSliceFlagsIdx, "kBarSliceFlagsIdx 与 layout 头不同源");
+static_assert(kBarL1ProgressIdx == kL1ProgIdx, "kBarL1ProgressIdx 与 layout 头不同源");
+static_assert(kBarL2DoneIdx == kL2DoneIdx, "kBarL2DoneIdx 与 layout 头不同源");
+static_assert(kBarTaskReadyIdx == kTaskReadyIdx, "kBarTaskReadyIdx 与 layout 头不同源");
+static_assert(kBarTaskCounterIdx == kTaskCounterIdx, "kBarTaskCounterIdx 与 layout 头不同源");
+
 // 默认 TK 日志（相对仓库根目录；scripts/run.sh 已切到仓库根）
 inline const char* kDefaultTkLog = "test/70.r32_tpr_perf/0928_tk_info.log";
 
@@ -333,12 +341,6 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.rwk = d.rwk;
     a.unk = d.unk;
     a.unk_peers = d.d_unk;
-    a.xrelease_idx = kXreleaseIdx;
-    a.task_ready_idx = kTaskReadyIdx;
-    a.task_counter_idx = kTaskCounterIdx;
-    a.l2_done_idx = kL2DoneIdx;
-    a.slice_flags_idx = kSliceFlagsIdx;
-    a.l1_prog_idx = kL1ProgIdx;
     a.x_off = L.x_off;
     a.prefold_off = L.prefold_off;
     a.in_bf16 = MX_IN_BF16;
