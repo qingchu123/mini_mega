@@ -38,7 +38,15 @@ constexpr int kL1Parts = kNSlice * kNK;                     // 每 (专家,窗�
 #define KRING_OVERRIDE 8
 #endif
 constexpr int kRing = KRING_OVERRIDE;  // 专家窗口槽数（ring 复用）
-constexpr int kMaxWin = 8;  // 专家窗口槽数（ring 复用）
+// [RING_OFF] 实验开关：1 = 去掉 L1/L2 ring 复用，按最大占用申请唯一槽。
+//   0（默认）= 现行为逐字不变（pool_slot=e*kRing+w%kRing，ring 门照旧）。
+//   打开后 per-expert 窗口槽 = ceil(kMaxTPR/win_cap)（win_min=32 → 最多 16）。
+#ifndef RING_OFF
+#define RING_OFF 0
+#endif
+// 唯一槽上界：win_min=32 ⇒ 每专家最多 ceil(kMaxTPR/32)=16 个窗口槽。
+// 仅 RING_OFF=1 时用于放大 local_data 热缓冲；默认 0 时不参与任何布局/索引。
+constexpr int kMaxWin = (kMaxTPR + 31) / 32;   // 16（原 8，未被引用）
 constexpr int kM = 16;               // M tile 行数
 // L1 N tile 宽（生产 block_n；原 MegaArgs.l1_block_n 的固定值）
 constexpr int kL1BlockN = 256;
