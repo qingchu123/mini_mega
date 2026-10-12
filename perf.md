@@ -1619,3 +1619,40 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
 - 预取深度 A/B：`MX_FP4_W=1 + R24_BPF=4 + R19_L1_PF=8` 可再降至 ~567µs，
   但会同时改变默认 fp8 路径（历史 TPR128/256 回退），需做成 fp4 条件默认，未纳入。
 - 权重 fp4 量化/reorg 仅在 bench/check 侧实现；torch 侧未接入（本环境无 torch）。
+
+## [261012_19_24] r19balance/impl1：fp4 条件默认加深 B 预取环（`#if MX_FP4_W`）— `-s2 top50` 583.7→569.9µs（−2.4%），fp8 默认逐字不变
+
+> 目标：把上节遗留的「`MX_FP4_W=1 + R24_BPF=4 + R19_L1_PF=8` ≈567µs」做成 **仅 fp4
+> 路径** 生效的条件默认。直接改默认会同时改变 fp8 路径（历史大档回退），本版用
+> `#if MX_FP4_W` 覆盖 `R24_BPF`/`R19_L1_PF` 的 `#ifndef` 默认值。
+
+### 1. 改动（`src/compute_big.cuh`）
+
+- `R24_BPF` 默认 `2→4`、`R19_L1_PF` 默认 `2→8`，**仅当 `MX_FP4_W`**；`#else` 分支
+  与 `-D` 覆盖语义保持原文逐字不变。`R24_BPF` 经 `kR24BPF` 同时作用于 L1/L2 的
+  kAsync（`count>64`）与尾块路径；`R24_DIAG_NOB` 消融确认 fp4 下 B 暴露仍为 ~121µs
+  （NOB 地板 449µs），本次收益来自更深的 packed 环覆盖剩余 B 延迟。
+
+### 2. A/B（同会话交替，us_mean；s2=top50 replays5、s1=nodes3 replays3）
+
+| 口径 | fp4 基线 (BPF2/PF2) | fp4 条件默认 (BPF4/PF8) | 变化 |
+|---|---:|---:|---:|
+| `-s2 top50` mean（3 轮） | 583.7 | **569.9** | **−2.4%** |
+| s1 TPR=32 | 392.2 | 389.2 | −0.8% |
+| s1 TPR=64 | 505.5 | 494.8 | −2.1% |
+| s1 TPR=128 | 895.6 | 894.4 | ≈0 |
+| s1 TPR=256 | 1562.2 | 1579.0 | +1.1% |
+
+### 3. 门禁
+
+- `MACA_PATH=/opt/maca scripts/build.sh so check mybench`（`MX_FP4_W=0/1` 两种）通过。
+- `timeout 10 scripts/run.sh check --smoke` **PASS 8/8**，6.2s（<10s）。
+- `MX_FP4_W=0` 行为逐字不变：`static_assert` 探针确认默认仍 `R24_BPF==2 && R19_L1_PF==2`；
+  `-DMX_FP4_W=1 -DR24_BPF=2 -DR19_L1_PF=2` 亦确认 `-D` 覆盖仍生效。
+
+### 4. 结论与遗留
+
+- fp4 下 `-s2` 583.7→569.9µs（−2.4%）；距 500µs 仍差 ~70µs（NOB 地板 449µs 为主体）。
+- s1 TPR=256 +1.1%：大窗 kAsync 亦随之用 BPF=4。可选后续把深度改由
+  `S.a->win_cap<=64` 运行期门控（大窗保持 2），需复制 kAsync 实例，本轮未纳入。
+- torch 侧改动（工作副本内 flags_bridge/init）单列，未随本提交验证。

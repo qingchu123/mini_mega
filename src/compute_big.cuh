@@ -83,8 +83,17 @@ enum class MegaPhase : int { Both = 0, L1 = 1, L2 = 2 };
 #ifndef R19_L1_MT
 #define R19_L1_MT 8
 #endif
+// [MX_FP4_W·r19balance] fp4 权重下 B（W1/W2）HBM 字节减半、但预取覆盖的 k-step
+//   数不变 → 默认加深 L1 B 预取环（2→8）以覆盖剩余 B 延迟。仅 fp4 路径生效，
+//   MX_FP4_W=0 时默认仍为 2（逐字不变）。可用 -DR19_L1_PF= 覆盖。
+#if MX_FP4_W
+#ifndef R19_L1_PF
+#define R19_L1_PF 8
+#endif
+#else
 #ifndef R19_L1_PF
 #define R19_L1_PF 2
+#endif
 #endif
 #ifndef R19_L1_BATCH
 #define R19_L1_BATCH 2
@@ -722,8 +731,18 @@ __device__ __forceinline__ void r19_l1_wait_all(
 #define R24_L2_KS R24_KS
 #endif
 // B 预取环深（2 的幂；R24 路径专用）
+// [MX_FP4_W·r19balance] fp4 下 B 每 k-step 仅 8B/lane（packed），预取环改存 packed
+//   uint64 后单槽寄存器占用减半 → 默认加深 2→4（L1/L2 的 kAsync + 尾块路径共用
+//   本值），覆盖 B 延迟。仅 fp4 路径生效；MX_FP4_W=0 时默认仍为 2（逐字不变）。
+//   可用 -DR24_BPF= 覆盖。
+#if MX_FP4_W
+#ifndef R24_BPF
+#define R24_BPF 4
+#endif
+#else
 #ifndef R24_BPF
 #define R24_BPF 2
+#endif
 #endif
 // 阶段发布等待模式：默认仅等 bsm 搬运（不拖住 B 直装的 gvmcnt 流）
 #ifndef R24_BSMCNT_WAIT

@@ -413,6 +413,21 @@ KERNEL_CFLAGS="-DMXK_FUSE_REDUCE=1" scripts/build.sh so check mybench
   但需做成 **fp4 条件默认**（否则回退默认 fp8 路径，历史 `-s2` TPR128/256 回退），未纳入。
   权重 fp4 量化/reorg 在 torch 侧尚未接入（本环境无 torch）。
 
+## 方向5b：fp4 条件默认加深 B 预取环（`#if MX_FP4_W`）
+
+时间标签 `[261012_19_24]`。承接上节遗留：把 `R24_BPF=4 + R19_L1_PF=8` 用
+`#if MX_FP4_W` 做成 **仅 fp4 路径** 的默认（`src/compute_big.cuh`），`#else` 分支与
+`-D` 覆盖语义逐字不变。
+
+| 口径 | fp4 基线 (BPF2/PF2) | fp4 条件默认 (BPF4/PF8) | 变化 |
+|---|---:|---:|---:|
+| `-s2 top50` mean（3 轮） | 583.7 | **569.9** | **−2.4%** |
+| s1 TPR=32 / 64 / 128 / 256 | 392.2 / 505.5 / 895.6 / 1562.2 | 389.2 / 494.8 / 894.4 / 1579.0 | −0.8% / −2.1% / ≈0 / +1.1% |
+
+门禁：`check --smoke` PASS 8/8（6.2s，<10s）；`MX_FP4_W=0` 经 `static_assert` 探针确认
+默认仍为 `R24_BPF=2 && R19_L1_PF=2`（逐字等价基线），`-D` 覆盖仍生效。详见
+`perf.md` [261012_19_24]。
+
 ## torch 层（pybind + Python 包，可安装 wheel）
 
 时间标签 `[261006_12_40]`（未提交 git）。新增 `torch/`：pybind11 扩展
