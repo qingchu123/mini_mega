@@ -252,11 +252,9 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
   a.skip_prologue = (int)skip_prologue;
   a.prefix_ptr = nullptr;
   a.w1 = w1;
-  a.l1_k_out = (int)b.intermediate_hidden;
   a.ffn_hidden = b.ffn_hidden;
   a.w2 = w2;
   a.l2_out = b.l2_out;
-  a.l2_k_out = (int)b.hidden;
   a.combine_rows_off = b.L.combine_rows_off;
   a.prefold_off = b.L.prefold_off;
   a.in_bf16 = b.L.in_bf16;

@@ -350,11 +350,10 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.max_spins = (int)kSpinLimit;
     a.prefix_ptr = d.ld ? &d.ld->prefix_tbl[0][0] : nullptr;
     a.w1 = d.w1;
-    a.l1_k_out = kIntermediate;
     a.ffn_hidden = d.ffn;
     a.w2 = d.w2;
     a.l2_out = d.l2;
-    a.l2_k_out = kHidden;
+
     a.combine_rows_off = g.combine_off;
     a.y = y;
     a.grid = kGrid;

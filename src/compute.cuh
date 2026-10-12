@@ -38,7 +38,7 @@ struct MegaArgs {
     int win_cap;               // 窗口容量（窗口划分 / pool / staging / ffn / l2 行 stride）
     // 已内联常量（原运行期传参，本子集固定）：
     //   k_in=kHidden、topk=kTopk、ring=kRing、l1_block_n=kL1BlockN、
-    //   l1_n_total=2*l1_k_out、tbl_cap=slot_capacity、pool_stride=win_cap、
+    //   l1_n_total=2*kIntermediate、tbl_cap=slot_capacity、pool_stride=win_cap、
     //   publish_epoch=kPublishEpoch、recv_stride=kRecvStride
 
     // ======================================================================
@@ -63,8 +63,7 @@ struct MegaArgs {
     int64_t prefold_off;          // [BF16-IN] 本地 fold 的 fp8 x 区（self 内偏移）
     int in_bf16;                  // [BF16-IN] 输入 x 是 bf16(1) / fp8(0)
     // -- 计算链缓冲 --
-    int l1_k_out;                 // L1 输出隐藏维 I（l1_n_total 由 2*l1_k_out 派生）
-    int l2_k_out;                 // L2 输出维 H
+    // l1_k_out/l2_k_out 已内联为常量 kIntermediate/kHidden（本子集固定）。
     const uint8_t* w1;            // [EPR][2I][H] lane 序 packed tile（gate/up 配对）
     const uint8_t* w2;            // [EPR][H][I] lane 序 packed tile
     uint8_t* ffn_hidden;          // [EPR][ring][win_cap][I] FP8
@@ -76,10 +75,8 @@ struct MegaArgs {
     // ======================================================================
     // [3] 输出
     // ======================================================================
-    // 独立核路径下本 kernel（mega_kernel）不写 y；y 由 REDUCE 经 host 侧指针写出。
-    // [方向3] MXK_FUSE_REDUCE=1 时 REDUCE 并入 mega 尾，需在此携带 host 传入的
-    //   y 指针（bench/check 逐节点不同），默认路径不读。
-    float* y;
+    // 本 kernel（mega_kernel）不写 y；y 由独立 REDUCE 核经 host 侧指针写出
+    // （MegaLaunchArgs::y）。[方向3] MXK_FUSE_REDUCE 已废弃，设备结构体不再携带 y。
 
     // ======================================================================
     // [4] 性能调优参数
@@ -88,14 +85,11 @@ struct MegaArgs {
     int skip_prologue;            // [R38] 前序复用：0 完整，>0 复用（见 kernel.cuh 说明）
 
     // ======================================================================
-    // [5] 调试 / debug（MX_DBG_COUNT，编译期默认关）
+    // [5] 调试 / debug
     // ======================================================================
     // （控制/诊断状态 out_total/out_processed/dbg/ck_dbg/pre_ticks/l1_chk/l2_chk
-    //   已迁入 local_flags（lf->...），不在此结构体。）
-#if MX_DBG_COUNT
-    unsigned long long* exec_ctr;  // [kExecCtrSlots] 各计数槽（nullptr = 不统计）
-    int dbg_count;                 // 运行期开关（host 读 env MXKERNEL_COUNT 填入）
-#endif
+    //   已迁入 local_flags（lf->...）。计数缓冲 exec_ctr/dbg_count 已移除：
+    //   设备入口恒以 ctr=nullptr 运行，MX_CTR_ADD 展开为空。）
 };
 
 
@@ -682,7 +676,7 @@ __device__ __forceinline__ void dispatch_pull_body(
 #else
     const bool frag_ok_ks = (a->rwk->ld.frag_a[0] != nullptr) &&
                             (a->rwk->ld.frag2[0] != nullptr) &&
-                            (a->l1_k_out > 0) && (mt_total_ks > 0) &&
+                            (kIntermediate > 0) && (mt_total_ks > 0) &&
                             (a->win_cap > 0);
 #endif
     const bool ksw = (a->win_cap <= R19_BLOCK_KSPLIT_WINMAX) && (kNK > 1) &&
@@ -779,7 +773,7 @@ __device__ __forceinline__ void dispatch_pull_body(
 #else
     S.frag_all = (a->rwk->ld.frag_a[0] != nullptr) &&
                  (a->rwk->ld.frag2[0] != nullptr) &&
-                 (a->l1_k_out > 0) && (mt_total > 0) && (a->win_cap > 0);
+                 (kIntermediate > 0) && (mt_total > 0) && (a->win_cap > 0);
 #endif
     S.epoch = (uint64_t)a->rwk->lf.current_time[0][1];
     S.merge = merge;

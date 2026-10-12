@@ -1305,3 +1305,52 @@ s2 稳定 −0.76%（3/3 轮均改善）；s1 三档在噪声内（TPR=32 单次
 本就在 smem，非溢出主因），但为后续「给任务体/流水腾寄存器」留出空间。距 500µs 仍远；
 剩余主体是 L1 GEMM（≈47%）与跨 block 分片任务量化。
 
+## [261012_15_39] r19balance：精简 `MegaArgs` 成员（去 `l1_k_out`/`l2_k_out`/`y`/计数）— local 2488→2288B、`-s2 top50` 709.9→704.6µs（−0.75%）
+
+> 目标：`-s2 top50` 向 500µs 推进，同时精简 `src/compute.cuh::MegaArgs`（减 `s_a` smem
+> 与使用点寄存器/指令）。逐字段独立 gated，删后跑门禁与 A/B；会破坏「单 .so 双路径」
+> 或 torch 语义的字段保留。
+
+### 1. 逐字段处理结果
+
+| 字段 | 处理 | 依据 |
+|---|---|---|
+| `l1_k_out`(=I=2048) | **删**，全部使用点改常量 `kIntermediate` | test 传 `kIntermediate`；torch 冻结 `FROZEN_INTERMEDIATE_HIDDEN=2048` |
+| `l2_k_out`(=H=6144) | **删**，改常量 `kHidden` | test 传 `kHidden`；torch 冻结 `FROZEN_HIDDEN=6144` |
+| `y` | **删**；移除 `MXK_FUSE_REDUCE` 融合分支（默认关）及 `to_mega_args` 拷贝 | 设备侧仅 fuse 分支读；独立 REDUCE 核用 `MegaLaunchArgs::y`，保留 |
+| `exec_ctr`/`dbg_count` | **删**；`mega_kernel` 入口恒 `ctr=nullptr` | `#if MX_DBG_COUNT` 默认 0，无功能影响 |
+| `pool_ptr` | **留** | torch 传 `nullptr` → 用 `sym+pool_off`；test 传 `rwk->ld.expert_tokens`。二者不等，派生会改 torch 行为 |
+| `prefix_ptr` | **留** | 同上：torch 用 `sym+prefix_off`，test 用 `rwk->ld.prefix_tbl` |
+| `in_bf16` | **留** | torch 运行时按 `SymmBuffer::L.in_bf16` 区分 bf16/fp8（单 .so 双路径），编译期化会破坏 |
+| `slot_capacity` | **留** | test `--max-tokens` 可变、torch `cap` 可变，非固定 |
+
+`l1_k_out`/`l2_k_out` 共 ~175 处使用点（`a->`/`S.a->`）逐点替换为常量；字段声明、
+`MegaLaunchArgs`/`to_mega_args`/`make_args`/torch `make_mega_args` 同步删除。行为逐字不变。
+
+### 2. 内核资源（`MT_DUMP_RES=1`，`-s1 -tprs 16 -nodes 1 -replays 1`）
+
+| 版本 | regs | local | smem(full) | smem(empty) |
+|---|---:|---:|---:|---:|
+| 基线（HEAD `06bb622`） | 256 | **2488 B** | 66160 | 592 |
+| 本改 | 256 | **2288 B（−200 B，−8.0%）** | 66144 | 576 |
+
+### 3. A/B
+
+| 场景 | 基线 | 本改 | 变化 |
+|---|---:|---:|---:|
+| **`-s2 top50` mean（3 轮）** | 709.87 | **704.57（704.68 / 704.56 / 704.57）** | **−0.75%** |
+| s1 TPR=32 | 457.16 | 461.87 | +1.0%（噪声） |
+| s1 TPR=128 | 940.07 | 942.93 | +0.3%（噪声） |
+| s1 TPR=256 | 1678.47 | 1626.16 | **−3.1%** |
+
+### 4. 门禁
+
+- `check --smoke` **PASS 8/8**，6.5s（<10s）。
+- `check --all` **PASS 762/762**，72.7s（`timeout 400` 内）。
+
+### 5. 结论与遗留
+
+删 4 个设备字段使 `local 2488→2288B`、`s_a` smem −16B，`-s2 top50` 稳定 −0.75%、
+s1 TPR256 −3.1% 且其余不回退。`pool_ptr`/`prefix_ptr`/`in_bf16`/`slot_capacity` 因
+torch 语义或运行期灵活性保留。距 500µs 仍远，主体仍为 L1 GEMM 与跨 block 分片。
+

@@ -33,11 +33,9 @@ __device__ __forceinline__ void mega_dispatch_loop(const MegaArgs* a,
 template <bool kWithCompute, MegaPhase kPhase = MegaPhase::Both>
 __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     const bool kTick = (blockIdx.x == 0) && (threadIdx.x == 0);
-#if MX_DBG_COUNT
-    unsigned long long* ctr = mx_ctr_open(a.dbg_count, a.exec_ctr);
-#else
+    // [计数字段移除] 不再从 MegaArgs 读取 exec_ctr/dbg_count：恒 nullptr，
+    //   MX_CTR_ADD 展开为空语句（默认 MX_DBG_COUNT=0）。
     unsigned long long* ctr = nullptr;
-#endif
     if (threadIdx.x == 0) {
         if (blockIdx.x == 0) MX_CTR_ADD(ctr, kCtrKernelLaunch, 1);
         MX_CTR_ADD(ctr, kCtrKernelBlocks, 1);
@@ -129,8 +127,8 @@ __global__ void __launch_bounds__(256) mega_reduce_kernel(
 // [集71] host 侧接口：计数缓冲清零 / 打印
 //
 // 语义（重要，配合 CUDA Graph）：
-//   1) mx_count_enabled()：读运行期 env MXKERNEL_COUNT（"1"/非 0 即开），
-//      host 侧填入 MegaArgs::dbg_count。
+//   1) mx_count_enabled()：读运行期 env MXKERNEL_COUNT（"1"/非 0 即开）。
+//      [计数字段移除] 设备入口恒以 nullptr 运行，计数写入不再生效。
 //   2) mx_count_alloc(dev_ptr)：分配 [kExecCtrSlots] 个 unsigned long long。
 //   3) mx_count_clear(dev_ptr)：**必须在 graph capture 之前、在捕获流之外**
 //      调用。capture 流内做依赖 host 同步（mcMemcpy）的清零会破坏捕获合法性；

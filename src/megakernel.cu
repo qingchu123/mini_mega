@@ -74,21 +74,8 @@ namespace {
 
 // 公共 POD -> 设备入参（逐字段显式拷贝，避免依赖两份结构体布局一致）。
 MegaArgs to_mega_args(const MegaLaunchArgs& a) {
-    // [窗口口径守卫] 拒绝未验证的 win_cap 组合，避免静默产出坏数据。
-    // 放行条件（实验判定，见 .agents/work/guard_sub_w*.log）：
-    //   win == slot，或 win 为 16 的倍数且 48 <= win <= slot。
-    // 已知失败：win<48（16/32 出现 REDUCE/graph 误差）、win 非 16 倍数（40/56
-    // 出现 L1L2 失败）。这些组合仍拒绝。
-    const bool win_ok = (a.win_cap == a.slot_capacity) ||
-                        (a.win_cap % 16 == 0 && a.win_cap >= 32 &&
-                         a.win_cap <= a.slot_capacity);
-    if (!win_ok) {
-        std::fprintf(stderr,
-            "[megakernel] win_cap=%d 不被允许（slot_capacity=%d）：需 win==slot，"
-            "或 win 为 16 的倍数且 32<=win<=slot。\n",
-            a.win_cap, a.slot_capacity);
-        std::exit(2);
-    }
+    // [窗口口径] 不再设守卫：win_cap 由调用方/C++ 选窗逻辑决定
+    //   （torch 层不干预，见 mxk_select_win / src/win_select.cuh）。
     MegaArgs m{};
     m.topk_idx = a.topk_idx;
     m.self = a.self;
@@ -118,8 +105,6 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.max_spins = a.max_spins;
     m.skip_prologue = a.skip_prologue;
     m.prefix_ptr = a.prefix_ptr;
-    m.l1_k_out = a.l1_k_out;
-    m.l2_k_out = a.l2_k_out;
     m.w1 = a.w1;
     m.w2 = a.w2;
     m.ffn_hidden = a.ffn_hidden;
