@@ -76,11 +76,13 @@ struct MegaLaunchArgs {
     // -- 前序 / REDUCE 偏移（self 内）--
     int64_t topk_idx_off = 0;              // REDUCE：self + topk_idx_off = topk_idx 基址
     // -- 数据缓冲偏移（self / peer sym 内）--
-    //   pool / prefix 已移入本 rank 私有 rwk->ld（kernel 直接取），不再有对应字段。
-    int64_t x_off = 0, weights_off = 0, w_off = 0, meta_off = 0;
-    int64_t combine_rows_off = -1;         // combine_rows（BF16）；<0 关闭 COMBINE
-    int64_t prefold_off = 0;               // [BF16-IN] 本地 fold 的 fp8 x 区（self 内）
+    //   pool / prefix 已移入本 rank 私有 rwk->ld（kernel 直接取）；
+    //   [UNK-MERGE] token_route_weights/token_src_meta/prefold/combine_rows 已并入
+    //   unk（kernel 经 a->unk->rd / a->unk_peers 取），不再有对应偏移字段。
+    //   仅保留对外输入视图 x / topk_weights 的 sym 偏移。
+    int64_t x_off = 0, weights_off = 0;
     int in_bf16 = 0;                       // [BF16-IN] x 是 bf16(1)/fp8(0)
+    int skip_combine = 0;                  // [诊断] >0: 任务尾 COMBINE 空操作
     // -- 计算链缓冲 --
     const uint8_t* w1 = nullptr;
     const uint8_t* w2 = nullptr;

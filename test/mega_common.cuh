@@ -341,18 +341,14 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.unk = d.unk;
     a.unk_peers = d.d_unk;
     a.x_off = L.x_off;
-    a.prefold_off = L.prefold_off;
     a.in_bf16 = MX_IN_BF16;
     a.weights_off = L.topk_weights_off;
-    a.w_off = L.token_route_weights_off;
-    a.meta_off = L.token_src_meta_off;
     a.max_spins = (int)kSpinLimit;
     a.w1 = d.w1;
     a.ffn_hidden = d.ffn;
     a.w2 = d.w2;
     a.l2_out = d.l2;
 
-    a.combine_rows_off = g.combine_off;
     a.y = y;
     a.grid = kGrid;
     a.threads = g.threads;

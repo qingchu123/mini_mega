@@ -1545,8 +1545,9 @@ __device__ __forceinline__ void r19_pull_flags(
     const int u4_slice = (kHidden / 16) / S.nslice_eff;   // 本任务 uint4 数
     const int u4_off = slice * u4_slice;
     uint8_t* pool = S.pool_base;
-    float* wt = reinterpret_cast<float*>(const_cast<uint8_t*>(S.a->self) + S.a->w_off);
-    int* meta = reinterpret_cast<int*>(const_cast<uint8_t*>(S.a->self) + S.a->meta_off);
+    // [UNK-MERGE] staging 已并入 unk->rd（rank 内读写）。
+    float* wt = S.a->unk->rd.token_route_weights;
+    int* meta = S.a->unk->rd.token_src_meta;
     const uint32_t* src_tbl =
         &(&S.a->unk->rd)->src_index_table[S.cycle][0][0][0];
     const bool kTick = (S.pt != nullptr) && (blockIdx.x == 0) && (task == 0) &&
@@ -1595,18 +1596,23 @@ __device__ __forceinline__ void r19_pull_flags(
             }
             // [L1L2-SPLIT] pool/frag 数据搬移仅 Both/L1（L2 阶段不碰输入缓冲）。
             if constexpr (kPhase != MegaPhase::L2) {
-                // [BF16-IN] bf16 输入时读本地 fold 后的 fp8 区，否则读 fp8 x。
-                const int64_t xoff =
-                    S.a->in_bf16 ? S.a->prefold_off : S.a->x_off;
+                // [BF16-IN] bf16 输入时读本地 fold 后的 fp8 区（在 unk->rd.prefold，
+                //   peer 可读），否则读 sym 内 fp8 x（对外输入视图，不变）。
+                // [UNK-MERGE] prefold 由 sym 偏移改为 unk 直取（跨 rank 经 unk_peers）。
 #ifdef PULL_LOCAL_DIAG
                 // [诊断] 远端读换成本 rank 本地读（同 volume/pattern），量化远端代价
-                const uint4* srcp = reinterpret_cast<const uint4*>(
-                                        S.a->self + xoff) +
+                const uint8_t* xbase_self = S.a->in_bf16
+                    ? reinterpret_cast<const uint8_t*>(S.a->unk->rd.prefold)
+                    : (S.a->self + S.a->x_off);
+                const uint4* srcp = reinterpret_cast<const uint4*>(xbase_self) +
                                     (size_t)(src_token % S.a->slot_capacity) *
                                         (kHidden / 16) + u4_off;
 #else
-                const uint4* srcp = reinterpret_cast<const uint4*>(
-                                        S.a->peer_bases[src] + xoff) +
+                const uint8_t* xbase = S.a->in_bf16
+                    ? reinterpret_cast<const uint8_t*>(
+                          S.a->unk_peers[src]->rd.prefold)
+                    : (S.a->peer_bases[src] + S.a->x_off);
+                const uint4* srcp = reinterpret_cast<const uint4*>(xbase) +
                                     (size_t)src_token * (kHidden / 16) + u4_off;
 #endif
                 // [H2] 本场景 u4_slice=96（6144/16/4）：3 个远端装载先全量发出，
@@ -1785,11 +1791,13 @@ __device__ __forceinline__ void r19_l1_pub_wait(
 
 __device__ __forceinline__ CombineCtx cm_build_ctx(const R19Sched& S) {
     CombineCtx c;
-    c.meta = reinterpret_cast<const int*>(S.a->self + S.a->meta_off);
-    c.weights = reinterpret_cast<const float*>(S.a->self + S.a->w_off);
+    // [UNK-MERGE] staging 与 combine_rows 均在 unk（rd）；COMBINE 开关由
+    //   skip_combine 诊断位决定（取代原 combine_rows_off<0 语义）。
+    c.meta = S.a->unk->rd.token_src_meta;
+    c.weights = S.a->unk->rd.token_route_weights;
     c.peer_bases = S.a->peer_bases;
     c.unk_peers = S.a->unk_peers;
-    c.rows_off = S.a->combine_rows_off;
+    c.combine_on = !S.a->skip_combine;
     c.epoch = S.epoch;
     c.block_idx = (int)blockIdx.x;
     c.staging_cap = S.a->win_cap;
@@ -1800,7 +1808,7 @@ __device__ __forceinline__ void r19_tail_common(
         const R19Sched& S, const CombineCtx& ctx, bool fused, int task, int e,
         int w, int count, int slice, unsigned epoch, int pool_slot) {
     (void)S; (void)task; (void)e; (void)w; (void)pool_slot; (void)epoch;
-    if (ctx.rows_off >= 0) {
+    if (ctx.combine_on) {
         const int lane = (int)(threadIdx.x % 64);
         const int warp = (int)(threadIdx.x / 64);
         CombineCtx c = ctx;
@@ -1845,7 +1853,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     // [tail 内联] ctx/fuse 由 S 现构造（CombineTail 已去除）
     const CombineCtx cctx = cm_build_ctx(S);
     CombineFuseCtx fuse;
-    fuse.capable = (cctx.rows_off >= 0);
+    fuse.capable = cctx.combine_on;
     fuse.c = &cctx;
     fuse.out_base = reinterpret_cast<const uint8_t*>(S.a->l2_out);
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是

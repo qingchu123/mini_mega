@@ -53,12 +53,13 @@ struct MegaArgs {
     uint8_t* const* peer_bases;   // 各 rank 对称区基址表（拉 x / weights）
     const int64_t* topk_idx;      // 本 rank 输入路由（对称区内视图）
     // -- 数据缓冲偏移（self / peer sym 内）--
-    //   pool / prefix 已移入本 rank 私有 rwk->ld（kernel 从 a->rwk->ld 取），
-    //   不再经 sym 偏移或外部指针覆盖。
-    int64_t x_off, weights_off, w_off, meta_off;
-    int64_t combine_rows_off;     // 目标 rank combine_rows（BF16，<0 关闭 COMBINE）
-    int64_t prefold_off;          // [BF16-IN] 本地 fold 的 fp8 x 区（self 内偏移）
+    //   pool / prefix 已移入本 rank 私有 rwk->ld（kernel 从 a->rwk->ld 取）；
+    //   [UNK-MERGE] token_route_weights/token_src_meta/prefold/combine_rows 已并入
+    //   unk（kernel 经 a->unk->rd / a->unk_peers 取），不再经 sym 偏移。
+    //   仅保留对外输入视图 x 与 topk_weights 的 sym 偏移。
+    int64_t x_off, weights_off;
     int in_bf16;                  // [BF16-IN] 输入 x 是 bf16(1) / fp8(0)
+    int skip_combine;             // [诊断] MX_SKIP_COMBINE=1 → 任务尾 COMBINE 空操作
     // -- 计算链缓冲 --
     // l1_k_out/l2_k_out 已内联为常量 kIntermediate/kHidden（本子集固定）。
     const uint8_t* w1;            // [EPR][2I][H] lane 序 packed tile（gate/up 配对）

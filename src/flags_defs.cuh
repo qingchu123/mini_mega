@@ -150,6 +150,15 @@ struct alignas(256) ranks_data {
     alignas(256) uint32_t expert_recv_counts[M_CYCLE][kRanks][64];
     alignas(256) uint16_t combine_rows[M_CYCLE][kTopk][kMaxTPR][kHidden];
 
+    // ---- [UNK-MERGE] kernel 自有内部 staging（原 sym scratch 经 offset 访问，
+    //   现并入 unk_data：kernel 经 rd 直接访问，peer 亦可读 prefold）。----
+    //   维度取最大使用：token 槽按 blockIdx<kGrid、窗口行 stride 用运行期 win_cap
+    //   （≤ slot_capacity ≤ kMaxTPR），故扁平维 [kGrid * kMaxTPR] 覆盖全部索引；
+    //   prefold = slot_cap*H fp8（[kMaxTPR][kHidden]）。
+    alignas(256) float token_route_weights[kGrid * kMaxTPR];
+    alignas(256) int token_src_meta[kGrid * kMaxTPR * 3];
+    alignas(256) uint8_t prefold[kMaxTPR][kHidden];
+
 };
 
 

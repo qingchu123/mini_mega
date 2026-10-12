@@ -111,6 +111,15 @@
 #define R30_DIAG_NOREAD 0
 #endif
 
+// [方向3] REDUCE 并入 mega 尾（默认 0 = 行为逐字等价基线，独立 mega_reduce_kernel）。
+//   =1 时 launch_full 不再单发 REDUCE：mega_kernel 任务循环结束后，各 block 就地
+//   按 item=(token,half) 轮分执行 reduce_tile_body。epoch/cyc 取自本轮 task_setup
+//   已自增的 current_time[0][1]，与独立 kernel 路径一致。仅 kWithCompute+Both 生效。
+//   融合路径的输出 y 由 MegaArgs::y 携带（host 传入，逐节点可不同）。
+#ifndef MXK_FUSE_REDUCE
+#define MXK_FUSE_REDUCE 0
+#endif
+
 // combine_rows 指针（M_CYCLE 片）。数组→元素指针需要 reinterpret_cast。
 __device__ __forceinline__ uint16_t* cmb_rows(ranks_data* rd, int cycle) {
     return reinterpret_cast<uint16_t*>(rd->combine_rows[cycle]);
@@ -119,12 +128,10 @@ __device__ __forceinline__ const uint16_t* cmb_rows(const ranks_data* rd,
                                                     int cycle) {
     return reinterpret_cast<const uint16_t*>(rd->combine_rows[cycle]);
 }
-// 兼容旧调用点（未提供 ranks_data 时回退到 sym + rows_off）。
-__device__ __forceinline__ uint16_t* cmb_rows_compat(
-        unk_data* const* up, uint8_t* const* pb, long long off, int src,
-        int cycle) {
-    if (up != nullptr) return cmb_rows(&up[src]->rd, cycle);
-    return reinterpret_cast<uint16_t*>(const_cast<uint8_t*>(pb[src]) + off);
+// [UNK-MERGE] combine_rows 恒在 unk（rd）：直接取 peer 基址（含 self）。
+__device__ __forceinline__ uint16_t* cmb_rows_compat(unk_data* const* up,
+                                                     int src, int cycle) {
+    return cmb_rows(&up[src]->rd, cycle);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,8 +149,8 @@ struct CombineCtx {
     const int* meta = nullptr;          // staging 元数据视图（见上）
     const float* weights = nullptr;     // staging 权重视图（无效行 = 0）
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址（含 self）
-    unk_data* const* unk_peers = nullptr;  // 各 rank unk（含 self）：rd=combine_rows，rf=完成标记
-    long long rows_off = -1;            // 目标 rank combine_rows 区偏移（BF16）
+    unk_data* const* unk_peers = nullptr;  // 各 rank unk（含 self）：rd=combine_rows/staging，rf=完成标记
+    bool combine_on = true;             // [UNK-MERGE] 取代原 rows_off<0：false 时空操作
     uint64_t epoch = 0;                 // 本窗 64 位 epoch（= current_time）
     int slice = 0;                      // 本 block 任务切片号 [0, kNSlice)
     int block_idx = 0;                  // staging 块号（= blockIdx.x）
@@ -192,7 +199,7 @@ __device__ __forceinline__ void combine_push_one_row(
     const int stok = m[1];
     const int kk = m[2];
     const uint16_t* srow = out_h + stag * kHidden + col_lo;
-    uint16_t* drow_h = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src, f.c->cycle) +
+    uint16_t* drow_h = cmb_rows_compat(f.c->unk_peers, src, f.c->cycle) +
         ((size_t)kk * kMaxTPR + stok) * kHidden + col_lo;
     for (int i = lane; i < nu4; i += 64) {
 #if R30_DIAG_NOREAD
@@ -262,13 +269,13 @@ __device__ __forceinline__ void combine_push_chunk_rows(
         const int src1 = m1[0], stok1 = m1[1], kk1 = m1[2];
         const int src2 = m2[0], stok2 = m2[1], kk2 = m2[2];
         const int src3 = m3[0], stok3 = m3[1], kk3 = m3[2];
-        uint16_t* d0 = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src0, f.c->cycle) +
+        uint16_t* d0 = cmb_rows_compat(f.c->unk_peers, src0, f.c->cycle) +
             ((size_t)kk0 * kMaxTPR + stok0) * kHidden + col_lo;
-        uint16_t* d1 = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src1, f.c->cycle) +
+        uint16_t* d1 = cmb_rows_compat(f.c->unk_peers, src1, f.c->cycle) +
             ((size_t)kk1 * kMaxTPR + stok1) * kHidden + col_lo;
-        uint16_t* d2 = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src2, f.c->cycle) +
+        uint16_t* d2 = cmb_rows_compat(f.c->unk_peers, src2, f.c->cycle) +
             ((size_t)kk2 * kMaxTPR + stok2) * kHidden + col_lo;
-        uint16_t* d3 = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, src3, f.c->cycle) +
+        uint16_t* d3 = cmb_rows_compat(f.c->unk_peers, src3, f.c->cycle) +
             ((size_t)kk3 * kMaxTPR + stok3) * kHidden + col_lo;
         const uint16_t* s0 = out_h + stag * kHidden + col_lo;
 #if R30_PUSHSTRIDE
@@ -354,7 +361,7 @@ __device__ __forceinline__ void combine_push_warp_cols(
         if (f.c->weights[stag] == 0.0f) continue;
         const int* m = f.c->meta + stag * 3;
         const uint16_t* srow = out_h + stag * kHidden;
-        uint16_t* drow = cmb_rows_compat(f.c->unk_peers, f.c->peer_bases, f.c->rows_off, m[0], f.c->cycle) +
+        uint16_t* drow = cmb_rows_compat(f.c->unk_peers, m[0], f.c->cycle) +
             ((size_t)m[2] * kMaxTPR + m[1]) * kHidden;
         for (int q = 0; q < nb; ++q) {
             const int col = (g0 + q) * block_n + warp * n_per_warp + j * 8;
@@ -438,7 +445,7 @@ __device__ __forceinline__ void combine_push_pair(
         const int stok = m[1];   // 源 token
         const int kk = m[2];     // topk 槽
         const uint16_t* srow = out_h + stag * kHidden;
-        uint16_t* drow_h = cmb_rows_compat(c.unk_peers, c.peer_bases, c.rows_off, src, c.cycle) +
+        uint16_t* drow_h = cmb_rows_compat(c.unk_peers, src, c.cycle) +
             ((size_t)kk * kMaxTPR + stok) * kHidden;
         for (int mi = 0; mi < c.merge; ++mi) {   // 覆盖的每个逻辑列段
             const int c0 = (lg0 + mi) * kCpl;
@@ -470,21 +477,21 @@ __device__ __forceinline__ void combine_push_pair(
 }
 
 // ---------------------------------------------------------------------------
-// REDUCE：每 token 2 个 block（列分半）协作完成 topk 加权求和 → y（FP32）。
-//   self    ：本 rank 对称区基址（combine_rows/sums/topk_idx/weights 的视图）。
+// REDUCE 分片体：对给定 (token, half) 完成 topk 加权求和 → y（FP32）。
+//   [方向3] 抽出 token/half 参数，既供独立 mega_reduce_kernel（wrapper
+//   reduce_body 按 blockIdx 派生），也供「并入 mega 尾」的融合路径直接循环调用。
+//   self    ：本 rank 对称区基址（combine_rows fallback / 视图）。
 //   y       ：输出 [tokens][kHidden] FP32。
 //   R       ：rank 数（有效专家判据 e < R*kEPR）。
-//   combine_cap：combine_rows/sums 行容量（= max_tokens；行索引
-//               (k*combine_cap+token)）。
-//   其余偏移与 bar_flags 语义同骨架 reduce_kernel（bench:1283-1365）。
 //   等待放行判据：sums 标记 >= epoch（单调）；无效 k 不等待、不累加。
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void reduce_body(
+__device__ __forceinline__ void reduce_tile_body(
         const uint8_t* self, const ranks_data* remote, float* y, int R,
-        int tokens, long long combine_rows_off,
-        long long topk_idx_off, long long weights_off,
+        int tokens, int token, int half,
+        const int64_t* topk_idx, const float* weights,
         local_flags* lf, ranks_flags* rf, long long task_ready_idx,
         int max_spins, unsigned long long* ctr = nullptr) {   // 槽 stride 固定 = kCombineSlicesMax（结构体维度）
+    (void)self;   // [UNK-MERGE] combine_rows 恒从 unk（remote=rd）读
     // [M_CYCLE] REDUCE 是独立 kernel：mega 末尾已把 current_time[0][1] 自增到 L+1
     // （block0 为 leader，每 launch 恰自增一次），故 (ct-1)%M_CYCLE = L%M_CYCLE，
     // 与本轮 mega 的 bar / combine_sums 片一致。用 device 计数派生，graph 安全。
@@ -497,16 +504,8 @@ __device__ __forceinline__ void reduce_body(
     }
     // 64 位 epoch：mega 的 task_setup 已把 current_time[0][1] 增至本轮值。
     const uint64_t epoch = (uint64_t)lf->current_time[0][1];
-    const int64_t* topk_idx =
-        reinterpret_cast<const int64_t*>(self + topk_idx_off);
-    const float* weights = reinterpret_cast<const float*>(self + weights_off);
-    const uint16_t* rows_h = remote != nullptr
-        ? cmb_rows(remote, cyc)
-        : reinterpret_cast<const uint16_t*>(self + combine_rows_off);
+    const uint16_t* rows_h = cmb_rows(remote, cyc);
     const int tid = (int)threadIdx.x;
-    // 每 token 2 个 block（列分半），grid=kGrid=32 覆盖 TPR=16 的 32 个半区
-    const int token = (int)blockIdx.x / 2;
-    const int half = (int)blockIdx.x % 2;
     const int cols_h = kHidden / 2;
     const int c_base = half * cols_h;
     if (token < tokens) {
@@ -582,4 +581,19 @@ __device__ __forceinline__ void reduce_body(
         }
         __syncthreads();
     }
+}
+
+// 独立 mega_reduce_kernel 的入口 wrapper：blockIdx → (token, half) 映射逐字保持
+// 基线（每 token 2 个 block，列分半）。行为与重构前逐字等价。
+__device__ __forceinline__ void reduce_body(
+        const uint8_t* self, const ranks_data* remote, float* y, int R,
+        int tokens, long long topk_idx_off, long long weights_off,
+        local_flags* lf, ranks_flags* rf, long long task_ready_idx,
+        int max_spins, unsigned long long* ctr = nullptr) {
+    const int token = (int)blockIdx.x / 2;
+    const int half = (int)blockIdx.x % 2;
+    reduce_tile_body(self, remote, y, R, tokens, token, half,
+                     reinterpret_cast<const int64_t*>(self + topk_idx_off),
+                     reinterpret_cast<const float*>(self + weights_off),
+                     lf, rf, task_ready_idx, max_spins, ctr);
 }

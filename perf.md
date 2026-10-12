@@ -1457,3 +1457,61 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
 后续项；torch 公有视图 `mega.l1_acts`（原指向 sym expert_tokens）随之不再反映 kernel pool
 （仓内无消费者）。距 500µs 仍远，主体仍为 L1 GEMM 与跨 block 分片任务量化。
 
+## [261012_16_36] r19balance：内部 sym scratch 并入 `unk_data`（`rd`）— 删 4 个 `*_off`、`local` −32B、`-s2 top50` ≈中性
+
+> 目标：把**非对外**的 sym scratch 字段并入 `unk_data`（`src/flags_defs.cuh` 的
+> `ranks_data`），仿 `ranks_data` 按最大使用量声明数组；kernel 改走
+> `a->unk->rd` / `a->unk_peers`。**对外输入视图 `x`/`topk_idx`/`topk_weights`
+> 仍留在 sym（不变）**。`src_index_table`/`expert_recv_counts`/`combine_rows`
+> 本就在 `rd`，本轮去重后 kernel 恒用 `rd`。
+
+### 1. 改动
+
+- `src/flags_defs.cuh`：`ranks_data` 追加 `token_route_weights[kGrid*kMaxTPR]`、
+  `token_src_meta[kGrid*kMaxTPR*3]`、`prefold[kMaxTPR][kHidden]`（`alignas(256)`）。
+- `src/compute.cuh`/`src/megakernel.{h,cu}`：删 `MegaArgs`/`MegaLaunchArgs` 的
+  `w_off`/`meta_off`/`prefold_off`/`combine_rows_off`（及 `to_mega_args` 拷贝）；
+  新增诊断位 `skip_combine`（取代原 `combine_rows_off<0` 语义）。
+- `src/compute_big.cuh`：staging `wt/meta` 改 `a->unk->rd.token_route_weights/
+  token_src_meta`；pull 源 `prefold` 改 `unk_peers[src]->rd.prefold`（fp8 `x` 仍走
+  `peer_bases`+`x_off`）；`cm_build_ctx`/`r19_tail_common` 的 COMBINE 开关改 `combine_on`。
+- `src/kernel.cuh`：`x_fold_body` 写 `a.unk->rd.prefold`；`mega_reduce_kernel` 删 `rows_off`。
+- `src/combine.cuh`：`CombineCtx.rows_off`→`combine_on`；`cmb_rows_compat` 恒取
+  `unk_peers[src]->rd`；`reduce_tile_body`/`reduce_body` 删 `combine_rows_off`
+  （`combine_rows` 恒从 `remote=rd` 读）。另含工作区既有的 `MXK_FUSE_REDUCE`（默认 0）
+  脚手架。
+- `src/multi_compile/kernel_reduce.cu`、`test/mega_common.cuh`、`torch/csrc/apis/mega.hpp`：
+  同步删对应形参/赋值。
+- sym 布局（`mega_moe.cuh`/`host_layout.cuh`/`layout.hpp`）**保留**该部分 scratch 槽
+  （仅不再被 kernel 使用，降低风险；见遗留）。
+
+### 2. 内核资源（`MT_DUMP_RES=1`，`-s1 -tprs 16 -nodes 1 -replays 1`）
+
+| 版本 | regs | local | smem(full) | smem(empty) |
+|---|---:|---:|---:|---:|
+| 基线（HEAD `5362f49`） | 256 | 2288 B | 66064 | 496 |
+| 本改 | 256 | **2256（−32B）** | **66032（−32B）** | **464（−32B）** |
+
+### 3. A/B（us_mean 跨 rank，同会话）
+
+| 场景 | 基线 | 本改 | 变化 |
+|---|---:|---:|---:|
+| **`-s2 top50` mean（3 轮）** | 699.52 | **701.50** | +0.28%（噪声内） |
+| s1 TPR=32 | 451.84 | 449.22 | −0.6%（噪声） |
+| s1 TPR=128 | 932.98 | 900.97 | −3.4%（噪声/利好） |
+| s1 TPR=256 | 1623.17 | 1620.23 | −0.2%（噪声） |
+
+### 4. 门禁
+
+- `check --smoke` **PASS 8/8**，5.99s（`timeout 10` 内）。
+- `check --all` **PASS 762/762**，73.72s（`timeout 400` 内）。
+- `MACA_PATH=/opt/maca scripts/build.sh so check mybench` 通过。
+
+### 5. 结论与遗留
+
+行为逐字不变的结构精简：`MegaArgs` −4 个 `*_off` 字段、`s_a` smem −32B、`local` −32B；
+性能中性（`-s2 top50` +0.28% 在噪声内，s1 TPR=128 略优）。sym 中该部分 scratch 槽**保留未删**
+（`L.token_route_weights_off`/`token_src_meta_off`/`prefold_off`/`combine_rows_off` 仍计算），
+仅 kernel 不再读写，属可省内存/可继续收紧的后续项。距 500µs 仍远，主体仍为 L1 GEMM 与
+跨 block 分片任务量化。
+

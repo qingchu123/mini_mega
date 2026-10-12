@@ -91,21 +91,18 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.unk_peers = a.unk_peers;
     m.x_off = a.x_off;
     m.weights_off = a.weights_off;
-    m.w_off = a.w_off;
-    m.meta_off = a.meta_off;
     m.max_spins = a.max_spins;
     m.skip_prologue = a.skip_prologue;
     m.w1 = a.w1;
     m.w2 = a.w2;
     m.ffn_hidden = a.ffn_hidden;
     m.l2_out = a.l2_out;
-    m.combine_rows_off = a.combine_rows_off;
-    m.prefold_off = a.prefold_off;
     m.in_bf16 = a.in_bf16;
-    // [诊断] MX_SKIP_COMBINE=1：禁用任务尾 COMBINE（combine_rows_off<0 → 空操作）
+    m.skip_combine = a.skip_combine;
+    // [诊断] MX_SKIP_COMBINE=1：禁用任务尾 COMBINE（skip_combine=1 → 空操作）
     if (const char* s = std::getenv("MX_SKIP_COMBINE");
         s != nullptr && std::atoi(s) != 0)
-        m.combine_rows_off = -1;
+        m.skip_combine = 1;
     return m;
 }
 
@@ -198,7 +195,7 @@ void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
 void launch_reduce(const MegaLaunchArgs& a, mcStream_t stream) {
     mega_reduce_kernel<<<2 * a.tokens, 256, 0, stream>>>(
         a.self, a.unk ? &a.unk->rd : nullptr, a.y, a.R, a.tokens,
-        a.combine_rows_off, a.topk_idx_off, a.weights_off,
+        a.topk_idx_off, a.weights_off,
         a.rwk ? &a.rwk->lf : nullptr, a.unk ? &a.unk->rf : nullptr,
         kBarTaskReadyIdx, a.max_spins);
 }

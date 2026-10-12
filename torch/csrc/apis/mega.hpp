@@ -239,16 +239,12 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
   // flag 索引已内联为设备侧编译期常量 kBar*Idx（src/common.cuh，镜像 layout 头）。
   a.x_off = b.L.x_off;
   a.weights_off = b.L.topk_weights_off;
-  a.w_off = b.L.token_route_weights_off;
-  a.meta_off = b.L.token_src_meta_off;
   a.max_spins = 4000000;
   a.skip_prologue = (int)skip_prologue;
   a.w1 = w1;
   a.ffn_hidden = b.ffn_hidden;
   a.w2 = w2;
   a.l2_out = b.l2_out;
-  a.combine_rows_off = b.L.combine_rows_off;
-  a.prefold_off = b.L.prefold_off;
   a.in_bf16 = b.L.in_bf16;
   a.y = y;
   a.grid = (int)kMegaGrid();

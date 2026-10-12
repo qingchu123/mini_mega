@@ -69,10 +69,11 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         // [R38] 复用前序：路由/计数持久，跳过 ROUTE/PUBLISH（数据与 node0 相同）。
         if (kTick) a.rwk->lf.pre_ticks[0] = a.rwk->lf.pre_ticks[1] = clock64();
     }
-    // [BF16-IN] 本地 x(bf16) fold → fp8（写 self+prefold_off），供 peer pull。
+    // [BF16-IN] 本地 x(bf16) fold → fp8（写 unk->rd.prefold），供 peer pull。
+    // [UNK-MERGE] 折叠区已并入 unk，跨 rank 经 unk_peers 读。
     if (a.in_bf16)
         x_fold_body(a.self + a.x_off,
-                    const_cast<uint8_t*>(a.self) + a.prefold_off,
+                    reinterpret_cast<uint8_t*>(a.unk->rd.prefold),
                     a.tokens * kHidden);   // peer 只读有效 token 行
     // 2) XBAR_ROUTE_READY（每节点：可见性门 + 跨 rank 对齐）
     if (a.skip_prologue >= 2) {
@@ -117,7 +118,7 @@ extern template __global__ void mega_kernel<true, MegaPhase::Both>(MegaArgs);
 // REDUCE：每 token 2 个 block 列分半
 __global__ void __launch_bounds__(256) mega_reduce_kernel(
     const uint8_t* self, const ranks_data* remote, float* y, int R, int tokens,
-    int64_t rows_off, int64_t topk_idx_off, int64_t weights_off,
+    int64_t topk_idx_off, int64_t weights_off,
     local_flags* lf, ranks_flags* rf, int64_t task_ready_idx, int max_spins
 #if MX_DBG_COUNT
     , unsigned long long* exec_ctr, int dbg_count
