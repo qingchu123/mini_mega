@@ -1824,9 +1824,13 @@ __device__ R19_BIG_ATTR void r19_big_task(
                             ((kHidden / 32) % R24_KS == 0) &&
                             (g_l1 % R19_L1_BATCH == 0);
         if (count <= 32 && g_l1 % 4 == 0) {
-            // [L1TUNE-B] 17..32 档：MT2/PF1（同 1 组权重、acc 减半）替代 MT4/PF2。
+            // [L1TUNE-B] 17..32 档：MT2（同 1 组权重、acc 减半）替代 MT4。
             //   实测 TPR24 630→483（−23%，docs/15/16）。count≤16 走 small 档。
-            r19_l1_big_iso<2, 1, 4>(
+            // [261012_方向2] PF1→PF2：本档 B 为延迟受限，PF1 每步暴露全局装载
+            //   延迟；regspill 隔离（R19_L1BIG_ISO noinline）落地后 PF2 的额外
+            //   寄存器预算可承受。实测 -s2 top50 750.4→734.4µs（−2.1%）、
+            //   均衡 TPR32 489.8→470.1µs（−4.0%），check --all 762/762 PASS。
+            r19_l1_big_iso<2, 2, 4>(
                 pool_w, fbase, S.mt_total, S.a->w1, e, count, kHidden,
                 (2 * S.a->l1_k_out), kL1BlockN, lane, warp, kComputeWarps, S.l1_chk,
                 g0_l1, g_l1, ffn_slot, ffn2, out_col_base, S.a->l1_k_out);

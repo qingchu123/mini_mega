@@ -967,3 +967,164 @@ s2 的 win_global 由 128 降到 64，额外收紧 ffn/l2 缓冲。
 以等量的 smem 端口流量为代价，净中性偏负。要压低 B 需**减少权重字节/提高复用**
 （窗口/布局类），而非掩盖延迟。**未接近 400µs**；开关默认关
 （`R24_BSMEM_B=0` 编译期消除，关时 `check --all` 762/762、s1/s2 逐字等价基线）。
+
+## [261012_11_10] 方向3：通信/REDUCE 与计算重叠 — 净中性/微回退，默认关（否决策略，附关键结论）
+
+> 目标：`-s2 top50` ~751µs 尽量下降（终极 400µs）。本任务聚焦「把通信/REDUCE 与
+> 计算重叠」。改动：`src/combine.cuh`（`reduce_body` 拆出 `reduce_tile_body` + wrapper；
+> 新增 `MXK_FUSE_REDUCE` 开关）、`src/kernel.cuh`（mega 尾融合 REDUCE）、
+> `src/megakernel.cu`（`launch_full` 融合分支 + `to_mega_args` 传 y）、
+> `src/compute.cuh`（`MegaArgs::y` 字段）。开关默认关（`MXK_FUSE_REDUCE=0` 编译期消除，
+> 关时逐字等价基线）。
+> 口径：`test/mybench -R 32`；s1 = `-s1 tprs 32,128,256 -nodes 3 -replays 2`，
+> s2 = `-s2 top50 -replays 3`，us_mean（跨 rank）。
+
+### 1. 关键诊断（本机，R=32）
+
+先把「通信地板」逐项消融量化（`-s2 top50` us_mean；`CM_SKIP_GEMM` 见
+`src/compute.cuh:99`，`PULL_LOCAL_DIAG` 见 `src/compute_big.cuh:1490`，
+`MX_SKIP_REDUCE` 见 `src/megakernel.cu`）：
+
+| 口径 | s2 top50 mean | 差值（=该分量在关键路径上的边际成本） |
+|---|---:|---:|
+| 基线 | 753.3 | — |
+| `CM_SKIP_GEMM=1`（纯通信+REDUCE） | **174.9** | 地板 174.9（非与 GEMM 相加项） |
+| `MX_SKIP_REDUCE=1` | 739.0 | **REDUCE ≈ 14.3µs** |
+| `PULL_LOCAL_DIAG=1`（A 远端读→本地读） | 740.4 | **A 远读 ≈ 13.0µs** |
+| `R30_DIAG_NOPUSH=1`（去 COMBINE 融合推送） | 805.7 | 反而更慢（推送已重叠，非暴露项） |
+
+s1（同法，`PULL_LOCAL_DIAG`）：
+
+| 档 | 基线 us | PULL_LOCAL us | A 远读 |
+|---|---:|---:|---:|
+| TPR=128 | 949.4 | 884.9 | **≈ 64.5µs** |
+| TPR=256 | 1670.2 | 1625.4 | **≈ 44.8µs** |
+| TPR=256 `MX_SKIP_REDUCE` | 1670.2 | 1637.6 | REDUCE ≈ 32.6µs |
+
+**核心结论**：`CM_SKIP_GEMM` 的 174.9µs「地板」**不等于**可回收量——在完整
+路径中，A pull / COMBINE 推送 / 跨 block 分片 wait-all 大部分已被 GEMM 计算掩盖
+（PULL 边际仅 13µs、NOPUSH 反而更慢）。**通信真正暴露在 s2 关键路径上的边际
+只有 REDUCE 14µs + A 远读 13µs ≈ 27µs（3.6%）**；s1 主要暴露项是 A 远读
+45~65µs。故方向3 对 s2 的理论上限约 749→722µs，**远达不到 400µs**。
+
+### 2. 候选1（REDUCE 并入 mega 尾，`MXK_FUSE_REDUCE=1`）
+
+实现：`mega_kernel` 任务循环后各 block 就地按 `item=(token,half)` 轮分执行
+`reduce_tile_body`（`src/kernel.cuh`）；`launch_full` 不再单发
+`mega_reduce_kernel`。epoch/cyc 取自本轮 task_setup 已自增的
+`current_time[0][1]`，与独立核一致；y 由 host 经新增 `MegaArgs::y` 传入。
+
+**正确性**：开 `check --smoke` **8/8 PASS**（<10s，含 graph×50）；关
+`check --all` **762/762 PASS**（78.6s）。
+
+**A/B**：
+
+| 场景 | 基线（默认关） | 融合 | 变化 |
+|---|---:|---:|---:|
+| s2 top50 mean | 749.1 | 755.0 | +0.8% |
+| s1 TPR=32 | 485.2 | 492.8 | +1.6% |
+| s1 TPR=128 | 950.5 | 983.8 | **+3.5%** |
+| s1 TPR=256 | 1675.5 | 1717.1 | **+2.5%** |
+
+→ **净中性/微回退，默认关**。根因（实测）：
+1. **SM 已被 mega 占满**：`MT_DUMP_RES=1` 显示 `full regs=256 smem=66160`，
+   512 线程 ×256 regs 已吃满单 SM 寄存器预算，reduce 无法与 GEMM 的其它 block
+   真正并发（融合只是把 reduce 排到各 block 任务之后，无重叠窗口）。
+2. 独立 REDUCE 用 `2*tokens` 个 block；融合后仅 `kGrid=32` 个 block，s1 大档
+   （tokens=256 → 需 512 block）并行度降 16×，故 s1 明显回退（s2 tokens=16，
+   2*tokens=32=grid，故中性）。
+
+### 3. 候选2/3 评估（未产生正收益）
+
+- **候选2（pull 提高在飞请求数/预取）**：pull 热路径已是最优——`win=48/64` 时
+  `u4_slice=96` 走 `[H2]` 三条远端装载全发再连续 store（`src/compute_big.cuh:1503`），
+  MLP 已满；且 A 是 FG 远读带宽受限（平台 ~10GB/s，perf.md 前记）。s2 边际仅 13µs。
+- **候选3（COMBINE 推送与计算重叠）**：R29 融合推送已生效；`R30_DIAG_NOPUSH`
+  去推送反而更慢（805.7µs），说明推送已完全隐藏在 L2 内，无剩余串行尾。
+- **候选1 的跨 launch 变体（独立 stream）**：本机验证 MACA 流捕获语义——`BeginCapture
+  (ThreadLocal)` 下若侧流未在 `EndCapture` 前 join，返回 `ErrInvalidState(904)` 且
+  无图产出（`.agents/work/impl1/tmp/cap_test2.cu`）。bench/check 逐节点调用
+  `launch_full` 且不提供 finalize 钩子，**N 节点必留 ≥1 个未 join 的 REDUCE 侧流工作**，
+  跨节点重叠在现有 harness 下不可实现（除非改 test/mybench.cu/check.cu 的捕获模式，
+  属越界）。
+
+### 4. 结论与遗留
+
+- **方向3 对 s2 的边际上限 ≈ 27µs（REDUCE 14 + A 远读 13），已基本被现有实现
+  吃掉**；融合 REDUCE 净中性/微回退，默认关。**未接近 400µs**。
+- 通往 400µs 的**剩余杠杆不在通信/重叠**，而在 GEMM 本体（s2 中 ≈576µs）与
+  跨 block 分片 wait-all 的**任务量化**（每窗 NS=4 片、鸽笼上界，见 README
+  「块级代价感知 LPT」）。
+- 遗留：若允许改 harness（Global 捕获 + 显式 finalize），可尝试跨节点
+  side-stream REDUCE；但本机 SM 已满，预期仍受并发窗口限制。
+
+## [261012_10_01] 方向2：17..32 档 L1 预取 PF1→PF2（每窗延迟隐藏）— s2 −2.1%、s1 TPR32 −4.0%
+
+> 目标：`-s2 top50` ~751µs 尽量下降（终极 400µs）。本任务聚焦「压缩掩码浪费 + 每窗固定
+> 开销」。改动仅 `src/compute_big.cuh`（17..32 档档位 1 行；`r19_big_task` L1 段）。
+> 口径：`test/mybench -R 32`；s1 = `-s1 tprs 32,128,256 -nodes 3 -replays 2`，
+> s2 = `-s2 top50 -replays 3`，us_mean（跨 rank）；各 2~3 次均值。
+> 说明：早期在共享主工作副本测得的「PF1 4× 加速」经隔离 worktree 复核为**并发构建
+> 污染伪值**（另一 Agent 同时重建 `test/mybench`），已丢弃。
+
+### 1. 诊断（隔离 worktree，R=32）
+
+- `-s2 top50` 为**单波**：每 rank 仅约 7 个窗口（专家平均 count≈18~48），`out_processed`
+  最大 ≈2 任务/块；内核墙钟 ≈ 最忙 rank 的单任务耗时。
+- 相位（`R24_DIAG_PHASE=1`）：L1 占关键路径最大头（trL1max 典型 36~45 万周期），
+  L2 次之；`CM_SKIP_GEMM` 地板 ≈175µs（见方向3 节），故剩余杠杆在 GEMM 本体。
+- 掩码：窗口 M 对齐到 16 是 16×16 MMA 的固有粒度；count∈17..31 走 MT2 计 32 行，
+  多算的 0~15 行**不增加 B（权重）流量**（B 按 expert 全量、与 count 无关），
+  故“行功 6049 vs 4096”主要是 MMA 空转而非带宽项。**方向2 的可行子项收敛为
+  「每窗 B 装载延迟隐藏（预取深度）」**，而非削减对齐行。
+
+### 2. 改动
+
+`src/compute_big.cuh:1826-1837`，17..32 档（`count<=32 && g_l1%4==0`）：
+
+```
+- r19_l1_big_iso<2, 1, 4>(   // MT2 / B 预取环 1（无重叠）
++ r19_l1_big_iso<2, 2, 4>(   // MT2 / B 预取环 2（一步预取，隐藏装载延迟）
+```
+
+A 档（MT2）、N 批（B4）、fragment 路径均不变；仅 B 寄存器预取环深 1→2。
+（docs/15/16 当年选 PF1 是为省寄存器；`R19_L1BIG_ISO=__noinline__` 隔离落地后
+额外寄存器预算可承受。）**掩码行数、窗口数、win 分布均不变。**
+
+### 3. A/B
+
+| 场景 | 基线 | 本改（PF2） | 变化 |
+|---|---:|---:|---:|
+| **`-s2 top50` mean** | **750.4**（751.0 / 749.7） | **734.4**（734.8 / 733.9） | **−2.1%** |
+| s1 TPR=32 | 489.8（483.7 / 503.2 / 482.5） | 470.1（467.9 / 469.4 / 473.0） | **−4.0%** |
+| s1 TPR=128 | 956.2 | 947.0 | −1.0% |
+| s1 TPR=256 | 1683.1 | 1681.8 | −0.1% |
+
+s1 三档均不劣（TPR=32 即本档；128/256 走 async 路径，差异在噪声内）。
+
+### 4. 门禁
+
+- `check --smoke`：**PASS 8/8**，6.9s（<10s）。
+- `check --all`：**PASS 762/762**，76.3s（`timeout 400` 内）。
+
+### 5. 负结果（同会话，均已否决）
+
+| 试验 | s2 top50 | s1 TPR32/128/256 | 结论 |
+|---|---:|---|---|
+| 17..32 档 PF3 | 1074.3 | — | 非法（`sp=kk&(kPF-1)` 要求 2 的幂） |
+| 17..32 档 PF4 | 739.2 | — | 劣于 PF2 |
+| 17..32 档改 r24 A-smem | 737.7 | — | 略劣于 PF2 |
+| 小档（≤16）PF4 | 752.7 | — | 中性 |
+| 全局 `R19_L1_MT=4` | 753.4 | 496/1146/2050 | TPR128/256 崩塌 |
+| 全局 `R24_BPF=4` | 748.4 | 488/1042/1792 | TPR128/256 回退 |
+| 全局 `CM_L2_PF=4` | 912.1 | — | 大幅回退（L2 代码膨胀） |
+| `R24_KS=16` | 构建失败 | — | A 双缓冲 smem 131328B > 128KB 上限 |
+| `KRING_OVERRIDE=12/16` | 746.0 / 744.4 | ~486/942~970/1675~1682 | 仅 −0.5~0.8%，TPR128 微回退，收益不足 |
+
+### 6. 结论
+
+17..32 档 B 预取环 1→2 是**安全且一致的正收益**：`-s2 top50 −2.1%`（750.4→734.4µs）、
+均衡 TPR=32 `−4.0%`，其余档不劣；`check --all` 762/762、smoke <10s。
+**窗口数/掩码行功均无变化**——本档收益来自每窗 B 装载延迟隐藏。距 400µs 仍远：剩余
+主体是 GEMM 本体（≈576µs）与跨 block 分片任务量化（每窗 NS=4 片鸽笼上界），
+非「掩码/每窗固定开销」可解。
