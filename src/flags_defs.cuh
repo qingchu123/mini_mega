@@ -110,7 +110,7 @@ struct alignas(256) local_data {
     // 内部使用
     alignas(256) int32_t route_slot_counts[kRanks * kEPR];
     alignas(256) int32_t prefix_tbl[kEPR][kRanks + 1];
-    alignas(256) uint8_t expert_tokens[kEPR* kRing][kMaxTPR][kHidden];
+    // [PEERBUF] expert_tokens 迁至 ranks_data（FG，peer 可读，供远端窗口拉取 A 行）。
     // [冗余，暂注释] alignas(256) float token_route_weights[kEPR + kGrid][kMaxTPR];  // 走 scratch 偏移
     // [冗余，暂注释] alignas(256) int token_src_meta[kEPR + kGrid][kMaxTPR][3];  // 走 scratch 偏移
 
@@ -132,7 +132,7 @@ struct alignas(256) local_data {
 #if (L1_SPLITK || R19_BLOCK_KSPLIT)
     alignas(256) float l1_partial[kEPR * kRing][kNSlice][kMaxTPR][kL1SliceCols];
 #endif
-    alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
+    // [PEERBUF] l2_out 迁至 ranks_data（FG，peer 可读，供远端回收 L2 输出）。
     // [FRAG-INT] A/f2 fragment 缓冲，纯 kernel 内部：由本结构体持有，kernel 从
     //   rwk->ld 直接取基址，host/torch 不再传入。尺寸按 kMaxTPR 静态定（容量
     //   上界，运行期实际用 ceil(win_cap/16) 列，只会更小）。
@@ -156,6 +156,9 @@ struct alignas(256) ranks_data {
     alignas(256) uint32_t src_index_table[M_CYCLE][kEPR][kRanks][kMaxTPR];
     alignas(256) uint32_t expert_recv_counts[M_CYCLE][kRanks][64];
     alignas(256) uint16_t combine_rows[M_CYCLE][kTopk][kMaxTPR][kHidden];
+    // [PEERBUF] 原 local_data 私有缓冲迁入 FG（peer 可读）：A pool / L2 块槽输出。
+    alignas(256) uint8_t expert_tokens[kEPR * kRing][kMaxTPR][kHidden];
+    alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
 
     // ---- [UNK-MERGE] kernel 自有内部 staging（原 sym scratch 经 offset 访问，
     //   现并入 unk_data：kernel 经 rd 直接访问，peer 亦可读 prefold）。----

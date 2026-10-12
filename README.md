@@ -428,6 +428,26 @@ KERNEL_CFLAGS="-DMXK_FUSE_REDUCE=1" scripts/build.sh so check mybench
 默认仍为 `R24_BPF=2 && R19_L1_PF=2`（逐字等价基线），`-D` 覆盖仍生效。详见
 `perf.md` [261012_19_24]。
 
+## 方案 Stage 1：peer 可见缓冲（`expert_tokens` / `l2_out` 迁入 FG `ranks_data`）
+
+时间标签 `[261012_22_54]`。组内均衡方案（窗口按组内最小负载分配到组内 rank）需要
+远端 rank 读取 A 行、回收 L2 输出，因此先把两块原 rank 私有缓冲迁入 `unk->rd`（FG，
+peer 可读）。**纯数据放置，不改任务分配**，默认 fp8 路径。
+
+| 项 | 变化 |
+|---|---|
+| `local_data.expert_tokens` / `local_data.l2_out` | 删除，改到 `ranks_data`（FG） |
+| `rwk_data` 大小 | 1040MB → 637MB（迁出 402MB，FG 增加同量） |
+| kernel 引用 | `S.pool_base`、`combine_push_pair` 与 `fuse.out_base` 等改为 `a->unk->rd.*` |
+
+| 口径 | 基线 (9ce5306) | Stage 1 | 变化 |
+|---|---:|---:|---:|
+| `-s2 top50` mean（2 轮） | 698.4 ~ 698.8 | 690.4 ~ 691.3 | ≈ −1.1% |
+| `-s1 TPR=16`（3 轮交替） | 320.8 ~ 327.7 | 316.0 ~ 322.6 | ≈ −1.5% |
+| `-s1 TPR=32 / 256`（单轮） | 420.9 / 1597.2 | 416.2 / 1595.0 | ≈ 0 |
+
+门禁：`check --smoke` PASS 8/8（6.9s，<10s）。FG 放置对 pool 读写无可见开销。
+
 ## torch 层（pybind + Python 包，可安装 wheel）
 
 时间标签 `[261006_12_40]`（未提交 git）。新增 `torch/`：pybind11 扩展

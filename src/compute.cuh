@@ -789,8 +789,8 @@ __device__ __forceinline__ void dispatch_pull_body(
     R19Sched S;
     S.a = a;
     S.cycle = cycle;
-    // [A-RWK] pool 基址 = 本 rank 私有 rwk->ld.expert_tokens（rank 内读写）
-    S.pool_base = &a->rwk->ld.expert_tokens[0][0][0];
+    // [PEERBUF] pool 基址 = FG unk->rd.expert_tokens（本 rank 读写，peer 可读）
+    S.pool_base = &a->unk->rd.expert_tokens[0][0][0];
     S.bar_flags = a->rwk->lf.bar[cycle];
     S.dbg = a->rwk->lf.dbg;
     S.l1_chk = a->rwk->lf.l1_chk;
