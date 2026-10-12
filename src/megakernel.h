@@ -84,10 +84,9 @@ struct MegaLaunchArgs {
     int in_bf16 = 0;                       // [BF16-IN] x 是 bf16(1)/fp8(0)
     int skip_combine = 0;                  // [诊断] >0: 任务尾 COMBINE 空操作
     // -- 计算链缓冲 --
-    const uint8_t* w1 = nullptr;
-    const uint8_t* w2 = nullptr;
-    uint8_t* ffn_hidden = nullptr;         // [FRAG-INT] frag 缓冲为 kernel 内部（rwk->ld）
-    uint16_t* l2_out = nullptr;
+    // [RWK-LD] w1/w2/ffn_hidden/l2_out 不再作为 host 入参：kernel 从本 rank
+    //   私有 rwk->ld（local_data）派生；host 只需在 init 时把 w1/w2 拷进
+    //   rwk->ld.w1/w2（见 mxk_rwk_w1_off/w2_off）。
     // l1_k_out/l2_k_out 已内联为常量 kIntermediate/kHidden（本子集固定）。
     // flag 索引（xrelease/task_ready/task_counter/l2_done/slice_flags/l1_prog）
     //   已内联为设备侧编译期常量 kBar*Idx（common.cuh；镜像 layout 头）。

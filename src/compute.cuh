@@ -62,10 +62,9 @@ struct MegaArgs {
     int skip_combine;             // [诊断] MX_SKIP_COMBINE=1 → 任务尾 COMBINE 空操作
     // -- 计算链缓冲 --
     // l1_k_out/l2_k_out 已内联为常量 kIntermediate/kHidden（本子集固定）。
-    const uint8_t* w1;            // [EPR][2I][H] lane 序 packed tile（gate/up 配对）
-    const uint8_t* w2;            // [EPR][H][I] lane 序 packed tile
-    uint8_t* ffn_hidden;          // [EPR][ring][win_cap][I] FP8
-    uint16_t* l2_out;             // [kGrid][win_cap][H] BF16
+    // [RWK-LD] w1/w2/ffn_hidden/l2_out 已删除：kernel 一律从本 rank 私有
+    //   a->rwk->ld（local_data）派生（w1/w2 lane 序 tile、ffn_hidden FP8、
+    //   l2_out BF16），不再经 host 传入，省 4 个指针（smem s_a −32B）。
     // -- flag 索引已内联为编译期常量 kBarXxxxIdx（common.cuh；镜像 layout 头）--
 
     // ======================================================================

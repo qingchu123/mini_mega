@@ -1515,3 +1515,58 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
 仅 kernel 不再读写，属可省内存/可继续收紧的后续项。距 500µs 仍远，主体仍为 L1 GEMM 与
 跨 block 分片任务量化。
 
+## [261012_16_47] r19balance：删 `MegaArgs` 的 `w1/w2/ffn_hidden/l2_out`（kernel 从 `rwk->ld` 派生）— `local` −16B、`s_a` smem −32B、`-s2 top50` ≈中性
+
+> 目标：把最后 4 个 `MegaArgs` 显存指针字段删除。它们都是 `local_data`（本 rank
+> 私有 `rwk->ld`）成员：`w1[kEPR][2I][H]`、`w2[kEPR][H][I]`、
+> `ffn_hidden[kEPR*kRing][kMaxTPR][I]`、`l2_out[kGrid][kMaxTPR][H]`。kernel 一律
+> 从 `a->rwk->ld` 取基址，host/torch 不再传入。对外 API（权重入参、`x`/`topk`
+> 视图）名称/语义不变。
+
+### 1. 改动
+
+- `src/compute.cuh`：删 `MegaArgs::w1/w2/ffn_hidden/l2_out`（4 个指针）。
+- `src/compute_big.cuh`：所有 `S.a->w1/w2/ffn_hidden/l2_out` 使用点（共 46 处）
+  改 `&S.a->rwk->ld.{w1,w2,ffn_hidden,l2_out}[0][0][0]`（类型对：w1/w2 `const uint8_t*`、
+  ffn_hidden `uint8_t*`、l2_out `uint16_t*`）。
+- `src/megakernel.{h,cu}`：删 `MegaLaunchArgs` 4 字段与 `to_mega_args` 拷贝。
+- `test/mega_common.cuh`：删 `a.w1/w2/ffn_hidden/l2_out` 赋值（`d.w1/d.w2/d.ffn/d.l2`
+  仍指向同一 `ld`，权重填充/清零/校验不变）。
+- `torch/csrc/apis/mega.hpp`：删 `a.*` 赋值；停独立分配 `ffn_hidden`/`l2_out`
+  （改用 `rwk->ld`）；`w1/w2` 改为首次 launch 前一次性 D2D 拷进 `rwk->ld.w1/w2`
+  （按来源指针缓存，静态一次成本）。
+- `torch/csrc/flags_bridge.cu`：新增 `mxk_rwk_w1_off()/mxk_rwk_w2_off()`（`rwk` 基址
+  到 `ld.w1/w2` 的字节偏移）；`torch/csrc/python_api.cpp`：校验权重 numel 与
+  `ld.w1/w2` 一致后再拷。
+
+### 2. 内核资源（`MT_DUMP_RES=1`，`-s1 -tprs 16 -nodes 1 -replays 1`）
+
+| 版本 | regs | local | smem(full) | smem(empty) |
+|---|---:|---:|---:|---:|
+| 基线（HEAD `524b86d`） | 256 | 2256 B | 66032 | 464 |
+| 本改 | 256 | **2240（−16B）** | **66000（−32B）** | **432（−32B）** |
+
+### 3. A/B（同会话，先 stash 本方改动重建基线再实测）
+
+| 场景 | 基线 | 本改 | 变化 |
+|---|---:|---:|---:|
+| **`-s2 top50` min（3 轮）** | 712.68 / 713.10 / 723.37（均 716.4） | **725.06 / 712.24 / 711.07（均 716.1）** | ≈0%（噪声内） |
+| s1 TPR=32（2 轮） | 448.94 / 436.14 | 463.49 / 448.09 | +1.4%（噪声） |
+| s1 TPR=128（2 轮） | 921.34 / 896.13 | 930.09 / 905.86 | +1.1%（噪声） |
+| s1 TPR=256（2 轮） | 1607.55 / 1606.53 | 1607.98 / 1600.17 | ≈0% |
+
+> 注：本会话 `-s2 top50` 整体基线（712–724µs）显著高于 `perf.md` 历史记录
+> （699–702µs），系机器负载/会话差异；A/B 以同会话交替口径为准，结论中性。
+
+### 4. 门禁
+
+- `check --smoke` **PASS 8/8**，6.68s（`timeout 10` 内）。
+- `check --all` **PASS 762/762**，73.33s（`timeout 400` 内）。
+- `MACA_PATH=/opt/maca scripts/build.sh so check mybench` 通过。
+
+### 5. 结论与遗留
+
+行为逐字不变的结构精简：`MegaArgs` 再 −4 个指针字段、`s_a` smem −32B、`local` −16B；
+性能中性（同会话 A/B 噪声内）。**torch 侧改动本环境无 torch 无法编译验证**，仅静态审查
+（API 名称/语义不变；`mxk_rwk_w1_off/w2_off` 新增偏移导出），待重出 whl 时验证。
+

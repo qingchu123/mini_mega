@@ -344,10 +344,7 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.in_bf16 = MX_IN_BF16;
     a.weights_off = L.topk_weights_off;
     a.max_spins = (int)kSpinLimit;
-    a.w1 = d.w1;
-    a.ffn_hidden = d.ffn;
-    a.w2 = d.w2;
-    a.l2_out = d.l2;
+    // [RWK-LD] w1/w2/ffn_hidden/l2_out 由 kernel 从 d.rwk->ld 派生，不再经 args 传。
 
     a.y = y;
     a.grid = kGrid;

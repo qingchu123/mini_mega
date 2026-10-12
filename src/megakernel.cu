@@ -93,10 +93,7 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.weights_off = a.weights_off;
     m.max_spins = a.max_spins;
     m.skip_prologue = a.skip_prologue;
-    m.w1 = a.w1;
-    m.w2 = a.w2;
-    m.ffn_hidden = a.ffn_hidden;
-    m.l2_out = a.l2_out;
+    // [RWK-LD] w1/w2/ffn_hidden/l2_out 由 kernel 从 a.rwk->ld 派生，不再拷贝。
     m.in_bf16 = a.in_bf16;
     m.skip_combine = a.skip_combine;
     // [诊断] MX_SKIP_COMBINE=1：禁用任务尾 COMBINE（skip_combine=1 → 空操作）
