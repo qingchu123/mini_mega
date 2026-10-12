@@ -85,8 +85,16 @@ inline Geo make_geo(int R, int max_tokens, int win) {
 //   不一致造成的假象，已在 test/check.cu 修正。
 //   候选 {32,48,64,96,128} ∩ [win_min, max_tokens]；无合法候选时取 max_tokens。
 //   注：win=128 对均衡、win=48 对 TK 不均衡更优（见 docs/11、perf_now.md）。
+//   [261012] 重标定为 ring-aware + 倾斜门控（见 perf.md [261012_08_23]）。
+//   安全回退：MXK_WIN_LEGACY=1 时走旧代价模型（select_win_legacy）。
 inline int choose_win_cap_counts(const std::vector<int>& per_expert, int max_tokens) {
     std::vector<uint32_t> c(per_expert.begin(), per_expert.end());
+    static const bool legacy = []() {
+        const char* e = std::getenv("MXK_WIN_LEGACY");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    if (legacy)
+        return mxk::select_win_legacy(c.data(), (int)c.size(), max_tokens, /*win_min=*/32);
     return mxk::select_win(c.data(), (int)c.size(), max_tokens, /*win_min=*/32);
 }
 
