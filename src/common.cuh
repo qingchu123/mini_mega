@@ -141,14 +141,16 @@ constexpr int kBTileBytes = 1024;          // fp8：32×32 super-tile = 1024B
 #define MX_GROUP_WEIGHTS 0
 #endif
 
-// [MX_GROUP_SCHED] 阶段 3：组内均衡调度 + 远端 helper 计算（默认 0 = 逐字节等价现状）。
+// [MX_GROUP_SCHED] 阶段 3：组内均衡调度 + 远端 helper 计算。
 //   交织组：group = rank % nGroups，member = rank / nGroups，nGroups = R / kGroupRanks。
 //   每个 rank 用确定性 LPT 把「本组 32 个专家的全部窗口」重新分配给组内 4 个 rank，
 //   非 owner 的窗口由 helper 远端拉取 A（读 owner 的 src_index_table）、用本组权重
 //   w1g/w2g（ge 索引）计算，L2 结果 push 回源 rank 的 combine_rows，协议不变。
+//   [261013] 人类指示：默认开启（`-DMX_GROUP_SCHED=0` 可关回旧基线）。
 //   依赖组权重（w1g/w2g）就绪 → 自动打开 MX_GROUP_WEIGHTS。
+//   注：仅倾斜路由（-s2）净收益 +18%；均衡路由（-s1）+0.5~3.4% 回退。
 #ifndef MX_GROUP_SCHED
-#define MX_GROUP_SCHED 0
+#define MX_GROUP_SCHED 1
 #endif
 #if MX_GROUP_SCHED && !MX_GROUP_WEIGHTS
 #undef MX_GROUP_WEIGHTS

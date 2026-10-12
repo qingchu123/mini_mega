@@ -1734,3 +1734,18 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
   wall 由最忙 block 的**单个大窗（≤64 行）任务**决定；rank 级重分配对该单任务无效。
 - 跨组均衡被**权重复制边界**阻断（helper 只能读本组 w1g/w2g；读远端/全量权重均回退）。
 - 后续需**缩短单任务**：M 维切分（同窗多 block 分摊行）或 K 切（`R19_BLOCK_KSPLIT`）与 gs 组合。
+
+## [261013_0024] agent/peerbuf/stage3c：**默认开启** 组内均衡（MX_GROUP_SCHED 默认 1，人类指示）
+
+> 按人类指示把 `MX_GROUP_SCHED` 默认改为 **1**（`-DMX_GROUP_SCHED=0` 可关回旧基线）。
+> 默认构建（无 KERNEL_CFLAGS）现即走组内均衡 + 远端 helper。
+
+### 门禁 / 数据（默认构建，R=32）
+- `check --smoke` **PASS 8/8**，7.4s。
+- `-s2 top50` mean **568.5µs**（replays3）；旧默认（src 内 gs=0）≈695µs → **−18%**。
+- `s1 TPR16/32/256` = **327/433/1611µs**（旧默认 315/417/1604，均衡 +0.5~3.9% 回退，已知）。
+- `sizeof(rwk_data)=1543610624B`（w1g/w2g 32 专家；旧默认 637MB）。
+
+### 说明
+- 仅倾斜路由净收益；均衡路由有回退。默认开启为人类决定，后续需解决均衡回退。
+- `-DMX_GROUP_SCHED=0` 行为与 f0abe9e 之前默认逐字节一致（同一 gs_cap=false 路径）。
