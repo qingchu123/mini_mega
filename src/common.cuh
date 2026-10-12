@@ -74,6 +74,17 @@ constexpr int64_t kBarTaskCounterIdx = 2501;
 #define R19_L1BIG_ISO __noinline__
 #endif
 
+// [BALANCE·docs/20 §4.2] L1 split-K 开关默认值提前到 common.cuh：
+//   flags_defs.cuh 在此（底部）解析结构体时需可见同一取值，才能按需分配
+//   l1_partial/l1_part_cnt（默认两者皆 0 → 不分配，rwk_data 缩小 ~524MB）。
+//   compute.cuh / compute_big.cuh 的 #ifndef 定义保留（默认不覆盖）。
+#ifndef L1_SPLITK
+#define L1_SPLITK 0
+#endif
+#ifndef R19_BLOCK_KSPLIT
+#define R19_BLOCK_KSPLIT 0
+#endif
+
 // [BF16-IN] 输入 x 为 bf16（模型直接喂）：prologue 本地 fold 成 fp8 写独立区
 //   （layout prefolded_input_tokens），peer 只 pull fp8（体积减半）。0=原 fp8xfp8。
 #ifndef MX_IN_BF16

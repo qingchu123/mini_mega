@@ -754,8 +754,11 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.frag_a = a->rwk->ld.frag_a[0];
     S.frag2 = a->rwk->ld.frag2[0];
     // [BALANCE·docs/20 §4.2] L1 split-K 部分和 / 段计数缓冲（kernel 内部派生）
+    //   默认（L1_SPLITK/R19_BLOCK_KSPLIT 皆 0）不分配 → 不取址；字段随结构体消失。
+#if (L1_SPLITK || R19_BLOCK_KSPLIT)
     S.l1_partial = a->rwk->ld.l1_partial[0][0][0];
     S.l1_part_cnt = a->rwk->lf.l1_part_cnt[0];
+#endif
     // [R34][FRAG-INT] fragment m 维 = ceil(win_cap/16)；槽 = local_data.frag_a/frag2。
     const int mt_total = (a->win_cap + 15) >> 4;
     S.mt_total = mt_total;

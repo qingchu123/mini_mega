@@ -73,7 +73,10 @@ struct alignas(256) local_flags {
     alignas(256) float l1_chk[kGrid];        // L1 数值校验累加
     alignas(256) float l2_chk[kGrid];        // L2 数值校验累加
     // [BALANCE·docs/20] L1 split-K：每 (slot, N片 s) 的 K 段完成计数（atomicAdd 判最后一段）
+    //   仅 L1 split-K（L1_SPLITK / R19_BLOCK_KSPLIT）路径用到：默认不分配。
+#if (L1_SPLITK || R19_BLOCK_KSPLIT)
     alignas(256) uint32_t l1_part_cnt[kEPR * kRing][kNSlice];
+#endif
 };
 
 // ---- 跨 rank（FG 显存，peer 可写）----
@@ -125,14 +128,18 @@ struct alignas(256) local_data {
     alignas(256) uint8_t ffn_hidden[kEPR * kRing][kMaxTPR][kIntermediate];
     // [BALANCE·docs/20] L1 split-K FP32 部分和（gate/up 原值，未 SwiGLU）：每 (slot, N片 s)
     //   一块 [行][2I/NS]，NK 个 K 段 atomicAdd 累加；最后一段读回→SwiGLU→FP8 写 ffn_hidden。
+    //   仅 L1 split-K（L1_SPLITK / R19_BLOCK_KSPLIT）路径用到：默认不分配（~512MB）。
+#if (L1_SPLITK || R19_BLOCK_KSPLIT)
     alignas(256) float l1_partial[kEPR * kRing][kNSlice][kMaxTPR][kL1SliceCols];
+#endif
     alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
     // [FRAG-INT] A/f2 fragment 缓冲，纯 kernel 内部：由本结构体持有，kernel 从
     //   rwk->ld 直接取基址，host/torch 不再传入。尺寸按 kMaxTPR 静态定（容量
     //   上界，运行期实际用 ceil(win_cap/16) 列，只会更小）。
     alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden / 32) * ((kMaxTPR + 15) / 16) * 512];
     alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate / 32) * ((kMaxTPR + 15) / 16) * 512];
-    alignas(256) float y[kMaxTPR][kHidden];
+    // [DEL-Y] 原 alignas(256) float y[kMaxTPR][kHidden]（12MB）零引用已删除：
+    //   真正 y 走 MegaLaunchArgs.y/REDUCE；test 侧另分配 d.y（见 mega_common.cuh）。
     // [冗余，暂注释] alignas(256) float ynode[kMaxTPR][kHidden];  // mega_common 另行分配 d.ynode
 };
 

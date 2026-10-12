@@ -234,7 +234,10 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     d.ffn = &d.ld->ffn_hidden[0][0][0];
     d.l2 = &d.ld->l2_out[0][0][0];
     const size_t y_bytes = (size_t)ynode_rows * kHidden * sizeof(float);
-    d.y = &d.ld->y[0][0];
+    // [DEL-Y] ld.y 已删除（zero-ref）：REDUCE 输出 d.y 独立分配，容量 kMaxTPR*H
+    //   （≥ 任一 launch 的 tokens*H），零初始化与原来 ld.y 随 rwk 清零等价。
+    CHECK(mcMalloc((void**)&d.y, (size_t)kMaxTPR * kHidden * sizeof(float)));
+    CHECK(mcMemset(d.y, 0, (size_t)kMaxTPR * kHidden * sizeof(float)));
     d.ynode.assign(nodes, nullptr);
     for (int n = 0; n < nodes; ++n) {
         CHECK(mcMalloc((void**)&d.ynode[n], y_bytes));
