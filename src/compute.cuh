@@ -76,7 +76,10 @@ struct MegaArgs {
     // ======================================================================
     // [3] 输出
     // ======================================================================
-    // 本 kernel（mega_kernel）不写最终 y；y 由 REDUCE 经 host 侧指针写出。
+    // 独立核路径下本 kernel（mega_kernel）不写 y；y 由 REDUCE 经 host 侧指针写出。
+    // [方向3] MXK_FUSE_REDUCE=1 时 REDUCE 并入 mega 尾，需在此携带 host 传入的
+    //   y 指针（bench/check 逐节点不同），默认路径不读。
+    float* y;
 
     // ======================================================================
     // [4] 性能调优参数
@@ -637,26 +640,10 @@ template <MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void dispatch_pull_body(
         const MegaArgs* a, int cycle, uint8_t* a_smem = nullptr,
         uint8_t* b_smem = nullptr, unsigned long long* ctr = nullptr) {
-    // [S-SHRINK] 只保留循环/派生所需局部；其余纯 a-> 直接读 smem（任务体经 S.a）。
-    const uint8_t* self = a->self;                 // pool_base / prefix 回退
-    const int R = a->R, win_cap = a->win_cap;      // s_prefix / 窗口前缀
-    const int ring = kRing;
-    uint8_t* pool_ptr = a->pool_ptr;               // pool_base
-    uint32_t* bar_flags = a->rwk->lf.bar[cycle];
-    const int64_t task_counter_idx = a->task_counter_idx;
-    const int64_t l2_done_idx = a->l2_done_idx;
-    const int64_t task_ready_idx = a->task_ready_idx;
-    int* out_processed = a->rwk->lf.out_processed;
-    int* dbg = a->rwk->lf.dbg;
-    const int max_spins = a->max_spins;
-    float* l1_chk = a->rwk->lf.l1_chk;
-    float* l2_chk = a->rwk->lf.l2_chk;
-    const int rep = 0, n_reps = 1;
-    const uint64_t epoch = (uint64_t)a->rwk->lf.current_time[0][1];
-    const int* prefix_ptr = a->prefix_ptr;
-    unsigned long long* pt = a->rwk->lf.pre_ticks;
-    uint8_t* frag_a = a->rwk->ld.frag_a[0];
-    uint8_t* frag2 = a->rwk->ld.frag2[0];
+    // [S-SHRINK2] 去函数级循环不变量局部缓存：每使用点直接读 a->（s_a, smem）；
+    //   仅保留编译期常量（rep/n_reps）；ring 用 kRing。降低 mega_kernel 跨 noinline
+    //   任务体的寄存器保活压力。
+    constexpr int rep = 0, n_reps = 1;
     extern __shared__ __align__(16) uint8_t smem_raw[];
     int* s_count = reinterpret_cast<int*>(smem_raw);   // EPR：每专家总行数
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）
@@ -664,23 +651,23 @@ __device__ __forceinline__ void dispatch_pull_body(
     __shared__ int s_task, s_expert, s_window, s_count_w, s_slice, s_kseg;
     __shared__ unsigned s_epoch;
     // prefix_ptr 非空时用独立前缀表缓冲（与 task_setup_body 的 prefix_ptr 对齐）
-    const int* prefix = (prefix_ptr != nullptr)
-        ? prefix_ptr
-        : reinterpret_cast<const int*>(self + a->prefix_off);
+    const int* prefix = (a->prefix_ptr != nullptr)
+        ? a->prefix_ptr
+        : reinterpret_cast<const int*>(a->self + a->prefix_off);
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
     (void)warp; (void)lane;
     // [O1] 全 experts src 前缀一次预载（s_prefix 扩容 EPR*(R+1)）
-    for (int i = tid; i < kEPR * (R + 1); i += (int)blockDim.x)
+    for (int i = tid; i < kEPR * (a->R + 1); i += (int)blockDim.x)
         s_prefix[i] = prefix[i];
     // 每专家总行数 + 窗口前缀（前缀和以 win_cap 划分窗口）
     if (tid == 0) {
         int total = 0;
         s_cum[0] = 0;
         for (int e = 0; e < kEPR; ++e) {
-            s_count[e] = prefix[e * (R + 1) + R];
-            total += (s_count[e] + win_cap - 1) / win_cap;
+            s_count[e] = prefix[e * (a->R + 1) + a->R];
+            total += (s_count[e] + a->win_cap - 1) / a->win_cap;
             s_cum[e + 1] = total;
         }
     }
@@ -689,15 +676,16 @@ __device__ __forceinline__ void dispatch_pull_body(
     // [BALANCE·docs/20 §4.2b] 跨 block K 切：任务 = (e,w,slice,kseg)，共 x kNk。
     //   运行时再按 win_cap + fragment 可用门控（大窗/无 frag 走原整段 L1）：
     //   ksw 为真时 raw_tasks 含 kNK，否则退化回 kNSlice（解码按 ksw 分支）。
-    const int mt_total_ks = (win_cap + 15) >> 4;
+    const int mt_total_ks = (a->win_cap + 15) >> 4;
 #if defined(CM_NO_FRAGALL)
     const bool frag_ok_ks = false;
 #else
-    const bool frag_ok_ks = (frag_a != nullptr) && (frag2 != nullptr) &&
+    const bool frag_ok_ks = (a->rwk->ld.frag_a[0] != nullptr) &&
+                            (a->rwk->ld.frag2[0] != nullptr) &&
                             (a->l1_k_out > 0) && (mt_total_ks > 0) &&
-                            (win_cap > 0);
+                            (a->win_cap > 0);
 #endif
-    const bool ksw = (win_cap <= R19_BLOCK_KSPLIT_WINMAX) && (kNK > 1) &&
+    const bool ksw = (a->win_cap <= R19_BLOCK_KSPLIT_WINMAX) && (kNK > 1) &&
                      frag_ok_ks;
     const int kseg_n = ksw ? kNK : 1;
     const int raw_tasks = s_cum[kEPR] * kNSlice * kseg_n;
@@ -711,15 +699,15 @@ __device__ __forceinline__ void dispatch_pull_body(
 #if R19_BLOCK_LPT
     // [BLOCK-LPT] 建排序表：s_order[raw_tasks]（任务 id 降序按代价）+ 临时 s_cost
     //   与 s_hist。紧凑放在 s_prefix 之后；smem 不足则 lpt_ok=false 回退基线。
-    const int kLptHeadInts = kEPR + (kEPR + 1) + kEPR * (R + 1);
+    const int kLptHeadInts = kEPR + (kEPR + 1) + kEPR * (a->R + 1);
     constexpr int kLptMaxTasks = 640;   // 任务数上界（EPR*ceil(512/32)*kNSlice=512）
     constexpr int kLptSmemInts = 2048;  // prod_smem(~8448B)/4 的保守下界
-    int* s_order = s_prefix + kEPR * (R + 1);
+    int* s_order = s_prefix + kEPR * (a->R + 1);
     int* s_cost = s_order + kLptMaxTasks;
     int* s_hist = s_cost + kLptMaxTasks;
     const bool lpt_ok = (raw_tasks > 0) && (raw_tasks <= kLptMaxTasks) &&
-                        (win_cap >= 0) &&
-                        (kLptHeadInts + 2 * kLptMaxTasks + (win_cap + 1) <=
+                        (a->win_cap >= 0) &&
+                        (kLptHeadInts + 2 * kLptMaxTasks + (a->win_cap + 1) <=
                          kLptSmemInts);
     if constexpr (kPhase != MegaPhase::L2) {
         if (lpt_ok) {
@@ -737,16 +725,16 @@ __device__ __forceinline__ void dispatch_pull_body(
                     else hi = mid;
                 }
                 const int wv = tw - s_cum[lo];
-                const int remain = s_count[lo] - wv * win_cap;
-                s_cost[i] = remain < win_cap ? remain : win_cap;
+                const int remain = s_count[lo] - wv * a->win_cap;
+                s_cost[i] = remain < a->win_cap ? remain : a->win_cap;
             }
             __syncthreads();
             // 2) 降序稳定计数排序（相等代价保持 task id 升序 → 保持 ring 窗口关系）
             if (tid == 0) {
-                for (int c = 0; c <= win_cap; ++c) s_hist[c] = 0;
+                for (int c = 0; c <= a->win_cap; ++c) s_hist[c] = 0;
                 for (int i = 0; i < raw_tasks; ++i) ++s_hist[s_cost[i]];
                 int acc = 0;
-                for (int c = win_cap; c >= 0; --c) {
+                for (int c = a->win_cap; c >= 0; --c) {
                     const int h = s_hist[c];
                     s_hist[c] = acc;
                     acc += h;
@@ -770,29 +758,30 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.a = a;
     S.cycle = cycle;
     // [A-RWK] pool 基址：显式传入（普通显存）或回退对称区 self+pool_off
-    S.pool_base = (pool_ptr != nullptr)
-                      ? pool_ptr
-                      : const_cast<uint8_t*>(self) + a->pool_off;
-    S.bar_flags = bar_flags;
-    S.dbg = dbg;
-    S.l1_chk = l1_chk;
-    S.l2_chk = l2_chk;
-    S.pt = pt;
-    S.frag_a = frag_a;
-    S.frag2 = frag2;
+    S.pool_base = (a->pool_ptr != nullptr)
+                      ? a->pool_ptr
+                      : const_cast<uint8_t*>(a->self) + a->pool_off;
+    S.bar_flags = a->rwk->lf.bar[cycle];
+    S.dbg = a->rwk->lf.dbg;
+    S.l1_chk = a->rwk->lf.l1_chk;
+    S.l2_chk = a->rwk->lf.l2_chk;
+    S.pt = a->rwk->lf.pre_ticks;
+    S.frag_a = a->rwk->ld.frag_a[0];
+    S.frag2 = a->rwk->ld.frag2[0];
     // [BALANCE·docs/20 §4.2] L1 split-K 部分和 / 段计数缓冲（kernel 内部派生）
     S.l1_partial = a->rwk->ld.l1_partial[0][0][0];
     S.l1_part_cnt = a->rwk->lf.l1_part_cnt[0];
     // [R34][FRAG-INT] fragment m 维 = ceil(win_cap/16)；槽 = local_data.frag_a/frag2。
-    const int mt_total = (win_cap + 15) >> 4;
+    const int mt_total = (a->win_cap + 15) >> 4;
     S.mt_total = mt_total;
 #if defined(CM_NO_FRAGALL)
     S.frag_all = false;
 #else
-    S.frag_all = (frag_a != nullptr) && (frag2 != nullptr) &&
-                 (a->l1_k_out > 0) && (mt_total > 0) && (win_cap > 0);
+    S.frag_all = (a->rwk->ld.frag_a[0] != nullptr) &&
+                 (a->rwk->ld.frag2[0] != nullptr) &&
+                 (a->l1_k_out > 0) && (mt_total > 0) && (a->win_cap > 0);
 #endif
-    S.epoch = epoch;
+    S.epoch = (uint64_t)a->rwk->lf.current_time[0][1];
     S.merge = merge;
     S.nslice_eff = nslice_eff;
     // [集71] 计数缓冲下传任务体
@@ -809,8 +798,9 @@ __device__ __forceinline__ void dispatch_pull_body(
                 ? ((int)blockIdx.x + processed * (int)gridDim.x)
                 : ((processed == 0)
                        ? (int)blockIdx.x
-                       : atomicAdd(reinterpret_cast<int*>(
-                                       bar_flags + task_counter_idx), 1));
+                        : atomicAdd(reinterpret_cast<int*>(
+                                       a->rwk->lf.bar[cycle] +
+                                       a->task_counter_idx), 1));
 #if R19_BLOCK_LPT
             // [BLOCK-LPT] 领到的号 counter 映射为降序排序后的任务 id（仅非 L2 路径）。
             const int task_lpt = (kPhase != MegaPhase::L2 && lpt_ok &&
@@ -843,18 +833,19 @@ __device__ __forceinline__ void dispatch_pull_body(
                 }
                 s_expert = lo;
                 s_window = tw - s_cum[lo];
-                const int remain = s_count[lo] - s_window * win_cap;
-                s_count_w = remain < win_cap ? remain : win_cap;
-                s_epoch = *(volatile const uint32_t*)(bar_flags + task_ready_idx);
+                const int remain = s_count[lo] - s_window * a->win_cap;
+                s_count_w = remain < a->win_cap ? remain : a->win_cap;
+                s_epoch = *(volatile const uint32_t*)(a->rwk->lf.bar[cycle] +
+                                                      a->task_ready_idx);
                 // [L1L2-SPLIT] ring 门等前代 L2 完成；拆分下前代 L2 在下一个
                 //   kernel（stream 顺序已保证），且数据槽不复用 → 编译期跳过。
                 if constexpr (kPhase == MegaPhase::Both) {
-                    if (s_window >= ring || rep > 0) {
+                    if (s_window >= kRing || rep > 0) {
                         // ring 门：target=(rep + w/ring)*nslice_eff（每物理任务 +1），
                         // 槽复用前等前代 L2 完成。[R35] 用 nslice_eff 匹配物理任务数。
-                        l2_gate_wait(bar_flags, (int)l2_done_idx, lo, s_window,
-                                     rep, ring, nslice_eff, slice, -1, 0u, dbg,
-                                     max_spins, ctr);
+                        l2_gate_wait(a->rwk->lf.bar[cycle], (int)a->l2_done_idx,
+                                     lo, s_window, rep, kRing, nslice_eff, slice,
+                                     -1, 0u, a->rwk->lf.dbg, a->max_spins, ctr);
                     }
                 }
             }
@@ -875,11 +866,11 @@ __device__ __forceinline__ void dispatch_pull_body(
         // [L1L2-SPLIT] 旗槽（ring，容量 EPR*ring）与数据槽（拆分下每窗口独占）：
         //   slot_win = ceil(kMaxTPR/win_cap) 覆盖 count<=kMaxTPR 的全部窗口；
         //   Both 下两者相同（e*ring + w%ring），行为逐字不变。
-        const int pool_slot = e * ring + w % ring;
-        const int slot_win = (kMaxTPR + win_cap - 1) / win_cap;
+        const int pool_slot = e * kRing + w % kRing;
+        const int slot_win = (kMaxTPR + a->win_cap - 1) / a->win_cap;
         const int data_slot =
             (kPhase == MegaPhase::Both) ? pool_slot : (e * slot_win + w);
-        const int* pfx = s_prefix + e * (R + 1);
+        const int* pfx = s_prefix + e * (a->R + 1);
         // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
         if (count > kM) {
             r19_big_task<kPhase>(S, task, e, w, count, slice, kseg,
@@ -895,7 +886,7 @@ __device__ __forceinline__ void dispatch_pull_body(
         // [L1L2-SPLIT] 拆分下无环复用（数据槽每窗口独占）→ 跳过 ring 门与发布。
         bool h_pub = false;
         if constexpr (kPhase == MegaPhase::Both) {
-            h_pub = (s_count[e] > (w + ring) * win_cap) || n_reps > 1;
+            h_pub = (s_count[e] > (w + kRing) * a->win_cap) || n_reps > 1;
         }
         // [BALANCE·docs/20 §4.2b] K 切下仅 owner（kseg==0）发布 l2_done：每窗口
         //   仍恰好 nslice_eff 次，ring 门 target 语义不变；非 owner 不发布。
@@ -904,11 +895,11 @@ __device__ __forceinline__ void dispatch_pull_body(
         if (tid == 0) {
             if (h_pub)
                 atomicAdd(reinterpret_cast<uint32_t*>(
-                              bar_flags + l2_done_idx +
-                              (size_t)(e * ring + w % ring)),
+                              a->rwk->lf.bar[cycle] + a->l2_done_idx +
+                              (size_t)(e * kRing + w % kRing)),
                           1u);
             ++processed;
-            if (out_processed != nullptr) out_processed[blockIdx.x] = processed;
+            a->rwk->lf.out_processed[blockIdx.x] = processed;
             // [集71] 任务数 / slice 数 / l2_done 发布次数
             // [L1L2-SPLIT] L1/L2 各自跑一遍任务循环 → 统计只在 L2/Both 记一次
             if constexpr (kPhase != MegaPhase::L1) {
@@ -930,6 +921,6 @@ __device__ __forceinline__ void dispatch_pull_body(
         }
     }
     // 诊断：block0 任务循环结束（L2 + COMBINE + 尾）
-    if (pt != nullptr && blockIdx.x == 0 && tid == 0)
-        pt[7] = clock64();
+    if (blockIdx.x == 0 && tid == 0)
+        a->rwk->lf.pre_ticks[7] = clock64();
 }
