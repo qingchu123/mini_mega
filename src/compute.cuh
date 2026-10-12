@@ -791,6 +791,14 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.cycle = cycle;
     // [PEERBUF] pool 基址 = FG unk->rd.expert_tokens（本 rank 读写，peer 可读）
     S.pool_base = &a->unk->rd.expert_tokens[0][0][0];
+#if MX_GROUP_WEIGHTS
+    // [WP-G1 S2] 组内 32 专家权重：本 rank 的 ge 块起点 = (rank%kGroupRanks)*kEPR
+    S.w1_base = &a->rwk->ld.w1g[(a->rank % kGroupRanks) * kEPR][0][0];
+    S.w2_base = &a->rwk->ld.w2g[(a->rank % kGroupRanks) * kEPR][0][0];
+#else
+    S.w1_base = &a->rwk->ld.w1[0][0][0];
+    S.w2_base = &a->rwk->ld.w2[0][0][0];
+#endif
     S.bar_flags = a->rwk->lf.bar[cycle];
     S.dbg = a->rwk->lf.dbg;
     S.l1_chk = a->rwk->lf.l1_chk;
