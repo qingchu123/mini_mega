@@ -57,6 +57,24 @@ __global__ void __launch_bounds__(256) fill_w_lane_kernel(
          idx += (size_t)gridDim.x * blockDim.x) {
         const int np = (int)(idx / k_iters);
         const int kt = (int)(idx % k_iters);
+#if MX_FP4_W
+        // [MX_FP4_W] 每 super-tile 512B：lane L 的 8B = 低 4B(行 row0 的 8×e2m1) +
+        //   高 4B(行 row0+16)，与设备 r19_load_b16 的 fp4 分支逐字节对应。
+        uint32_t* tile32 = reinterpret_cast<uint32_t*>(w + idx * kBTileBytes);
+        for (int L = 0; L < 64; ++L) {
+            const int row0 = np * 32 + (L % 16);
+            const int row1 = row0 + 16;
+            const int k0 = kt * 32 + (L / 16) * 8;
+            uint32_t lo = 0, hi = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                lo |= (uint32_t)WPROBE_FP4_CODE(seed, row0, k0 + j) << (4 * j);
+                hi |= (uint32_t)WPROBE_FP4_CODE(seed, row1, k0 + j) << (4 * j);
+            }
+            tile32[L * 2 + 0] = lo;
+            tile32[L * 2 + 1] = hi;
+        }
+#else
         uint8_t* tile = w + idx * 1024;
         for (int L = 0; L < 64; ++L) {
             const int row0 = np * 32 + (L % 16);
@@ -67,6 +85,7 @@ __global__ void __launch_bounds__(256) fill_w_lane_kernel(
                 tile[L * 16 + 8 + b] = WPROBE_VAL(seed, row1, k0 + b);
             }
         }
+#endif
     }
 }
 

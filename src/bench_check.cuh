@@ -402,14 +402,29 @@ static inline uint16_t f32_to_bf16_rne(float v) {
 // -------------------------------------------------------- lane 序 tile 读取 --
 // W_e 基址（该 expert 的逻辑 [n_rows][k_cols] 16B/lane 配对 packed tile），
 // 返回逻辑 (row, k) 处的 FP8 字节。只解码 host 生成的字节布局，与设备实现独立。
+// [MX_FP4_W] 权重存 fp4 打包（super-tile 512B、每 lane 8B），此处按 e2m1 表解包成
+//   fp8 字节（与设备 cvt_pk8_f4tof8 一致），供 CPU 参考复用同一量化权重。
 static inline uint8_t w_lane_get(const uint8_t* w_e, int row, int k,
                                  int k_cols) {
     const int k_iters = k_cols / 32;
+#if MX_FP4_W
     const uint8_t* tile =
-        w_e + ((size_t)(row >> 5) * (size_t)k_iters + (size_t)(k >> 5)) * 1024;
+        w_e + ((size_t)(row >> 5) * (size_t)k_iters + (size_t)(k >> 5)) *
+                  kBTileBytes;
+    const int lane = (row & 15) + (((k & 31) >> 3) << 4);
+    const int sub = (row >> 4) & 1;
+    const int kl = k & 7;
+    const uint8_t packed = tile[(size_t)lane * 8 + (size_t)sub * 4 +
+                                (size_t)(kl >> 1)];
+    const uint8_t code = (uint8_t)((packed >> (4 * (kl & 1))) & 0xfu);
+    return fp4_code_to_fp8(code);
+#else
+    const uint8_t* tile =
+        w_e + ((size_t)(row >> 5) * (size_t)k_iters + (size_t)(k >> 5)) * kBTileBytes;
     const int lane = (row & 15) + (((k & 31) >> 3) << 4);
     const int sub = (row >> 4) & 1;
     return tile[(size_t)lane * 16 + (size_t)sub * 8 + (size_t)(k & 7)];
+#endif
 }
 
 // ------------------------------------------------------------------ L1 参考 --
@@ -419,7 +434,7 @@ static inline uint8_t w_lane_get(const uint8_t* w_e, int row, int k,
 // 输出     : ffn_expect [count][I] FP32 = silu(gate)·up（FP8 量化前期望）
 static inline void ref_l1(const uint8_t* x, const uint8_t* w1, int expert,
                           int count, int H, int I, float* ffn_expect) {
-    const uint8_t* w_e = w1 + (size_t)expert * (size_t)(2 * I) * (size_t)H;
+    const uint8_t* w_e = w1 + (size_t)expert * MT_WSTRIDE(2 * I, H);
     std::vector<float> xd((size_t)H);
     for (int r = 0; r < count; ++r) {
         const uint8_t* xr = x + (size_t)r * H;
@@ -445,7 +460,7 @@ static inline void ref_l1(const uint8_t* x, const uint8_t* w1, int expert,
 // 输出    : out_expect [count][H] FP32（BF16 量化前期望）
 static inline void ref_l2(const uint8_t* ffn, const uint8_t* w2, int expert,
                           int count, int I, int H, float* out_expect) {
-    const uint8_t* w_e = w2 + (size_t)expert * (size_t)H * (size_t)I;
+    const uint8_t* w_e = w2 + (size_t)expert * MT_WSTRIDE(H, I);
     std::vector<float> ad((size_t)I);
     for (int r = 0; r < count; ++r) {
         const uint8_t* ar = ffn + (size_t)r * I;

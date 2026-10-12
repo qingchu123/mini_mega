@@ -134,10 +134,48 @@ __device__ __forceinline__ R19Frag2 r19_load_b16(
         const uint8_t* __restrict__ w, int n, int k, int k_hidden) {
     const int lane = threadIdx.x & 63;
     const size_t n_tiles = (size_t)(k_hidden >> 5);
+#if MX_FP4_W
+    // [MX_FP4_W] 8B/lane：低 4B=行 n 的 8×e2m1、高 4B=行 n+16；解包回两个 fp8
+    //   native fragment，喂现有 MMA（指令不变）。
     const uint8_t* tile =
-        w + ((size_t)(n >> 5) * n_tiles + (size_t)(k >> 5)) * 1024;
+        w + ((size_t)(n >> 5) * n_tiles + (size_t)(k >> 5)) * kBTileBytes;
+    const uint8_t* p = tile + (size_t)lane * 8;
+    const uint64_t pk = *reinterpret_cast<const uint64_t*>(p);
+    const uint64_t e0 =
+        __builtin_mxc_cvt_pk8_f4tof8_scale_lo((uint32_t)pk, kFp4ScaleCode);
+    const uint64_t e1 =
+        __builtin_mxc_cvt_pk8_f4tof8_scale_lo((uint32_t)(pk >> 32u),
+                                              kFp4ScaleCode);
+    return R19Frag2{static_cast<uint32_t>(e0), static_cast<uint32_t>(e0 >> 32u),
+                    static_cast<uint32_t>(e1), static_cast<uint32_t>(e1 >> 32u)};
+#else
+    const uint8_t* tile =
+        w + ((size_t)(n >> 5) * n_tiles + (size_t)(k >> 5)) * kBTileBytes;
     return *reinterpret_cast<const R19Frag2*>(tile + (size_t)lane * 16);
+#endif
 }
+
+#if MX_FP4_W
+// [MX_FP4_RING] 只装 8B packed fp4，解包推迟到消费点（降低预取环寄存器占用、
+//   把 2 次 cvt 排到使用前，给编译器更大调度窗口）。
+__device__ __forceinline__ uint64_t r19_load_b_pk(
+        const uint8_t* __restrict__ w, int n, int k, int k_hidden) {
+    const int lane = threadIdx.x & 63;
+    const size_t n_tiles = (size_t)(k_hidden >> 5);
+    const uint8_t* tile =
+        w + ((size_t)(n >> 5) * n_tiles + (size_t)(k >> 5)) * kBTileBytes;
+    return *reinterpret_cast<const uint64_t*>(tile + (size_t)lane * 8);
+}
+__device__ __forceinline__ R19Frag2 r19_expand_pk(uint64_t pk) {
+    const uint64_t e0 =
+        __builtin_mxc_cvt_pk8_f4tof8_scale_lo((uint32_t)pk, kFp4ScaleCode);
+    const uint64_t e1 =
+        __builtin_mxc_cvt_pk8_f4tof8_scale_lo((uint32_t)(pk >> 32u),
+                                              kFp4ScaleCode);
+    return R19Frag2{static_cast<uint32_t>(e0), static_cast<uint32_t>(e0 >> 32u),
+                    static_cast<uint32_t>(e1), static_cast<uint32_t>(e1 >> 32u)};
+}
+#endif
 
 #ifdef R24_DIAG_NOB
 __device__ __forceinline__ R19Frag2 r19_load_b16z(
@@ -145,8 +183,14 @@ __device__ __forceinline__ R19Frag2 r19_load_b16z(
     return R19Frag2{0u, 0u, 0u, 0u};
 }
 #define R19_LDB(w, n, k, kh) r19_load_b16z(w, n, k, kh)
+#if MX_FP4_W
+#define R19_LDB_PK(w, n, k, kh) 0ull
+#else
+#define R19_LDB_PK(w, n, k, kh) r19_load_b_pk(w, n, k, kh)
+#endif
 #else
 #define R19_LDB(w, n, k, kh) r19_load_b16(w, n, k, kh)
+#define R19_LDB_PK(w, n, k, kh) r19_load_b_pk(w, n, k, kh)
 #endif
 
 // ============================================================================
@@ -270,7 +314,7 @@ __device__ __forceinline__ void r19_l1_big(
         //   gate/up 原值 FP32：seg==0 直写、否则 atomicAdd 到 l1_partial。
         int k_step_begin = 0, int k_steps = -1,
         float* l1_part = nullptr, int l1_seg = 0, int l1_row0 = 0) {
-    const uint8_t* w_e = w1 + (size_t)expert * n_total * k_hidden;
+    const uint8_t* w_e = w1 + (size_t)expert * MT_WSTRIDE(n_total, k_hidden);
     float acc_chk = 0.0f;
     for (int c0 = 0; c0 < count; c0 += kMT * kM) {
         const int cc = (count - c0 < kMT * kM) ? (count - c0) : kMT * kM;
@@ -289,7 +333,11 @@ __device__ __forceinline__ void r19_l1_big(
             for (int q = 0; q < kBatch; ++q)
                 nbase[q] = (g0 + q) * block_n + warp * n_per_warp;
             R19Frag a_pipe[kPF][kMT];
+#if MX_FP4_W && MX_FP4_RING
+            uint64_t b_pk[kPF][kBatch];
+#else
             R19Frag2 b_pair[kPF][kBatch];
+#endif
             #pragma unroll
             for (int sp = 0; sp < kPF; ++sp) {
                 if (sp >= k_iters) break;
@@ -298,9 +346,15 @@ __device__ __forceinline__ void r19_l1_big(
                     a_pipe[sp][m] = R21_LDA(sp, m);
                 #pragma unroll
                 for (int q = 0; q < kBatch; ++q)
+#if MX_FP4_W && MX_FP4_RING
+                    b_pk[sp][kBatch - 1 - q] =
+                        R19_LDB_PK(w_e, nbase[q],
+                                   (k_step_begin + sp) * kKStep, k_hidden);
+#else
                     b_pair[sp][kBatch - 1 - q] =
                         R19_LDB(w_e, nbase[q],
                                 (k_step_begin + sp) * kKStep, k_hidden);
+#endif
             }
             R19Acc acc[kBatch][kMT][kNT];
             #pragma unroll
@@ -313,11 +367,21 @@ __device__ __forceinline__ void r19_l1_big(
             #pragma unroll kPF
             for (int kk = 0; kk < k_iters; ++kk) {
                 const int sp = kk & (kPF - 1);
+#if MX_FP4_W && MX_FP4_RING
+                R19Frag2 bexp[kBatch];
+                #pragma unroll
+                for (int q = 0; q < kBatch; ++q)
+                    bexp[q] = r19_expand_pk(b_pk[sp][kBatch - 1 - q]);
+#endif
                 #pragma unroll
                 for (int m = 0; m < kMT; ++m) {
                     #pragma unroll
                     for (int q = 0; q < kBatch; ++q) {
+#if MX_FP4_W && MX_FP4_RING
+                        const R19Frag2 bp = bexp[q];
+#else
                         const R19Frag2 bp = b_pair[sp][kBatch - 1 - q];
+#endif
                         const R19Frag b0 = {bp[0], bp[1]};
                         const R19Frag b1 = {bp[2], bp[3]};
                         acc[q][m][0] = __builtin_mxc_mma_16x16x32f8(
@@ -333,9 +397,15 @@ __device__ __forceinline__ void r19_l1_big(
                         a_pipe[sp][m] = R21_LDA(nk, m);
                     #pragma unroll
                     for (int q = 0; q < kBatch; ++q)
+#if MX_FP4_W && MX_FP4_RING
+                        b_pk[sp][kBatch - 1 - q] =
+                            R19_LDB_PK(w_e, nbase[q],
+                                       (k_step_begin + nk) * kKStep, k_hidden);
+#else
                         b_pair[sp][kBatch - 1 - q] =
                             R19_LDB(w_e, nbase[q],
                                     (k_step_begin + nk) * kKStep, k_hidden);
+#endif
                 }
             }
             #pragma unroll
@@ -808,7 +878,7 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
     const int k_iters = (k_steps >= 0) ? k_steps : (k_hidden / kKStep);
     const int nstage = k_iters / kKS;
     const int n_per_warp = block_n / nwarps;
-    const uint8_t* w_e = w1 + (size_t)expert * n_total * k_hidden;
+    const uint8_t* w_e = w1 + (size_t)expert * MT_WSTRIDE(n_total, k_hidden);
     float acc_chk = 0.0f;
     // [D1·B-smem] B 环 smem 紧接 A 双缓冲之后（实例偏移）；仅 kBsmB>0 时使用。
     constexpr int kBRing = (kBsmB > 0) ? kBsmB : 1;
@@ -897,6 +967,17 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
                 }
             }
         } else {
+#if MX_FP4_W && MX_FP4_RING
+        uint64_t b_pk[kBPF][kBatch];
+        #pragma unroll
+        for (int sp = 0; sp < kBPF; ++sp) {
+            if (sp >= k_iters) break;
+            #pragma unroll
+            for (int q = 0; q < kBatch; ++q)
+                b_pk[sp][q] = R19_LDB_PK(w_e, nbase[q],
+                                         (k_step_begin + sp) * kKStep, k_hidden);
+        }
+#else
         R19Frag2 b_pair[kBPF][kBatch];
         #pragma unroll
         for (int sp = 0; sp < kBPF; ++sp) {
@@ -906,6 +987,7 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
                 b_pair[sp][q] = R19_LDB(w_e, nbase[q],
                                         (k_step_begin + sp) * kKStep, k_hidden);
         }
+#endif
         for (int st = 0; st < nstage; ++st) {
             // 等 stage st 的 bsm 完成 + 发布
             R24_WAIT_BSM();
@@ -925,12 +1007,22 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
                     if (kMask && (m >= kMTAct)) continue;   // [R36] 越界 tile
                     a_pipe[m] = r24_lds_a<kMT>(sb, j, m);
                 }
+#if MX_FP4_W && MX_FP4_RING
+                R19Frag2 bexp[kBatch];
+                #pragma unroll
+                for (int q = 0; q < kBatch; ++q)
+                    bexp[q] = r19_expand_pk(b_pk[sp][q]);
+#endif
                 #pragma unroll
                 for (int m = 0; m < kMT; ++m) {
                     if (kMask && (m >= kMTAct)) continue;   // [R36] 越界 tile
                     #pragma unroll
                     for (int q = 0; q < kBatch; ++q) {
+#if MX_FP4_W && MX_FP4_RING
+                        const R19Frag2 bp = bexp[q];
+#else
                         const R19Frag2 bp = b_pair[sp][q];
+#endif
                         const R19Frag b0 = {bp[0], bp[1]};
                         const R19Frag b1 = {bp[2], bp[3]};
                         acc[q][m][0] = __builtin_mxc_mma_16x16x32f8(
@@ -943,9 +1035,15 @@ __device__ R19_GEMM_ATTR void r24_l1_big(
                 if (nk < k_iters) {
                     #pragma unroll
                     for (int q = 0; q < kBatch; ++q)
+#if MX_FP4_W && MX_FP4_RING
+                        b_pk[sp][q] = R19_LDB_PK(w_e, nbase[q],
+                                                 (k_step_begin + nk) * kKStep,
+                                                 k_hidden);
+#else
                         b_pair[sp][q] = R19_LDB(w_e, nbase[q],
                                                 (k_step_begin + nk) * kKStep,
                                                 k_hidden);
+#endif
                 }
             }
         }
@@ -1119,7 +1217,11 @@ __device__ __forceinline__ void r19_l2_tile(
     for (int q = 0; q < kBatch; ++q)
         nbase[q] = (g0 + q) * block_n + warp * n_per_warp;
     R19Frag a_pipe[kPF][kMT];
+#if MX_FP4_W && MX_FP4_RING
+    uint64_t b_pk[kPF][kBatch];
+#else
     R19Frag2 b_pair[kPF][kBatch];
+#endif
     #pragma unroll
     for (int sp = 0; sp < kPF; ++sp) {
         if (sp >= k_iters) break;
@@ -1128,7 +1230,11 @@ __device__ __forceinline__ void r19_l2_tile(
             a_pipe[sp][m] = R21_L2A(sp, m);
         #pragma unroll
         for (int q = 0; q < kBatch; ++q)
+#if MX_FP4_W && MX_FP4_RING
+            b_pk[sp][q] = R19_LDB_PK(w2, nbase[q], sp * kKStep, k_in);
+#else
             b_pair[sp][q] = R19_LDB(w2, nbase[q], sp * kKStep, k_in);
+#endif
     }
     R19Acc acc[kBatch][kMT][kNT];
     #pragma unroll
@@ -1141,11 +1247,21 @@ __device__ __forceinline__ void r19_l2_tile(
     #pragma unroll kPF
     for (int kk = 0; kk < k_iters; ++kk) {
         const int sp = kk & (kPF - 1);
+#if MX_FP4_W && MX_FP4_RING
+        R19Frag2 bexp[kBatch];
+        #pragma unroll
+        for (int q = 0; q < kBatch; ++q)
+            bexp[q] = r19_expand_pk(b_pk[sp][q]);
+#endif
         #pragma unroll
         for (int m = 0; m < kMT; ++m) {
             #pragma unroll
             for (int q = 0; q < kBatch; ++q) {
+#if MX_FP4_W && MX_FP4_RING
+                const R19Frag2 bp = bexp[q];
+#else
                 const R19Frag2 bp = b_pair[sp][q];
+#endif
                 const R19Frag b0 = {bp[0], bp[1]};
                 const R19Frag b1 = {bp[2], bp[3]};
                 acc[q][m][0] = __builtin_mxc_mma_16x16x32f8(
@@ -1161,7 +1277,11 @@ __device__ __forceinline__ void r19_l2_tile(
                 a_pipe[sp][m] = R21_L2A(nk, m);
             #pragma unroll
             for (int q = 0; q < kBatch; ++q)
+#if MX_FP4_W && MX_FP4_RING
+                b_pk[sp][q] = R19_LDB_PK(w2, nbase[q], nk * kKStep, k_in);
+#else
                 b_pair[sp][q] = R19_LDB(w2, nbase[q], nk * kKStep, k_in);
+#endif
         }
     }
     // BF16 输出（每组写自己的列块）
@@ -1358,6 +1478,16 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
                 }
             }
             } else {
+#if MX_FP4_W && MX_FP4_RING
+            uint64_t b_pk[kBPF][kBatch];
+            #pragma unroll
+            for (int sp = 0; sp < kBPF; ++sp) {
+                if (sp >= k_iters) break;
+                #pragma unroll
+                for (int q = 0; q < kBatch; ++q)
+                    b_pk[sp][q] = R19_LDB_PK(w2, nbase[q], sp * kKStep, k_in);
+            }
+#else
             R19Frag2 b_pair[kBPF][kBatch];
             #pragma unroll
             for (int sp = 0; sp < kBPF; ++sp) {
@@ -1366,6 +1496,7 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
                 for (int q = 0; q < kBatch; ++q)
                     b_pair[sp][q] = R19_LDB(w2, nbase[q], sp * kKStep, k_in);
             }
+#endif
             for (int st = 0; st < nstage; ++st) {
                 R24_WAIT_BSM();
                 __syncthreads();
@@ -1403,12 +1534,22 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
                         if (kMask && (m >= kMTAct)) continue;   // [R36] 越界 tile
                         a_pipe[m] = r24_lds_a<kMT>(sb, j, m);
                     }
+#if MX_FP4_W && MX_FP4_RING
+                    R19Frag2 bexp[kBatch];
+                    #pragma unroll
+                    for (int q = 0; q < kBatch; ++q)
+                        bexp[q] = r19_expand_pk(b_pk[sp][q]);
+#endif
                     #pragma unroll
                     for (int m = 0; m < kMT; ++m) {
                         if (kMask && (m >= kMTAct)) continue;   // [R36] 越界 tile
                         #pragma unroll
                         for (int q = 0; q < kBatch; ++q) {
+#if MX_FP4_W && MX_FP4_RING
+                            const R19Frag2 bp = bexp[q];
+#else
                             const R19Frag2 bp = b_pair[sp][q];
+#endif
                             const R19Frag b0 = {bp[0], bp[1]};
                             const R19Frag b1 = {bp[2], bp[3]};
                             acc[q][m][0] = __builtin_mxc_mma_16x16x32f8(
@@ -1421,8 +1562,13 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
                     if (nk < k_iters) {
                         #pragma unroll
                         for (int q = 0; q < kBatch; ++q)
+#if MX_FP4_W && MX_FP4_RING
+                            b_pk[sp][q] = R19_LDB_PK(w2, nbase[q], nk * kKStep,
+                                                     k_in);
+#else
                             b_pair[sp][q] = R19_LDB(w2, nbase[q], nk * kKStep,
                                                     k_in);
+#endif
                     }
                 }
             }
@@ -2188,7 +2334,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
         uint16_t* out_slot = ((&S.a->rwk->ld.l2_out[0][0][0]) != nullptr)
             ? (&S.a->rwk->ld.l2_out[0][0][0]) + (size_t)blockIdx.x * S.a->win_cap * kHidden
             : nullptr;
-        const uint8_t* w2_e = (&S.a->rwk->ld.w2[0][0][0]) + (size_t)e * kHidden * kIntermediate;
+        const uint8_t* w2_e = (&S.a->rwk->ld.w2[0][0][0]) + (size_t)e * MT_WSTRIDE(kHidden, kIntermediate);
         // L2 的 A 走 local_data.frag2 的 fragment 副本
         const uint8_t* f2 = nullptr;
         if (CM_FRAG_L2 && S.frag_all && count > 0) {
@@ -2484,7 +2630,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         uint16_t* out_slot = ((&S.a->rwk->ld.l2_out[0][0][0]) != nullptr)
             ? (&S.a->rwk->ld.l2_out[0][0][0]) + (size_t)blockIdx.x * S.a->win_cap * kHidden
             : nullptr;
-        const uint8_t* w2_e = (&S.a->rwk->ld.w2[0][0][0]) + (size_t)e * kHidden * kIntermediate;
+        const uint8_t* w2_e = (&S.a->rwk->ld.w2[0][0][0]) + (size_t)e * MT_WSTRIDE(kHidden, kIntermediate);
         // [FRAG-ALL] L2 的 A 走 L1 的 frag2 fragment 副本
         const uint8_t* f2 = nullptr;
         if (CM_FRAG_L2 && S.frag_all && count > 0 && CM_FRAG_A2) {

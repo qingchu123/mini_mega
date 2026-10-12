@@ -1570,3 +1570,52 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
 性能中性（同会话 A/B 噪声内）。**torch 侧改动本环境无 torch 无法编译验证**，仅静态审查
 （API 名称/语义不变；`mxk_rwk_w1_off/w2_off` 新增偏移导出），待重出 whl 时验证。
 
+
+## [261012_18_58] r19balance/impl1：fp4(e2m1) 权重 + packed 预取环（`-DMX_FP4_W=1`，默认关）— `-s2 top50` 698→582µs（−16.7%），B 暴露 216→134µs（−38%）
+
+> 目标：W1/W2 以 fp4 打包（super-tile 512B、每 lane 8B），kernel 用
+> `__builtin_mxc_cvt_pk8_f4tof8_scale_lo` 解包回 fp8 fragment 复用现有 fp8 MMA
+> （指令不变）→ 权重 HBM 字节减半。上版原型「cvt 放进 B 预取环」净回退
+> （`-s2 top50` 695→877µs，B 暴露 216→427µs），本版定位并修复。
+
+### 1. 根因定位（同会话微基准 + 消融）
+
+- cvt 吞吐微基准（本机 MetaX C600-UL，32 SM / 1.6GHz，依赖链）：
+  128×256（16 warps/SM）362 Gcvt/s；32×256（**= 本 kernel 的 4 warps/SM**）123 Gcvt/s
+  → cvt 为**延迟受限**，低占用下吞吐仅 1/3。
+- `-DMX_FP4_NOCVT`（保留 8B 装载、只删 cvt）`-s2 top50` = 660µs < 基线 695µs
+  → 多出的全部代价是 cvt 的调度暴露，与装载宽度/字节无关（`ldx_b64` vs `ldx_b128` 非主因）。
+- `MT_DUMP_RES=1`：base regs=256/local=2240；fp4 regs=256/local=2252 —— 无额外溢出。
+
+### 2. 修法（`MX_FP4_RING`，默认 1；仅 `MX_FP4_W=1` 时生效）
+
+- 预取环由 `R19Frag2 b_pair[k][batch]`（16B/项，cvt 在环内）改为
+  `uint64_t b_pk[k][batch]`（8B/项，仅装载）；消费点按 k-step 批量
+  `R19Frag2 bexp[kBatch] = r19_expand_pk(b_pk)` 再喂 MMA。
+- 应用到 r19_l1_big / r24_l1_big / r19_l2_tile / r24_l2_big 四条路径。
+- 新增 `r19_load_b_pk` / `r19_expand_pk`；`R19_LDB_PK` 与 `R24_DIAG_NOB` 兼容。
+
+### 3. A/B（同会话交替，us_mean）
+
+| 场景 | 基线 | fp4+RING | 变化 |
+|---|---:|---:|---:|
+| `-s2 top50` mean（3 轮） | 698.2 | **581.6** | **−16.7%** |
+| `-s2 top50` B 暴露（`R24_DIAG_NOB`） | 216.4 | **134.0** | **−38%** |
+| s1 TPR=32（nodes3 replays2） | 446.9 | 396.9 | −11.2% |
+| s1 TPR=64 | 620.1 | **494.2** | **−20.3%** |
+| s1 TPR=128 | 915.3 | 890.9 | −2.7% |
+| s1 TPR=256 | 1597.3 | 1562.5 | −2.2% |
+
+### 4. 门禁
+
+- `MACA_PATH=/opt/maca scripts/build.sh so check mybench` 通过（默认与 fp4 两种）。
+- `timeout 10 scripts/run.sh check --smoke` **PASS 8/8**，6.4s。
+- 默认 `MX_FP4_W=0`：逐字等价基线（`#if` 全关）。
+
+### 5. 结论与遗留
+
+- fp4 权重经 packed 预取环后真正省带宽：B 暴露 216→134µs 落入目标窗口 110~145µs；
+  s2 698→582µs。**距 500µs 仍差 ~82µs**（NOB 地板 450µs 已占主要）。
+- 预取深度 A/B：`MX_FP4_W=1 + R24_BPF=4 + R19_L1_PF=8` 可再降至 ~567µs，
+  但会同时改变默认 fp8 路径（历史 TPR128/256 回退），需做成 fp4 条件默认，未纳入。
+- 权重 fp4 量化/reorg 仅在 bench/check 侧实现；torch 侧未接入（本环境无 torch）。

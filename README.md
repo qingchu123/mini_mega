@@ -324,6 +324,95 @@ KERNEL_CFLAGS="-DR24_BSMEM_B=1" scripts/build.sh so check mybench
   `NOB` 地板由 544→677µs（+133µs）——B 经 smem 多一遍写+读，占用 smem 端口带宽。
   B 实为**带宽受限**（≈191µs@1.4TB/s），隐藏延迟不减少字节数。详见 `perf.md`。
 
+## 方向3：通信/REDUCE 与计算重叠（`-DMXK_FUSE_REDUCE=1`，默认关，净中性/微回退）
+
+时间标签 `[261012_11_10]`。承接 `-s2 top50` ~751µs → 400µs 目标，尝试「把通信/REDUCE
+与计算重叠」。先把「通信地板」逐项消融量化（R=32，`us_mean`）：
+
+| 消融（`-s2 top50`） | mean (µs) | 边际成本 |
+|---|---:|---:|
+| 基线 | 753.3 | — |
+| `CM_SKIP_GEMM=1`（纯通信+REDUCE） | 174.9 | 地板（**非**与 GEMM 相加项） |
+| `MX_SKIP_REDUCE=1` | 739.0 | REDUCE ≈ 14.3 |
+| `PULL_LOCAL_DIAG=1` | 740.4 | A 远读 ≈ 13.0 |
+| `R30_DIAG_NOPUSH=1` | 805.7 | 推送已重叠（去之反而更慢） |
+
+**关键结论**：`CM_SKIP_GEMM` 的 174.9µs 地板**不等于可回收量**——A pull / COMBINE
+推送 / 跨 block wait-all 大部分已被 GEMM 掩盖；s2 真正暴露的通信边际只有
+REDUCE≈14µs + A 远读≈13µs ≈ **27µs（3.6%）**，方向3 上限约 749→722µs。s1 主要
+暴露 A 远读 45~65µs（`PULL_LOCAL_DIAG`：TPR128 949.4→884.9、TPR256 1670.2→1625.4）。
+
+候选1 实现（`MXK_FUSE_REDUCE`）：`reduce_body` 拆出 `reduce_tile_body`
+（`src/combine.cuh:481`）+ wrapper；`mega_kernel` 任务循环后就地按 `(token,half)`
+轮分执行（`src/kernel.cuh`）；`launch_full` 不再单发 `mega_reduce_kernel`
+（`src/megakernel.cu:231`）；host 经新增 `MegaArgs::y`（`src/compute.cuh:78`）传输出。
+```sh
+scripts/build.sh so check mybench                         # 默认关：逐字等价基线
+KERNEL_CFLAGS="-DMXK_FUSE_REDUCE=1" scripts/build.sh so check mybench
+```
+- 正确性：关 `check --all` **762/762**（78.6s）；开 `check --smoke` **8/8 PASS**（<10s）。
+- 性能：s2 = 749.1→**755.0µs（+0.8%）**；s1 TPR32 485.2→492.8（+1.6%）、
+  TPR128 950.5→983.8（+3.5%）、TPR256 1675.5→1717.1（+2.5%）。**净中性/微回退，默认关**。
+- 根因：`MT_DUMP_RES=1` 显示 `full regs=256 smem=66160`——SM/寄存器已被 mega 占满，
+  reduce 无并发窗口；且融合把 REDUCE 并行度由 `2*tokens` block 降到 `kGrid=32`
+  （s1 大档降 16×）。跨 launch side-stream 重叠亦被 harness 阻断：本机
+  `BeginCapture(ThreadLocal)` 下未 join 的侧流令 `EndCapture` 返回 904 且无图产出。
+
+详见 `perf.md` [261012_11_10]。
+
+## 方向4：win=512 + 跨 block 扁平池 NS4×NK8 L1 split-K（`-DR19_BLOCK_KSPLIT=1
+-DR19_BLOCK_KSPLIT_WINMAX=512`，默认关，净回退）
+
+时间标签 `[261012_13_55]`。目标 `-s2 top50` 734µs → 逼近 400µs：假设 win=512（每专家
+1 窗）消除按窗重复读权重，再用 `(e, N片 s, K段 c)` 共 32 个等代价子任务填入同一扁平池
+恢复负载均衡。**已用逐块相位诊断核实这是真正的块级派发**（非块内 K 循环）：
+
+| 口径（s2 top50 mean, µs） | 默认(自适应win) | win=512 无切 | win=512 + NS4×NK8 |
+|---|---:|---:|---:|
+| 完整 | **733.9** | 1992.1 | 2381.7 |
+| 纯通信+协议（`CM_SKIP_GEMM=1`） | 171.2 | 486.9 | — |
+
+- **块级分布**（rank17, case 806200）：win=512 无切仅 **12/32** block 有 L1
+  （热专家 4 个 N 片任务独占 b=24..27，L1=2.33M cyc，`max/min=7.66`）；加 NS4×NK8 后
+  **32/32** block 有 L1（每块 5~8 任务，`max/min=1.46`）。均衡达成，但每块 L1 均值
+  1.33M vs win=64 的 ~0.4M → **绝对耗时 ×3.3**。
+- **根因**：K 切把「M（窗）并行」换成「K 并行」，A-smem 双缓冲只剩 3 段流水
+  （`nstage=chunk/kKS`），每任务固定开销（流水未热身 + B 直装 + 协议）不随 K 缩小；
+  本机权重**非瓶颈**（`CM_SKIP_GEMM` 仅 171µs），win=512 省下的权重重复读 < 失去并行的代价。
+- **归约非瓶颈**：win512 base（无 atomicAdd）≈ ksplit；`r19_l1_reduce` 仅 ~227µs。
+  「非重叠 `l1_partial[e][s][c]`」需 ×NK 缓冲且末段 reduce 读量 ×NK，**更慢，未采用**。
+- 门禁：默认关 `check --all` **762/762**（75.4s）；开 `check --all` **762/762**（134.8s）、
+   `--smoke` 8/8。**未接近 400µs**；两开关保持默认关。详见 `perf.md` [261012_13_55]。
+
+## 方向5：fp4(e2m1) 权重 + packed 预取环（`-DMX_FP4_W=1`，默认关）
+
+时间标签 `[261012_18_58]`。目标：W1/W2 以 fp4 打包存储（HBM 字节减半），kernel 用
+`__builtin_mxc_cvt_pk8_f4tof8_scale_lo` 解包回 fp8 fragment 复用现有 fp8 MMA。
+
+- **原型问题**：把 cvt 放进 B 预取环（`load→cvt` 即刻产出 fp8 fragment）时，
+  `-s2 top50` 从 695µs 恶化到 877µs（B 暴露 216→427µs）。微基准（同会话，本机
+  C600-UL 32SM）显示该 cvt 为**延迟受限**：128×256 时 362 Gcvt/s，32×256（=本 kernel
+  的 4 warps/SM）仅 123 Gcvt/s。`MX_FP4_NOCVT` 隔离实验（只删 cvt，留 8B 装载）
+  得 660µs < 基线 → **代价全在 cvt 的调度暴露，不在字节/装载宽度**。
+- **修法（`MX_FP4_RING`，默认 1）**：预取环只缓存 **8B packed fp4**（寄存器减半），
+  解包推迟到消费点，并按 k-step 批量展开 `bexp[kBatch]` 后再喂 MMA，给编译器更大
+  调度窗口。应用到 r19/r24 的 L1/L2 四条 GEMM 路径。
+- **A/B（同会话，us_mean）**：
+
+| 口径 | 基线 | fp4+RING | 变化 |
+|---|---:|---:|---:|
+| `-s2 top50` mean（3 轮） | 698.2 | **581.6** | **−16.7%** |
+| `-s2` B 暴露（`R24_DIAG_NOB`） | 216.4 | **134.0** | **−38%** |
+| s1 TPR=32 | 446.9 | 396.9 | −11.2% |
+| s1 TPR=64 | 620.1 | **494.2** | **−20.3%** |
+| s1 TPR=128 | 915.3 | 890.9 | −2.7% |
+| s1 TPR=256 | 1597.3 | 1562.5 | −2.2% |
+
+- 门禁：`check --smoke` **PASS 8/8**，6.4s（<10s）；默认（`MX_FP4_W=0`）逐字等价基线。
+- 遗留：距 500µs 仍差 ~82µs；`MX_FP4_W=1 + R24_BPF=4 + R19_L1_PF=8` 可再降至 ~567µs，
+  但需做成 **fp4 条件默认**（否则回退默认 fp8 路径，历史 `-s2` TPR128/256 回退），未纳入。
+  权重 fp4 量化/reorg 在 torch 侧尚未接入（本环境无 torch）。
+
 ## torch 层（pybind + Python 包，可安装 wheel）
 
 时间标签 `[261006_12_40]`（未提交 git）。新增 `torch/`：pybind11 扩展

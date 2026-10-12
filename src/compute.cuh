@@ -199,6 +199,23 @@ __device__ __forceinline__ Fp8MmaFragment cm_load_a(
 // B（权重）16B/lane 配对 tile：一次 16B 装载 = 同 lane 的两个 native fragment。
 // n 必须为 32 的倍数（调用点 nbase 均为 block_n/8 的整数倍：256/32 网格）。
 // 低 8B = 逻辑行 n 的 fragment，高 8B = 逻辑行 n+16 的 fragment（本 K 段）。
+#if MX_FP4_W
+// [MX_FP4_W] 一个 lane 的 fp4 打包为 8B（低 4B=行 n 的 8×e2m1，高 4B=行 n+16），
+//   用 cvt_pk8_f4tof8 展开回两个 fp8 native fragment。地址 stride 见 r19_load_b16。
+__device__ __forceinline__ Fp8MmaFragment2 cm_expand_fp4_pair(
+        const uint8_t* __restrict__ p) {
+    const uint64_t pk = *reinterpret_cast<const uint64_t*>(p);
+    const uint64_t e0 =
+        __builtin_mxc_cvt_pk8_f4tof8_scale_lo((uint32_t)pk, kFp4ScaleCode);
+    const uint64_t e1 =
+        __builtin_mxc_cvt_pk8_f4tof8_scale_lo((uint32_t)(pk >> 32u),
+                                              kFp4ScaleCode);
+    return Fp8MmaFragment2{static_cast<uint32_t>(e0),
+                           static_cast<uint32_t>(e0 >> 32u),
+                           static_cast<uint32_t>(e1),
+                           static_cast<uint32_t>(e1 >> 32u)};
+}
+#endif
 __device__ __forceinline__ Fp8MmaFragment2 cm_load_b_lane16(
         const uint8_t* __restrict__ w, int n, int k, int k_hidden) {
 #ifdef CM_DIAG_BFIX
@@ -206,9 +223,15 @@ __device__ __forceinline__ Fp8MmaFragment2 cm_load_b_lane16(
 #endif
     const int lane = threadIdx.x & 63;
     const size_t n_tiles = (size_t)(k_hidden >> 5);
+#if MX_FP4_W
     const uint8_t* tile =
-        w + ((size_t)(n >> 5) * n_tiles + (size_t)(k >> 5)) * 1024;
+        w + ((size_t)(n >> 5) * n_tiles + (size_t)(k >> 5)) * kBTileBytes;
+    return cm_expand_fp4_pair(tile + (size_t)lane * 8);
+#else
+    const uint8_t* tile =
+        w + ((size_t)(n >> 5) * n_tiles + (size_t)(k >> 5)) * kBTileBytes;
     return *reinterpret_cast<const Fp8MmaFragment2*>(tile + (size_t)lane * 16);
+#endif
 }
 
 __device__ __forceinline__ float cm_silu(float x) {
@@ -277,7 +300,7 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
         kMTiles > 1
             ? ((count + kM - 1) / kM < kMTiles ? (count + kM - 1) / kM : kMTiles)
             : 1;
-    const uint8_t* w_e = w1 + (size_t)expert * n_total * k_hidden;
+    const uint8_t* w_e = w1 + (size_t)expert * MT_WSTRIDE(n_total, k_hidden);
     const bool gate_on =
         (gate != nullptr && gate->flags != nullptr && gate->k_iters_per_slice > 0);
     float acc_chk = 0.0f;
@@ -296,7 +319,17 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
         for (int q = 0; q < kBatch; ++q)
             nbase[q] = (g0 + q) * block_n + warp * n_per_warp;
 #if CM_BPTR
-        // [OPT-BPTR] B 的 k=0 基址（含 lane 偏移）；k step 递进 = +1024B
+        // [OPT-BPTR] B 的 k=0 基址（含 lane 偏移）；k step 递进 = +kBTileBytes
+#if MX_FP4_W
+        const uint8_t* b_base[kBatch];
+        #pragma unroll
+        for (int q = 0; q < kBatch; ++q)
+            b_base[q] = w_e + (size_t)(nbase[q] >> 5) *
+                                  (size_t)(k_hidden >> 5) * kBTileBytes +
+                        (size_t)(lane & 63) * 8;
+#define CM_LDB_L1(q, step)                                                  \
+    cm_expand_fp4_pair(b_base[(q)] + (size_t)(step) * kBTileBytes)
+#else
         const uint8_t* b_base[kBatch];
         #pragma unroll
         for (int q = 0; q < kBatch; ++q)
@@ -316,6 +349,7 @@ __device__ __forceinline__ void l1_gemm_swiglu_body_paired(
     (*reinterpret_cast<const Fp8MmaFragment2*>(b_base[(q)] +                \
                                                (size_t)(step) * 1024))
 #endif
+#endif  // MX_FP4_W
 #else
 #define CM_LDB_L1(q, step) cm_load_b_lane16(w_e, nbase[q], (step) * kKStep, k_hidden)
 #endif
@@ -490,7 +524,17 @@ __device__ __forceinline__ void l2_gemm_body(
         for (int q = 0; q < kBatch; ++q)
             nbase[q] = (g0 + q) * block_n + warp * n_per_warp;
 #if CM_BPTR_L2
-        // [OPT-BPTR-L2] B 的 k=0 基址（含 lane 偏移）；k step 递进 = +1024B
+        // [OPT-BPTR-L2] B 的 k=0 基址（含 lane 偏移）；k step 递进 = +kBTileBytes
+#if MX_FP4_W
+        const uint8_t* b_base[kBatch];
+        #pragma unroll
+        for (int q = 0; q < kBatch; ++q)
+            b_base[q] = w2 + (size_t)(nbase[q] >> 5) * (size_t)(k_in >> 5) *
+                                 kBTileBytes +
+                        (size_t)(lane & 63) * 8;
+#define CM_LDB_L2(q, step)                                                  \
+    cm_expand_fp4_pair(b_base[(q)] + (size_t)(step) * kBTileBytes)
+#else
         const uint8_t* b_base[kBatch];
         #pragma unroll
         for (int q = 0; q < kBatch; ++q)
@@ -500,6 +544,7 @@ __device__ __forceinline__ void l2_gemm_body(
 #define CM_LDB_L2(q, step)                                                  \
     (*reinterpret_cast<const Fp8MmaFragment2*>(b_base[(q)] +                \
                                                (size_t)(step) * 1024))
+#endif  // MX_FP4_W
 #else
 #define CM_LDB_L2(q, step) cm_load_b_lane16(w2, nbase[q], (step) * kKStep, k_in)
 #endif

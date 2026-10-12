@@ -91,6 +91,43 @@ constexpr int64_t kBarTaskCounterIdx = 2501;
 #define MX_IN_BF16 0
 #endif
 
+// [MX_FP4_W] fp4(e2m1) 权重原型：W1/W2 以 fp4 打包（每字节 2 个，super-tile 512B）
+//   存储，kernel 用 __builtin_mxc_cvt_pk8_f4tof8_scale_lo 解包成 fp8 fragment 再走
+//   现有 fp8 MMA（MMA 指令不变）→ L1 权重 HBM 字节减半。单一 UE8M0 scale（127 = ×1）。
+//   默认 0 = 现行为逐字节不变。开启需 -DMX_FP4_W=1 同时编译 so/mybench/check。
+#ifndef MX_FP4_W
+#define MX_FP4_W 0
+#endif
+#ifndef MX_FP4_RING
+#define MX_FP4_RING 1     // 1 = B 预取环缓存 packed fp4，消费点再解包（默认最优）
+#endif
+#if MX_FP4_W
+constexpr uint16_t kFp4ScaleCode = 127u;   // UE8M0：×2^(127-127)=1
+constexpr int kBTileBytes = 512;           // 32×32 权重 super-tile（fp4 打包后字节数）
+// 权重专家行主序字节步长：fp4 打包后为 fp8 的一半
+#define MT_WSTRIDE(n_rows, k_cols) (((size_t)(n_rows) * (size_t)(k_cols)) >> 1)
+// e2m1 code(4bit) -> e4m3 字节（scale=1）。与设备的
+//   __builtin_mxc_cvt_pk8_f4tof8_scale_lo(packed, 127) 逐字节一致（已探针验证）。
+__host__ __device__ constexpr uint8_t fp4_code_to_fp8(uint8_t c) {
+    const uint8_t sign = (c & 8u) ? 0x80u : 0u;
+    const uint8_t e = (uint8_t)((c >> 1) & 3u);
+    const uint8_t m = (uint8_t)(c & 1u);
+    uint8_t mag = 0;
+    if (e == 0)
+        mag = m ? 0x30u : 0x00u;                        // 0 或 0.5
+    else
+        mag = (uint8_t)(((uint8_t)(e - 1 + 7) << 3) | (m ? 4u : 0u));
+    return (uint8_t)(sign | mag);
+}
+// 设备/宿主共用的确定性 fp4 值函数（满 16 code 分布；与 WPROBE_VAL 独立）。
+#define WPROBE_FP4_CODE(seed, row, k)                                       \
+    ((uint8_t)((((seed) + (uint32_t)(row) * 131u + (uint32_t)(k) * 7u) >> 1) & \
+               0xfu))
+#else
+constexpr int kBTileBytes = 1024;          // fp8：32×32 super-tile = 1024B
+#define MT_WSTRIDE(n_rows, k_cols) ((size_t)(n_rows) * (size_t)(k_cols))
+#endif
+
 // [WP-G1] 组内 4× 静态权重复制：R=32 → 8 组 × 4 连续 rank，每组 32 专家。
 //   1 = local_data 持本组 32 个专家的只读权重 w1g[kGE][2I][H] / w2g[kGE][H][I]
 //       （kGE=kEPR*4=32），取代原 per-rank 的 w1[kEPR]/w2[kEPR]。

@@ -54,6 +54,27 @@ void fill_lane_host_w(std::vector<uint8_t>& buf, int n_rows, int k_cols, uint32_
     buf.assign((size_t)n_rows * k_cols, 0);
     const int k_iters = k_cols / 32;
     const int npairs = n_rows / 32;
+#if MX_FP4_W
+    // [MX_FP4_W] 与设备 fill_w_lane_kernel fp4 分支逐字节一致：每 super-tile 512B，
+    //   lane 的 8B = 行 row 的 8×e2m1 + 行 row+16 的 8×e2m1。
+    for (int np = 0; np < npairs; ++np)
+        for (int kt = 0; kt < k_iters; ++kt) {
+            uint32_t* tile32 = reinterpret_cast<uint32_t*>(
+                buf.data() + ((size_t)np * k_iters + kt) * kBTileBytes);
+            for (int L = 0; L < 64; ++L) {
+                const int row0 = row_base + np * 32 + (L % 16);
+                const int row1 = row0 + 16;
+                const int k0 = kt * 32 + (L / 16) * 8;
+                uint32_t lo = 0, hi = 0;
+                for (int j = 0; j < 8; ++j) {
+                    lo |= (uint32_t)WPROBE_FP4_CODE(seed, row0, k0 + j) << (4 * j);
+                    hi |= (uint32_t)WPROBE_FP4_CODE(seed, row1, k0 + j) << (4 * j);
+                }
+                tile32[L * 2 + 0] = lo;
+                tile32[L * 2 + 1] = hi;
+            }
+        }
+#else
     for (int np = 0; np < npairs; ++np)
         for (int kt = 0; kt < k_iters; ++kt) {
             uint8_t* tile = buf.data() + ((size_t)np * k_iters + kt) * 1024;
@@ -67,6 +88,7 @@ void fill_lane_host_w(std::vector<uint8_t>& buf, int n_rows, int k_cols, uint32_
                 }
             }
         }
+#endif
 }
 
 struct Env {
