@@ -828,10 +828,6 @@ __device__ __forceinline__ void dispatch_pull_body(
                 // [L1L2-SPLIT] ring 门等前代 L2 完成；拆分下前代 L2 在下一个
                 //   kernel（stream 顺序已保证），且数据槽不复用 → 编译期跳过。
                 if constexpr (kPhase == MegaPhase::Both) {
-#if RING_OFF
-                    // [RING_OFF] 唯一槽无复用 → 无前代 L2 依赖，跳过 l2_done ring 门。
-                    (void)rep;
-#else
                     if (s_window >= kRing || rep > 0) {
                         // ring 门：target=(rep + w/ring)*nslice_eff（每物理任务 +1），
                         // 槽复用前等前代 L2 完成。[R35] 用 nslice_eff 匹配物理任务数。
@@ -839,7 +835,6 @@ __device__ __forceinline__ void dispatch_pull_body(
                                      lo, s_window, rep, kRing, nslice_eff, slice,
                                      -1, 0u, a->rwk->lf.dbg, a->max_spins, ctr);
                     }
-#endif
                 }
             }
         }
@@ -859,17 +854,10 @@ __device__ __forceinline__ void dispatch_pull_body(
         // [L1L2-SPLIT] 旗槽（ring，容量 EPR*ring）与数据槽（拆分下每窗口独占）：
         //   slot_win = ceil(kMaxTPR/win_cap) 覆盖 count<=kMaxTPR 的全部窗口；
         //   Both 下两者相同（e*ring + w%ring），行为逐字不变。
-        // [RING_OFF] 唯一槽：pool_slot/data_slot 一律 e*slot_win+w（无 ring 复用），
-        //   slot_win=ceil(kMaxTPR/win_cap) ∈ [1,16]（win_min=32）。
-        const int slot_win = (kMaxTPR + a->win_cap - 1) / a->win_cap;
-#if RING_OFF
-        const int pool_slot = e * slot_win + w;
-        const int data_slot = pool_slot;
-#else
         const int pool_slot = e * kRing + w % kRing;
+        const int slot_win = (kMaxTPR + a->win_cap - 1) / a->win_cap;
         const int data_slot =
             (kPhase == MegaPhase::Both) ? pool_slot : (e * slot_win + w);
-#endif
         const int* pfx = s_prefix + e * (a->R + 1);
         // ---- 任务体分派（count<=kM 小路径 / count>kM M 档位大路径）----
         if (count > kM) {
@@ -886,11 +874,7 @@ __device__ __forceinline__ void dispatch_pull_body(
         // [L1L2-SPLIT] 拆分下无环复用（数据槽每窗口独占）→ 跳过 ring 门与发布。
         bool h_pub = false;
         if constexpr (kPhase == MegaPhase::Both) {
-#if RING_OFF
-            // [RING_OFF] 唯一槽无复用 → 无消费者，不发布 l2_done（h_pub 恒 false）。
-#else
             h_pub = (s_count[e] > (w + kRing) * a->win_cap) || n_reps > 1;
-#endif
         }
         // [BALANCE·docs/20 §4.2b] K 切下仅 owner（kseg==0）发布 l2_done：每窗口
         //   仍恰好 nslice_eff 次，ring 门 target 语义不变；非 owner 不发布。

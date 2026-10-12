@@ -20,15 +20,6 @@
 #include "flags.cuh"
 #include "combine.cuh"   // [R29] CombineFuseCtx/combine_push_chunk（融合推送）
 
-// [RING_OFF] ring 索引（分片旗 flag_slot / split-K 部分和 part_slot）：
-//   默认 = e*kRing+w%kRing（ring 复用）；RING_OFF=1 时改用数据唯一槽 ps
-//   （= e*slot_win+w），与数据缓冲/旗区唯一槽语义一致（避免跨窗别名）。
-#if RING_OFF
-#define MX_RING_SLOT(e, w, ps) (ps)
-#else
-#define MX_RING_SLOT(e, w, ps) ((e) * kRing + (w) % kRing)
-#endif
-
 // [OPT] 相位诊断（默认 0；写入 pre_ticks 第二 bank 的每 block L1/L2 累计周期）
 #ifndef R24_DIAG_PHASE
 #define R24_DIAG_PHASE 0
@@ -1540,7 +1531,7 @@ __device__ __forceinline__ void r19_pull_flags(
     const int s_row_off = w * S.a->win_cap;
     // 旗槽：保持 ring 索引（旗区容量 EPR*ring*nslice=256 不变）；数据槽 pool_slot
     //   在拆分下为 e*slot_win+w（每窗口独占，见 dispatch_pull_body）。
-    const int flag_slot = MX_RING_SLOT(e, w, pool_slot);
+    const int flag_slot = e * kRing + (w % kRing);
     // [GEN] 槽携带代际：pool_slot=e*ring+w%ring 会绕回复用；旗值改用单调代际
     //   epoch + w/ring（= 该槽第几次被用），wait 端用本窗算出的同一值等待，
     //   避免上一代窗口遗留的旗被误判就绪（多波 merge=1 陈旧读修复）。
@@ -1905,7 +1896,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
         //   最后一段归约 + 发布 l1_prog；owner（kseg==0）在下方等 l1_prog。
         //   要求 A 走 fragment（fbase）以便按全局 K step 定位；否则退回原链。
         if (ksplit && fbase != nullptr) {
-            const int part_slot = MX_RING_SLOT(e, w, pool_slot);
+            const int part_slot = e * kRing + (w % kRing);
             float* part = S.l1_partial +
                 ((size_t)part_slot * kNSlice + slice) * kMaxTPR * kL1SliceCols;
             uint32_t* cnt = S.l1_part_cnt + (size_t)part_slot * kNSlice + slice;
@@ -1945,7 +1936,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
         // [BALANCE·docs/20 §4.2] split-K 路径：块内跑 kNK 个 K 段 + 归约。
         //   要求 A 走 fragment（fbase）以便按全局 K step 定位；否则退回原链。
         if (fbase != nullptr) {
-            const int part_slot = MX_RING_SLOT(e, w, pool_slot);
+            const int part_slot = e * kRing + (w % kRing);
             float* part = S.l1_partial +
                 ((size_t)part_slot * kNSlice + slice) * kMaxTPR * kL1SliceCols;
             uint32_t* cnt =
@@ -2411,7 +2402,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
 #if R19_BLOCK_KSPLIT
         // [BALANCE·docs/20 §4.2b] 跨 block K 切（count<=16 → MT1）。
         if (ksplit && fbase != nullptr) {
-            const int part_slot = MX_RING_SLOT(e, w, pool_slot);
+            const int part_slot = e * kRing + (w % kRing);
             float* part = S.l1_partial +
                 ((size_t)part_slot * kNSlice + slice) * kMaxTPR * kL1SliceCols;
             uint32_t* cnt = S.l1_part_cnt + (size_t)part_slot * kNSlice + slice;
@@ -2428,7 +2419,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
 #if L1_SPLITK
         // [BALANCE·docs/20 §4.2] 小档 split-K：同 big（fbase 必需）。
         if (fbase != nullptr) {
-            const int part_slot = MX_RING_SLOT(e, w, pool_slot);
+            const int part_slot = e * kRing + (w % kRing);
             float* part = S.l1_partial +
                 ((size_t)part_slot * kNSlice + slice) * kMaxTPR * kL1SliceCols;
             uint32_t* cnt =

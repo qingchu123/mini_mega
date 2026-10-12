@@ -46,14 +46,6 @@ constexpr int M_CYCLE = 8;
 constexpr int kBarFlagsNumInt32 = 2560;
 constexpr int kFp8BarFlagsNumInt32 = 2568;
 
-// [RING_OFF] 热缓冲槽数：默认 EPR*ring（64）；RING_OFF=1 时 EPR*kMaxWin（128，
-//   覆盖唯一槽 e*slot_win+w 的最大索引，win_cap=32 → 127）。默认 0 逐字不变。
-#if RING_OFF
-constexpr int kDataSlots = kEPR * kMaxWin;
-#else
-constexpr int kDataSlots = kEPR * kRing;
-#endif
-
 // COMBINE 完成标记容量（kernel 侧不 include 布局头，故本地重述）：
 //   kCombineSlicesMax 与 include/deep_gemm/layout/mega_moe.cuh 的
 //   kMegaMoeMaxCombineSlices=32 一致；kMaxCombineRows = max_tokens 上限 512。
@@ -83,7 +75,7 @@ struct alignas(256) local_flags {
     // [BALANCE·docs/20] L1 split-K：每 (slot, N片 s) 的 K 段完成计数（atomicAdd 判最后一段）
     //   仅 L1 split-K（L1_SPLITK / R19_BLOCK_KSPLIT）路径用到：默认不分配。
 #if (L1_SPLITK || R19_BLOCK_KSPLIT)
-    alignas(256) uint32_t l1_part_cnt[kDataSlots][kNSlice];
+    alignas(256) uint32_t l1_part_cnt[kEPR * kRing][kNSlice];
 #endif
 };
 
@@ -118,7 +110,7 @@ struct alignas(256) local_data {
     // 内部使用
     alignas(256) int32_t route_slot_counts[kRanks * kEPR];
     alignas(256) int32_t prefix_tbl[kEPR][kRanks + 1];
-    alignas(256) uint8_t expert_tokens[kDataSlots][kMaxTPR][kHidden];
+    alignas(256) uint8_t expert_tokens[kEPR* kRing][kMaxTPR][kHidden];
     // [冗余，暂注释] alignas(256) float token_route_weights[kEPR + kGrid][kMaxTPR];  // 走 scratch 偏移
     // [冗余，暂注释] alignas(256) int token_src_meta[kEPR + kGrid][kMaxTPR][3];  // 走 scratch 偏移
 
@@ -133,19 +125,19 @@ struct alignas(256) local_data {
     alignas(256) uint8_t w1[kEPR][2*kIntermediate][kHidden];
     alignas(256) uint8_t w2[kEPR][kHidden][kIntermediate];
 #endif
-    alignas(256) uint8_t ffn_hidden[kDataSlots][kMaxTPR][kIntermediate];
+    alignas(256) uint8_t ffn_hidden[kEPR * kRing][kMaxTPR][kIntermediate];
     // [BALANCE·docs/20] L1 split-K FP32 部分和（gate/up 原值，未 SwiGLU）：每 (slot, N片 s)
     //   一块 [行][2I/NS]，NK 个 K 段 atomicAdd 累加；最后一段读回→SwiGLU→FP8 写 ffn_hidden。
     //   仅 L1 split-K（L1_SPLITK / R19_BLOCK_KSPLIT）路径用到：默认不分配（~512MB）。
 #if (L1_SPLITK || R19_BLOCK_KSPLIT)
-    alignas(256) float l1_partial[kDataSlots][kNSlice][kMaxTPR][kL1SliceCols];
+    alignas(256) float l1_partial[kEPR * kRing][kNSlice][kMaxTPR][kL1SliceCols];
 #endif
     alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
     // [FRAG-INT] A/f2 fragment 缓冲，纯 kernel 内部：由本结构体持有，kernel 从
     //   rwk->ld 直接取基址，host/torch 不再传入。尺寸按 kMaxTPR 静态定（容量
     //   上界，运行期实际用 ceil(win_cap/16) 列，只会更小）。
-    alignas(256) uint8_t frag_a[kDataSlots][int(kHidden / 32) * ((kMaxTPR + 15) / 16) * 512];
-    alignas(256) uint8_t frag2[kDataSlots][int(kIntermediate / 32) * ((kMaxTPR + 15) / 16) * 512];
+    alignas(256) uint8_t frag_a[kEPR * kRing][int(kHidden / 32) * ((kMaxTPR + 15) / 16) * 512];
+    alignas(256) uint8_t frag2[kEPR * kRing][int(kIntermediate / 32) * ((kMaxTPR + 15) / 16) * 512];
     // [DEL-Y] 原 alignas(256) float y[kMaxTPR][kHidden]（12MB）零引用已删除：
     //   真正 y 走 MegaLaunchArgs.y/REDUCE；test 侧另分配 d.y（见 mega_common.cuh）。
     // [冗余，暂注释] alignas(256) float ynode[kMaxTPR][kHidden];  // mega_common 另行分配 d.ynode
