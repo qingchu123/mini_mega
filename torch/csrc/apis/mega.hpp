@@ -233,19 +233,16 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
   a.tokens = (int)num_tokens;
   a.slot_capacity = (int)b.cap;
   a.win_cap = (int)wc;
-  a.prefix_off = b.L.prefix_tbl_off;
   a.rwk = b.rwk;
   a.unk = b.unk;
   a.unk_peers = b.d_unk_ptrs;
   // flag 索引已内联为设备侧编译期常量 kBar*Idx（src/common.cuh，镜像 layout 头）。
   a.x_off = b.L.x_off;
   a.weights_off = b.L.topk_weights_off;
-  a.pool_off = b.L.expert_tokens_off;
   a.w_off = b.L.token_route_weights_off;
   a.meta_off = b.L.token_src_meta_off;
   a.max_spins = 4000000;
   a.skip_prologue = (int)skip_prologue;
-  a.prefix_ptr = nullptr;
   a.w1 = w1;
   a.ffn_hidden = b.ffn_hidden;
   a.w2 = w2;

@@ -52,13 +52,10 @@ struct MegaArgs {
     const uint8_t* self;          // 本 rank 对称区基址
     uint8_t* const* peer_bases;   // 各 rank 对称区基址表（拉 x / weights）
     const int64_t* topk_idx;      // 本 rank 输入路由（对称区内视图）
-    // -- 可选独立缓冲（nullptr → self 内对应偏移）--
-    uint8_t* pool_ptr;            // [A-RWK] pool 缓冲（→ Self+pool_off）
-    int* prefix_ptr;              // 前缀表缓冲（→ self+prefix_off）
-    // -- 前序 / 收尾偏移（self 内）--
-    int64_t prefix_off;           // prefix_tbl 在 self 内偏移（prefix_ptr 为空时用）
     // -- 数据缓冲偏移（self / peer sym 内）--
-    int64_t x_off, weights_off, pool_off, w_off, meta_off;
+    //   pool / prefix 已移入本 rank 私有 rwk->ld（kernel 从 a->rwk->ld 取），
+    //   不再经 sym 偏移或外部指针覆盖。
+    int64_t x_off, weights_off, w_off, meta_off;
     int64_t combine_rows_off;     // 目标 rank combine_rows（BF16，<0 关闭 COMBINE）
     int64_t prefold_off;          // [BF16-IN] 本地 fold 的 fp8 x 区（self 内偏移）
     int in_bf16;                  // [BF16-IN] 输入 x 是 bf16(1) / fp8(0)
@@ -642,10 +639,8 @@ __device__ __forceinline__ void dispatch_pull_body(
     int* s_prefix = s_cum + kEPR + 1;                  // EPR*(R+1)：全 experts src 前缀
     __shared__ int s_task, s_expert, s_window, s_count_w, s_slice, s_kseg;
     __shared__ unsigned s_epoch;
-    // prefix_ptr 非空时用独立前缀表缓冲（与 task_setup_body 的 prefix_ptr 对齐）
-    const int* prefix = (a->prefix_ptr != nullptr)
-        ? a->prefix_ptr
-        : reinterpret_cast<const int*>(a->self + a->prefix_off);
+    // prefix 表 = 本 rank 私有 rwk->ld.prefix_tbl（rank 内读写）
+    const int* prefix = &a->rwk->ld.prefix_tbl[0][0];
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
@@ -749,10 +744,8 @@ __device__ __forceinline__ void dispatch_pull_body(
     R19Sched S;
     S.a = a;
     S.cycle = cycle;
-    // [A-RWK] pool 基址：显式传入（普通显存）或回退对称区 self+pool_off
-    S.pool_base = (a->pool_ptr != nullptr)
-                      ? a->pool_ptr
-                      : const_cast<uint8_t*>(a->self) + a->pool_off;
+    // [A-RWK] pool 基址 = 本 rank 私有 rwk->ld.expert_tokens（rank 内读写）
+    S.pool_base = &a->rwk->ld.expert_tokens[0][0][0];
     S.bar_flags = a->rwk->lf.bar[cycle];
     S.dbg = a->rwk->lf.dbg;
     S.l1_chk = a->rwk->lf.l1_chk;

@@ -85,20 +85,16 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     m.tokens = a.tokens;
     m.slot_capacity = a.slot_capacity;
     m.win_cap = a.win_cap;
-    m.prefix_off = a.prefix_off;
     // [步骤2b-A] kernel 直接使用结构体指针
     m.rwk = a.rwk;
     m.unk = a.unk;
     m.unk_peers = a.unk_peers;
     m.x_off = a.x_off;
     m.weights_off = a.weights_off;
-    m.pool_off = a.pool_off;
-    m.pool_ptr = a.pool_ptr;
     m.w_off = a.w_off;
     m.meta_off = a.meta_off;
     m.max_spins = a.max_spins;
     m.skip_prologue = a.skip_prologue;
-    m.prefix_ptr = a.prefix_ptr;
     m.w1 = a.w1;
     m.w2 = a.w2;
     m.ffn_hidden = a.ffn_hidden;

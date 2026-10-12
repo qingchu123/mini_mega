@@ -337,7 +337,6 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.tokens = tokens;
     a.slot_capacity = g.max_tokens;
     a.win_cap = win;
-    a.prefix_off = L.prefix_tbl_off;
     a.rwk = d.rwk;
     a.unk = d.unk;
     a.unk_peers = d.d_unk;
@@ -345,12 +344,9 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.prefold_off = L.prefold_off;
     a.in_bf16 = MX_IN_BF16;
     a.weights_off = L.topk_weights_off;
-    a.pool_off = L.expert_tokens_off;
-    a.pool_ptr = d.ld ? &d.ld->expert_tokens[0][0][0] : nullptr;
     a.w_off = L.token_route_weights_off;
     a.meta_off = L.token_src_meta_off;
     a.max_spins = (int)kSpinLimit;
-    a.prefix_ptr = d.ld ? &d.ld->prefix_tbl[0][0] : nullptr;
     a.w1 = d.w1;
     a.ffn_hidden = d.ffn;
     a.w2 = d.w2;

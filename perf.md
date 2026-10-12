@@ -1406,3 +1406,54 @@ torch 语义或运行期灵活性保留。距 500µs 仍远，主体仍为 L1 GE
 `-s2 top50` 均在噪声内。收益有限（索引本就在 smem），但为后续继续瘦身 `MegaArgs`
 铺路。距 500µs 仍远，主体仍为 L1 GEMM 与跨 block 分片任务量化。
 
+## [261012_16_05] r19balance：`pool`/`prefix` 移入 `rwk->ld`（rank 私有）— `MegaArgs` −4 字段、`s_a` smem −32B、`-s2 top50` ≈中性
+
+> 目标：继续精简 `MegaArgs`（上一条 [261012_15_53] 已把 6 个旗索引改编译期常量）。
+> 本轮把 DISPATCH pool（expert_tokens）与前缀表（prefix_tbl）从「sym scratch 偏移 /
+> 可选外部指针覆盖」彻底改为 **本 rank 私有 `rwk->ld`**：kernel 恒取
+> `&a->rwk->ld.expert_tokens[0][0][0]` / `&a->rwk->ld.prefix_tbl[0][0]`，
+> task_setup 也恒写 `rwk->ld.prefix_tbl`。行为逐字不变（pool/prefix 本就是 rank 内读写）。
+
+### 1. 改动
+
+- `src/compute.cuh`：删 `MegaArgs` 的 `pool_ptr`/`prefix_ptr`/`prefix_off`/`pool_off`
+  四字段；`dispatch_pull_body` 的 prefix/pool 基址改用 `rwk->ld`。
+- `src/megakernel.h`/`src/megakernel.cu`：删 4 字段与 `to_mega_args` 拷贝。
+- `src/kernel.cuh`：`task_setup_body` 的 `prefix_ptr` 实参改 `&a.rwk->ld.prefix_tbl[0][0]`，
+  `prefix_off` 传 0（不再用 sym 回退）。
+- `src/compute_big.cuh`：`R19Sched::pool_base` 注释同步。
+- `test/mega_common.cuh`/`torch/csrc/apis/mega.hpp`：删对应赋值（torch 不再依赖 sym 的
+  expert_tokens/prefix）。sym 布局（`mega_moe.cuh`/`host_layout.cuh`/`layout.hpp`）**保留**
+  expert_tokens/prefix_tbl 槽（仅不再被 kernel 使用；见遗留）。
+
+### 2. 内核资源（`MT_DUMP_RES=1`，`-s1 -tprs 16 -nodes 1 -replays 1`）
+
+| 版本 | regs | local | smem(full) | smem(empty) |
+|---|---:|---:|---:|---:|
+| 基线（HEAD `097b25b`） | 256 | 2288 B | 66096 | 528 |
+| 本改 | 256 | 2288 B | **66064（−32B）** | **496（−32B）** |
+
+`local`/`regs` 不变；4×8B 字段从 smem `s_a` 移除，恰 −32B。
+
+### 3. A/B（us_mean 跨 rank）
+
+| 场景 | 基线 | 本改 | 变化 |
+|---|---:|---:|---:|
+| **`-s2 top50` mean（3 轮）** | 703.67 | **701.82（700.61 / 701.49 / 703.36）** | ~0%（噪声内，略优） |
+| s1 TPR=32 | 460 | 464.13 | +0.9%（噪声） |
+| s1 TPR=128 | 912 | 911.57 | ~0% |
+| s1 TPR=256 | 1619 | 1614.93 | −0.3%（噪声） |
+
+### 4. 门禁
+
+- `check --smoke` **PASS 8/8**，6.59s（`timeout 10` 内）。
+- `check --all` **PASS 762/762**，72.9s（`timeout 400` 内）。
+
+### 5. 结论与遗留
+
+结构精简：`s_a` smem −32B、`MegaArgs` −4 字段；性能中性（`-s2 top50` 略优 0.26%）。
+sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_tokens_off`/
+`L.prefix_tbl_off` 及 `host_layout`/`layout.hpp` 仍在），仅 kernel 不再读写，属可省内存的
+后续项；torch 公有视图 `mega.l1_acts`（原指向 sym expert_tokens）随之不再反映 kernel pool
+（仓内无消费者）。距 500µs 仍远，主体仍为 L1 GEMM 与跨 block 分片任务量化。
+

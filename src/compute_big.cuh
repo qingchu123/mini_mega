@@ -205,7 +205,7 @@ struct R19Sched {
     // [S-SHRINK] 只缓存派生量/间接指针；纯 a-> 字段直接经 a（落在 smem s_a）读。
     const MegaArgs* a;          // 输入视图（smem）
     int cycle;                  // [M_CYCLE] 本轮远端片
-    uint8_t* pool_base;         // [A-RWK] pool 基址（nullptr → self+pool_off）
+    uint8_t* pool_base;         // [A-RWK] pool 基址 = rwk->ld.expert_tokens（rank 私有）
     uint32_t* bar_flags;        // = lf->bar[cycle]
     int* dbg;                   // = lf->dbg
     float* l1_chk;              // = lf->l1_chk

@@ -90,11 +90,12 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
         if (kTick) a.rwk->lf.pre_ticks[3] = clock64();
     } else {
         task_setup_body(a.self, &a.unk->rd, a.R, a.rank, a.slot_capacity,
-                        a.prefix_off, &a.rwk->lf, kBarTaskReadyIdx,
+                        /*prefix_off=*/0, &a.rwk->lf, kBarTaskReadyIdx,
                         kBarTaskCounterIdx, kBarL2DoneIdx,
                         a.rwk->lf.out_total, a.rwk->lf.dbg, a.max_spins,
                         kRecvStride, /*reset_ring=*/true, /*tid_base=*/0,
-                        /*sb_cnt=*/nullptr, /*smem_off=*/0, a.prefix_ptr,
+                        /*sb_cnt=*/nullptr, /*smem_off=*/0,
+                        &a.rwk->ld.prefix_tbl[0][0],
                         a.rwk->lf.ck_dbg, ctr);
     }
     if (kTick) a.rwk->lf.pre_ticks[3] = clock64();

@@ -73,14 +73,11 @@ struct MegaLaunchArgs {
     const uint8_t* self = nullptr;         // 本 rank 对称区基址
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址表（设备数组）
     const int64_t* topk_idx = nullptr;     // 本 rank 输入路由
-    // -- 可选独立缓冲（nullptr → self 内对应偏移）--
-    uint8_t* pool_ptr = nullptr;           // [A-RWK] pool 缓冲
-    int* prefix_ptr = nullptr;             // 前缀表缓冲
     // -- 前序 / REDUCE 偏移（self 内）--
-    int64_t prefix_off = 0;                // prefix_tbl（prefix_ptr 为空时用）
     int64_t topk_idx_off = 0;              // REDUCE：self + topk_idx_off = topk_idx 基址
     // -- 数据缓冲偏移（self / peer sym 内）--
-    int64_t x_off = 0, weights_off = 0, pool_off = 0, w_off = 0, meta_off = 0;
+    //   pool / prefix 已移入本 rank 私有 rwk->ld（kernel 直接取），不再有对应字段。
+    int64_t x_off = 0, weights_off = 0, w_off = 0, meta_off = 0;
     int64_t combine_rows_off = -1;         // combine_rows（BF16）；<0 关闭 COMBINE
     int64_t prefold_off = 0;               // [BF16-IN] 本地 fold 的 fp8 x 区（self 内）
     int in_bf16 = 0;                       // [BF16-IN] x 是 bf16(1)/fp8(0)
