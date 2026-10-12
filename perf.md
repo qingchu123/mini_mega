@@ -1656,3 +1656,51 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
 - s1 TPR=256 +1.1%：大窗 kAsync 亦随之用 BPF=4。可选后续把深度改由
   `S.a->win_cap<=64` 运行期门控（大窗保持 2），需复制 kAsync 实例，本轮未纳入。
 - torch 侧改动（工作副本内 flags_bridge/init）单列，未随本提交验证。
+
+## [261013_00_02] agent/peerbuf/stage3：组内均衡调度 + 远端 helper 计算（`-DMX_GROUP_SCHED=1`，默认关）— `-s2 top50` 695→571µs（−17.8%）
+
+> 目标：把 `-s 2 -top 50`（TK 实录不均衡）的 fp8 路径 mean 从 ~690µs 压向 500µs。
+> 做法：**交织组**（组 g = rank%8，member = rank/8）内，按确定性 LPT 把本组 32 个专家的
+> **窗口**重分配给组内 4 个 rank；非 owner 窗口由 helper 远端拉取 A（读 owner 的
+> `expert_recv_counts`/`src_index_table`）、用本组权重 `w1g/w2g`（ge 索引）计算，L2 结果
+> 经 COMBINE 推回源 rank，`combine_sums` 协议不变。默认 `MX_GROUP_SCHED=0` 逐字节不变。
+
+### 1. 改动
+
+- 新增 `src/group_sched.cuh`：交织组几何 + 组倾斜门控（`max·kGE > 3·Σ`）+ 桶式无 scratch
+  确定性 LPT（cost=ceil(rows/16)，cost 降序、(ge,w) 升序；平手优先 owner 再低序号）。
+- `src/flags_defs.cuh`：`kGroupRanks` 可用 `-DMX_GROUP_RANKS` 覆盖（默认 4）。
+- `src/compute.cuh`（`dispatch_pull_body`）：gs 激活时按本 rank 窗口序号 seq 建任务表
+  （`pool_slot=seq%kGSRing`、`ring=kGSRing=64`、`gen=epoch+seq/ring`），任务尾 `l2_done`
+  按 seq 判定复用；均衡组（不倾斜）回退逐字基线路径。
+- `src/compute_big.cuh`：`r19_pull_flags`/任务体新增 `owner`/`seq`；gs 下 `src_index_table`
+  用 owner 的 FG 表且专家维索引折 `le=ge%kEPR`；权重索引用组内专家序 `ge`。
+- `test/check.cu`：`check_l1l2` 按同一 gs 门控/LPT 定位 rank0 的正确 pool/frag 槽。
+- `src/host_layout.cuh`：`MX_GROUP_SCHED` 下动态 smem=40KB（gs 表；<48KB 默认上限）。
+
+### 2. A/B（同会话，R=32；s2=top50 nodes20 replays2 取 min；s1=nodes20 replays2）
+
+| 口径 | 默认 (MX_GROUP_SCHED=0) | 阶段3 (MX_GROUP_SCHED=1) | 变化 |
+|---|---:|---:|---:|
+| `-s2 top50` mean | 695.2 | **570.9** | **−17.9%** |
+| s1 TPR=16 | 315.1 | 323.7 | +2.7% |
+| s1 TPR=32 | 417.1 | 431.4 | +3.4% |
+| s1 TPR=256 | 1603.7 | 1611.4 | +0.5% |
+
+### 3. 门禁
+
+- `KERNEL_CFLAGS="-DMX_GROUP_SCHED=1" scripts/build.sh so mybench check` 通过。
+- `timeout 10 scripts/run.sh check --smoke` **PASS 8/8**（7.0s，<10s）。
+- `timeout 400 scripts/run.sh check --all` **PASS 762/762**（49.7s）——含全部 TK 实录 launch
+  （均衡 TPR 全表 + 762 用例），REDUCE/L1L2/graph 全通过。
+- 默认 `MX_GROUP_SCHED=0`：`check --smoke` PASS 8/8、`-s2 top50` mean 695.2µs（与基线一致）。
+
+### 4. 结论与遗留
+
+- `-s2 top50` 695→571µs（−17.9%）；距 500µs 仍差 ~70µs。
+- 均衡 TPR 路径回退 +0.5~3.4%（组倾斜判定需读 owner FG 计数 + gs 表构建），因 `MX_GROUP_SCHED`
+  默认关，生产不受影响；后续可用「是否曾出现倾斜」的跨 launch 记忆来对均衡负载零成本。
+- `MX_GROUP_RANKS=8`（组 8）实测更差（598µs）：权重复制 2×（rwk 2.75GB）、远端读更多，
+  收益被抵消；默认 4。
+- 未达 <500µs：wall 由最忙 block 的**单个大窗任务**决定，rank 级重分配有上限；后续需配合
+  更细粒度切片或 K 切（`R19_BLOCK_KSPLIT`）进一步缩短单任务。

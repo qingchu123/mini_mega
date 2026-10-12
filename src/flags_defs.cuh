@@ -94,10 +94,15 @@ struct alignas(256) ranks_flags {
         combine_sums[M_CYCLE][kTopk][kMaxCombineRows][kCombineSlicesMax];
 };
 
-// [WP-G1] 组内权重复制几何：kGroupRanks=4 连续 rank 一组，kGE=32 为每组专家数。
-//   全局专家映射：owner=e/kEPR，组=owner/kGroupRanks，组内专家序
-//   ge=(owner%kGroupRanks)*kEPR+(e%kEPR)∈[0,kGE)。
-constexpr int kGroupRanks = 4;
+// [WP-G1] 组内权重复制几何：kGroupRanks 个 rank 一组，kGE=kEPR*kGroupRanks 为每组
+//   专家数。全局专家映射（连续组，仅 MX_GROUP_WEIGHTS 非 gs 路径）：owner=e/kEPR，
+//   组=owner/kGroupRanks，组内专家序 ge=(owner%kGroupRanks)*kEPR+(e%kEPR)∈[0,kGE)。
+//   [MX_GROUP_SCHED] 可用 -DMX_GROUP_RANKS=8 扩大组规模（权重复制 2×，均衡更细）；
+//   交织组语义见 group_sched.cuh。
+#ifndef MX_GROUP_RANKS
+#define MX_GROUP_RANKS 4
+#endif
+constexpr int kGroupRanks = MX_GROUP_RANKS;
 constexpr int kGE = kEPR * kGroupRanks;
 
 // ---- 本 rank 私有（普通显存）----

@@ -278,6 +278,10 @@ struct R19Sched {
     int merge;
     int nslice_eff;
     int mt_total;
+    // [MX_GROUP_SCHED] 组内均衡：gs=1 时任务 (e,w) 语义变为「组内专家 ge + 本 rank
+    //   窗口序号 seq」；ring = pool/旗 ring 槽数（= kGSRing）；owner 由任务传入。
+    bool gs = false;
+    int ring = kRing;
     unsigned long long* ctr = nullptr;
 };
 
@@ -1687,7 +1691,8 @@ __device__ R19_GEMM_ATTR void r24_l2_big(
 template <MegaPhase kPhase = MegaPhase::Both>
 __device__ __forceinline__ void r19_pull_flags(
         const R19Sched& S, int task, int e, int w, int count, int slice,
-        unsigned epoch, int pool_slot, const int* pfx, int kseg = 0) {
+        unsigned epoch, int pool_slot, const int* pfx, int kseg = 0,
+        int owner = -1, int seq = -1) {
     const int tid = threadIdx.x;
     // [BALANCE·docs/20 §4.2b] 跨 block K 切：仅 owner（kseg==0）执行 pull/staging/
     //   分片旗；其余 K 段只等待分片旗（数据由 owner 搬齐）。未启用时 own≡true，
@@ -1700,14 +1705,17 @@ __device__ __forceinline__ void r19_pull_flags(
     const int s_row_off = w * S.a->win_cap;
     // 旗槽：保持 ring 索引（旗区容量 EPR*ring*nslice=256 不变）；数据槽 pool_slot
     //   在拆分下为 e*slot_win+w（每窗口独占，见 dispatch_pull_body）。
-    const int flag_slot = e * kRing + (w % kRing);
-    // [GEN] 槽携带代际：pool_slot=e*ring+w%ring 会绕回复用；旗值改用单调代际
-    //   epoch + w/ring（= 该槽第几次被用），wait 端用本窗算出的同一值等待，
-    //   避免上一代窗口遗留的旗被误判就绪（多波 merge=1 陈旧读修复）。
+    // [MX_GROUP_SCHED] gs 下 flag_slot 直接 = pool_slot（= seq%kGSRing）。
+    const int flag_slot = S.gs ? pool_slot : (e * kRing + (w % kRing));
+    // [GEN] 槽携带代际：pool_slot 会绕回复用；旗值改用单调代际 epoch + win/ring
+    //   （= 该槽第几次被用），wait 端用本窗算出的同一值等待，避免上一代窗口遗留
+    //   的旗被误判就绪（多波 merge=1 陈旧读修复）。gs 下 win 用本 rank 窗口序号。
+    const int gs_win = S.gs ? seq : w;
+    const int ring_sz = (S.ring > 0) ? S.ring : 1;
 #ifdef NO_GEN_FIX
     const unsigned gen = epoch;
 #else
-    const unsigned gen = epoch + (unsigned)(w / (kRing > 0 ? kRing : 1));
+    const unsigned gen = epoch + (unsigned)(gs_win / ring_sz);
 #endif
     (void)flag_slot;
     // [R35] 物理任务覆盖 merge 个连续逻辑 slice：K 片为连续 merge 段
@@ -1717,8 +1725,10 @@ __device__ __forceinline__ void r19_pull_flags(
     // [UNK-MERGE] staging 已并入 unk->rd（rank 内读写）。
     float* wt = S.a->unk->rd.token_route_weights;
     int* meta = S.a->unk->rd.token_src_meta;
-    const uint32_t* src_tbl =
-        &(&S.a->unk->rd)->src_index_table[S.cycle][0][0][0];
+    // [MX_GROUP_SCHED] 远端窗口读 owner 的 src_index_table（FG，peer 可读）。
+    const uint32_t* src_tbl = S.gs
+        ? &S.a->unk_peers[owner]->rd.src_index_table[S.cycle][0][0][0]
+        : &(&S.a->unk->rd)->src_index_table[S.cycle][0][0][0];
     const bool kTick = (S.pt != nullptr) && (blockIdx.x == 0) && (task == 0) &&
                        (tid == 0);
     // ---- 行均分 K 片 pull：半 warp 一行（8 warp × 2 行并行），staging 写 weights/meta
@@ -1747,8 +1757,11 @@ __device__ __forceinline__ void r19_pull_flags(
         int src = 0;
         while (src + 1 < S.a->R && pfx[src + 1] <= global_row) ++src;
         const int slot_in_rank = global_row - pfx[src];
+        // [MX_GROUP_SCHED] src_index_table 的专家维 = 本地专家号（kEPR）；gs 下
+        //   任务 e 为组内专家序 ge，须折算 le = ge%kEPR（表基址已指向 owner）。
+        const int e_tbl = S.gs ? (e % kEPR) : e;
         const uint32_t encoded =
-            src_tbl[(size_t)(e * S.a->R + src) * kMaxTPR + slot_in_rank];
+            src_tbl[(size_t)(e_tbl * S.a->R + src) * kMaxTPR + slot_in_rank];
         const int src_token = (int)(encoded / (uint32_t)kTopk);
         const bool valid = src_token >= 0 && src_token < S.a->slot_capacity;
         uint4* dstp = reinterpret_cast<uint4*>(
@@ -1924,10 +1937,12 @@ __device__ __forceinline__ void r19_l1_pub_wait(
     const bool kTick = (S.pt != nullptr) && (blockIdx.x == 0) && (task == 0) &&
                        (tid == 0);
     // [GEN] 与 slice_flags 同代际，避免 l1_prog 跨窗口复用陈旧读
+    // [MX_GROUP_SCHED] gs 下 w 实为「本 rank 窗口序号 seq」，ring 用 S.ring。
+    const int ring_sz = (S.ring > 0) ? S.ring : 1;
 #ifdef NO_GEN_FIX
     const unsigned gen = epoch;
 #else
-    const unsigned gen = epoch + (unsigned)(w / (kRing > 0 ? kRing : 1));
+    const unsigned gen = epoch + (unsigned)(w / ring_sz);
 #endif
     __syncthreads();
     // ---- l1_prog 发布 + L1→L2 依赖（本窗全部 NSLICE 个旗）----
@@ -2006,7 +2021,7 @@ template <MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_BIG_ATTR void r19_big_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         int kseg, unsigned epoch, int pool_slot, const int* pfx,
-        uint8_t* a_smem, uint8_t* b_smem) {
+        uint8_t* a_smem, uint8_t* b_smem, int owner = -1, int seq = -1) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
@@ -2027,7 +2042,8 @@ __device__ R19_BIG_ATTR void r19_big_task(
     fuse.out_base = reinterpret_cast<const uint8_t*>((&S.a->unk->rd.l2_out[0][0][0]));
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
-    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx, kseg);
+    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx, kseg,
+                           owner, seq);
 #if R24_DIAG_PHASE
     const unsigned long long t_l1s = (tid == 0) ? clock64() : 0ull;
 #endif
@@ -2332,7 +2348,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
             { if (kseg == 0) r19_l1_wait_all(S, pool_slot, w); }
         else
 #endif
-            r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
+            r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, S.gs ? seq : w);
     }   // end if constexpr (kPhase == MegaPhase::Both)
 #if R19_BLOCK_KSPLIT
     // 非 owner 的 K 段只做部分和：到此结束（不跑 L2/tail，不发布 l2_done）。
@@ -2531,7 +2547,7 @@ template <MegaPhase kPhase = MegaPhase::Both>
 __device__ R19_SMALL_ATTR void r19_small_task(
         const R19Sched& S, int task, int e, int w, int count, int slice,
         int kseg, unsigned epoch, int pool_slot, const int* pfx,
-        uint8_t* a_smem, uint8_t* b_smem) {
+        uint8_t* a_smem, uint8_t* b_smem, int owner = -1, int seq = -1) {
     const int tid = threadIdx.x;
     const int warp = tid / 64;
     const int lane = tid % 64;
@@ -2542,7 +2558,8 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     (void)b_smem;
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
-    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx, kseg);
+    r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx, kseg,
+                           owner, seq);
     // ---- L1：小 count 档位（与基线实例选择一致）----
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
@@ -2632,7 +2649,7 @@ __device__ R19_SMALL_ATTR void r19_small_task(
             { if (kseg == 0) r19_l1_wait_all(S, pool_slot, w); }
         else
 #endif
-            r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, w);
+            r19_l1_pub_wait(S, task, count, slice, epoch, pool_slot, S.gs ? seq : w);
     }   // end if constexpr (kPhase == MegaPhase::Both)
 #if R19_BLOCK_KSPLIT
     if constexpr (kPhase != MegaPhase::L1) {

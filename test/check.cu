@@ -33,6 +33,9 @@
 #include <vector>
 
 #include "mega_common.cuh"
+#if MX_GROUP_SCHED
+#include "group_sched.cuh"
+#endif
 
 namespace {
 
@@ -266,6 +269,40 @@ void l1_diag(Env& e, const Spec& s, const mt::Routes& routes, int ex, int rows,
 }
 
 // --------------------------------------------- L1 / L2（expert0，rank0） --
+#if MX_GROUP_SCHED
+// [MX_GROUP_SCHED] 计算 rank0（组0 member0）窗口列表中 (rank0 本地专家 ex, w=0)
+//   的序号 seq；<0 表示该窗口未分配给 rank0（该用例跳过 L1/L2 数值核验）。
+//   与设备 gs_enum/gs_sort/gs_assign 同源，确定性一致。
+static int gs_seq_rank0(const mt::Routes& routes, int R, int win, int ex) {
+    const int g = 0;   // rank0 的组号 = 0
+    int cg[kGE];
+    for (int ge = 0; ge < kGE; ++ge) {
+        const int m = ge / kEPR, le = ge % kEPR;
+        const int owner = mxk::gs_rank_of_member(R, g, m);
+        const int gex = owner * kEPR + le;
+        int c = 0;
+        for (int64_t v : routes[owner])
+            if (v == gex) ++c;
+        cg[ge] = c;
+    }
+    std::vector<int> ge_list(mxk::kGsMaxWin), gw_list(mxk::kGsMaxWin);
+    // 与设备同门控：组倾斜（max·kGE > 3·Σ）才启用 gs 重分配；否则基线槽。
+    int mx = 0;
+    long long sum = 0;
+    for (int i = 0; i < kGE; ++i) {
+        if (cg[i] > mx) mx = cg[i];
+        sum += cg[i];
+    }
+    if (!((sum > 0) && ((long long)mx * kGE > 3LL * sum))) return -2;
+    const int n = mxk::gs_schedule_member(cg, win, /*member=*/0, ge_list.data(),
+                                          gw_list.data(), mxk::kGsMaxWin);
+    const int target_ge = mxk::gs_ge_of_expert(R, ex);
+    for (int i = 0; i < n; ++i)
+        if (ge_list[i] == target_ge && gw_list[i] == 0) return i;
+    return -1;
+}
+#endif
+
 bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
     if (e.rank != 0) return true;
     const int win = s.win;
@@ -296,8 +333,18 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
     }
     const int rows = std::max(1, std::min(std::min(best, win), e.check_rows));
     const ProdLayout& L = e.geo.L;
-    const int pool_slot = ex * kRing;   // 专家 ex，窗口 w0
-    std::printf("    [L1/L2] expert=%d (rank0 本地) pairs=%d 核验行数=%d\n", ex, best, rows);
+    int pool_slot = ex * kRing;   // 专家 ex，窗口 w0（默认布局）
+#if MX_GROUP_SCHED
+    if (e.R % kGroupRanks == 0) {
+        const int seq = gs_seq_rank0(routes, e.R, win, ex);
+        if (seq == -1) {
+            std::printf("    [L1/L2] gs: (expert=%d, w0) 未分给 rank0，跳过数值核验\n", ex);
+            return true;
+        }
+        if (seq >= 0) pool_slot = seq % kGSRing;   // -2 = 组不倾斜（基线槽）
+    }
+#endif
+    std::printf("    [L1/L2] expert=%d (rank0 本地) pairs=%d 核验行数=%d pool_slot=%d\n", ex, best, rows, pool_slot);
 
     CHECK(mcSetDevice(0));
     std::vector<uint8_t> xd((size_t)rows * kHidden);
@@ -318,7 +365,7 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
         for (size_t i = 0; i < (size_t)rows * kIntermediate; ++i)
             if (ffn_d[i] != 0) ++nz0;
         if (nz0 < (long long)(rows * kIntermediate) / 2) {
-            const int slot = ex * kRing;   // 窗口 0 → frag2 槽 e*ring+0
+            const int slot = pool_slot;   // 窗口 0 → frag2 槽 = pool_slot
             // frag2 槽字节 = (kIntermediate/32)*mt*512（mt=ceil(win/16)），与内核 f2sz 一致；
             // 不能用 frag2[slot]（其 stride 基于 kMaxTPR=512，win<512 时会错位）。
             const size_t f2sz = (size_t)(kIntermediate / 32) * (size_t)mt * 512;

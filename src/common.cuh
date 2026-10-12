@@ -39,6 +39,9 @@ constexpr int kL1Parts = kNSlice * kNK;                     // 每 (专家,窗�
 #endif
 constexpr int kRing = KRING_OVERRIDE;  // 专家窗口槽数（ring 复用）
 constexpr int kMaxWin = 8;  // 专家窗口槽数（ring 复用）
+// [MX_GROUP_SCHED] 组内均衡：pool/分片旗/l2_done 的 ring 槽数 = kEPR*kRing（=64），
+//   索引由「本 rank 窗口序号 seq % kGSRing」给出（取代 e*kRing+w%kRing）。
+constexpr int kGSRing = kEPR * kRing;
 constexpr int kM = 16;               // M tile 行数
 // L1 N tile 宽（生产 block_n；原 MegaArgs.l1_block_n 的固定值）
 constexpr int kL1BlockN = 256;
@@ -136,6 +139,20 @@ constexpr int kBTileBytes = 1024;          // fp8：32×32 super-tile = 1024B
 //   由另一 agent 接入，本开关只负责结构体/填充就绪。
 #ifndef MX_GROUP_WEIGHTS
 #define MX_GROUP_WEIGHTS 0
+#endif
+
+// [MX_GROUP_SCHED] 阶段 3：组内均衡调度 + 远端 helper 计算（默认 0 = 逐字节等价现状）。
+//   交织组：group = rank % nGroups，member = rank / nGroups，nGroups = R / kGroupRanks。
+//   每个 rank 用确定性 LPT 把「本组 32 个专家的全部窗口」重新分配给组内 4 个 rank，
+//   非 owner 的窗口由 helper 远端拉取 A（读 owner 的 src_index_table）、用本组权重
+//   w1g/w2g（ge 索引）计算，L2 结果 push 回源 rank 的 combine_rows，协议不变。
+//   依赖组权重（w1g/w2g）就绪 → 自动打开 MX_GROUP_WEIGHTS。
+#ifndef MX_GROUP_SCHED
+#define MX_GROUP_SCHED 0
+#endif
+#if MX_GROUP_SCHED && !MX_GROUP_WEIGHTS
+#undef MX_GROUP_WEIGHTS
+#define MX_GROUP_WEIGHTS 1
 #endif
 
 // 自旋上限（异常保护）：约 1s（4M 周期 @2GHz）

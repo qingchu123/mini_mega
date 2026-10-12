@@ -113,6 +113,13 @@ static int prod_block_n(int bn_override) {
 
 // 生产 smem：数据区 max(window*bn*4, E*4) + 控制区 (EPR*2+R+2)*4
 static int64_t prod_smem(int R, int window, int block_n) {
+#if MX_GROUP_SCHED
+    // [MX_GROUP_SCHED] 动态 smem 额外承载：组内前缀 kGE*(R+1) + 计数 kGE +
+    //   本 rank 窗口表 (ge,w) 2*kGsMaxWin + LPT scratch (3+1)*kGsMaxWin + load。
+    //   取 40KB（kGE=64、R=32 时实际 ~25KB），低于默认 48KB 动态 smem 上限。
+    (void)R; (void)window; (void)block_n;
+    return 40960;
+#else
     const int64_t E = (int64_t)R * kEPR;
     const int64_t smem_data = std::max(
         (int64_t)window * block_n * (int64_t)sizeof(float),
@@ -120,4 +127,5 @@ static int64_t prod_smem(int R, int window, int block_n) {
     const int64_t smem_data_aligned = ((smem_data + 15) / 16) * 16;
     const int64_t control = ((int64_t)kEPR * 2 + R + 2) * (int64_t)sizeof(int);
     return smem_data_aligned + ((control + 127) / 128) * 128;
+#endif
 }

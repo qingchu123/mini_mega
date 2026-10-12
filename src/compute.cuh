@@ -25,6 +25,7 @@
 
 #include "common.cuh"
 #include "flags.cuh"
+#include "group_sched.cuh"   // [MX_GROUP_SCHED] 组内均衡窗口调度
 
 // ---------------------------------------------------------------- 主 kernel --
 // host -> device 参数（按值传结构体；全部为 POD）
@@ -683,6 +684,7 @@ __device__ __forceinline__ void dispatch_pull_body(
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）
     int* s_prefix = s_cum + kEPR + 1;                  // EPR*(R+1)：全 experts src 前缀
     __shared__ int s_task, s_expert, s_window, s_count_w, s_slice, s_kseg;
+    __shared__ int s_owner, s_seq, s_nwin, s_gsskew;
     __shared__ unsigned s_epoch;
     // prefix 表 = 本 rank 私有 rwk->ld.prefix_tbl（rank 内读写）
     const int* prefix = &a->rwk->ld.prefix_tbl[0][0];
@@ -690,11 +692,74 @@ __device__ __forceinline__ void dispatch_pull_body(
     const int warp = tid / 64;
     const int lane = tid % 64;
     (void)warp; (void)lane;
+    // [MX_GROUP_SCHED] 组内均衡：当本组窗口倾斜（max_expert·32 > 3·Σ）时，按交织组
+    //   把本组 32 专家的窗口 LPT 分配给组内 4 个 rank；本 rank 的窗口列表存 smem。
+    //   均衡（不倾斜）时保持逐字基线路径，避免为均衡负载引入远端读开销。
+    const bool gs_cap = MX_GROUP_SCHED && (a->R % kGroupRanks == 0) &&
+                        (mxk::gs_nGroups(a->R) >= 2);
+    bool gs_on = false;
+#if MX_GROUP_SCHED
+    const int gs_grp = mxk::gs_group_of_rank(a->R, a->rank);
+    const int gs_mem = mxk::gs_member_of_rank(a->R, a->rank);
+    int* s_gscount = s_prefix + kGE * (a->R + 1);
+    int* s_ge = s_gscount + kGE;
+    int* s_gw = s_ge + mxk::kGsMaxWin;
+    if (gs_cap) {
+        // 组倾斜判定：并行统计本组 4 个 owner 的 32 专家总计数（1024 次 FG 读，
+        //   blockDim 线程并行 + smem atomicAdd；均衡负载下这是唯一额外开销）。
+        if (tid < kGE) s_gscount[tid] = 0;
+        __syncthreads();
+        for (int i = tid; i < kGE * a->R; i += (int)blockDim.x) {
+            const int ge = i / a->R;
+            const int r = i % a->R;
+            const int m = ge / kEPR;
+            const int le = ge % kEPR;
+            const int o = mxk::gs_rank_of_member(a->R, gs_grp, m);
+            const int v =
+                (int)a->unk_peers[o]->rd.expert_recv_counts[cycle][r][le];
+            atomicAdd(&s_gscount[ge], v);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int mx = 0;
+            long long sum = 0;
+            for (int i = 0; i < kGE; ++i) {
+                if (s_gscount[i] > mx) mx = s_gscount[i];
+                sum += s_gscount[i];
+            }
+            s_gsskew = (sum > 0) && ((long long)mx * kGE > 3LL * sum);
+        }
+        __syncthreads();
+        gs_on = s_gsskew != 0;
+        if (gs_on) {
+            // 组内前缀：s_prefix[ge*(R+1)+src] = Σ_{r'<src} owner(ge) 收行数
+            //   （仅 gs 激活时构建；4 rank 读同一批 owner ⇒ 分配全局一致）。
+            for (int i = tid; i < kGE; i += (int)blockDim.x) {
+                const int m = i / kEPR;
+                const int le = i % kEPR;
+                const int o = mxk::gs_rank_of_member(a->R, gs_grp, m);
+                int c = 0;
+                for (int r = 0; r < a->R; ++r) {
+                    s_prefix[i * (a->R + 1) + r] = c;
+                    c += (int)a->unk_peers[o]->rd.expert_recv_counts[cycle][r][le];
+                }
+                s_prefix[i * (a->R + 1) + a->R] = c;
+            }
+            __syncthreads();
+            // 单线程桶式 LPT（无 scratch，O(cost × 窗口数)，开销可忽略）。
+            if (tid == 0)
+                s_nwin = mxk::gs_schedule_member(s_gscount, a->win_cap, gs_mem,
+                                                 s_ge, s_gw, mxk::kGsMaxWin);
+            __syncthreads();
+        }
+    }
+#endif
     // [O1] 全 experts src 前缀一次预载（s_prefix 扩容 EPR*(R+1)）
-    for (int i = tid; i < kEPR * (a->R + 1); i += (int)blockDim.x)
-        s_prefix[i] = prefix[i];
+    if (!gs_on)
+        for (int i = tid; i < kEPR * (a->R + 1); i += (int)blockDim.x)
+            s_prefix[i] = prefix[i];
     // 每专家总行数 + 窗口前缀（前缀和以 win_cap 划分窗口）
-    if (tid == 0) {
+    if (!gs_on && tid == 0) {
         int total = 0;
         s_cum[0] = 0;
         for (int e = 0; e < kEPR; ++e) {
@@ -720,9 +785,11 @@ __device__ __forceinline__ void dispatch_pull_body(
     const bool ksw = (a->win_cap <= R19_BLOCK_KSPLIT_WINMAX) && (kNK > 1) &&
                      frag_ok_ks;
     const int kseg_n = ksw ? kNK : 1;
-    const int raw_tasks = s_cum[kEPR] * kNSlice * kseg_n;
+    const int raw_tasks = gs_on ? (s_nwin * kNSlice)
+                                : (s_cum[kEPR] * kNSlice * kseg_n);
 #else
-    const int raw_tasks = s_cum[kEPR] * kNSlice;
+    const int raw_tasks =
+        gs_on ? (s_nwin * kNSlice) : (s_cum[kEPR] * kNSlice);
 #endif
     // merge 机制已去除：固定 merge=1（不粗化），nslice_eff=kNSlice。
     const int merge = 1;
@@ -789,12 +856,23 @@ __device__ __forceinline__ void dispatch_pull_body(
     R19Sched S;
     S.a = a;
     S.cycle = cycle;
+    // [MX_GROUP_SCHED] gs 语义：任务 e 为组内专家序 ge，pool/旗 ring = kGSRing；
+    //   权重基址指向 w1g/w2g 起点（ge 索引），owner 由任务传入。
+    S.gs = gs_on;
+    S.ring = gs_on ? kGSRing : kRing;
     // [PEERBUF] pool 基址 = FG unk->rd.expert_tokens（本 rank 读写，peer 可读）
     S.pool_base = &a->unk->rd.expert_tokens[0][0][0];
 #if MX_GROUP_WEIGHTS
-    // [WP-G1 S2] 组内 32 专家权重：本 rank 的 ge 块起点 = (rank%kGroupRanks)*kEPR
-    S.w1_base = &a->rwk->ld.w1g[(a->rank % kGroupRanks) * kEPR][0][0];
-    S.w2_base = &a->rwk->ld.w2g[(a->rank % kGroupRanks) * kEPR][0][0];
+    // [WP-G1 S2] 组内 32 专家权重：默认 owner-only 时本 rank 的 ge 块起点 =
+    //   (rank%kGroupRanks)*kEPR；[MX_GROUP_SCHED] gs 下按组内专家序 ge 直接索引
+    //   （基址 = w1g[0]）。
+    if (gs_on) {
+        S.w1_base = &a->rwk->ld.w1g[0][0][0];
+        S.w2_base = &a->rwk->ld.w2g[0][0][0];
+    } else {
+        S.w1_base = &a->rwk->ld.w1g[(a->rank % kGroupRanks) * kEPR][0][0];
+        S.w2_base = &a->rwk->ld.w2g[(a->rank % kGroupRanks) * kEPR][0][0];
+    }
 #else
     S.w1_base = &a->rwk->ld.w1[0][0][0];
     S.w2_base = &a->rwk->ld.w2[0][0][0];
@@ -853,6 +931,38 @@ __device__ __forceinline__ void dispatch_pull_body(
             s_task = task;
 #endif
             if (s_task < total_tasks) {
+#if MX_GROUP_SCHED
+                if (gs_on) {
+                    // [MX_GROUP_SCHED] task → (本 rank 窗口序号 seq, slice)；
+                    //   窗口表给出同窗的 (ge,w) 与 owner rank。计数/前缀取自组内表。
+                    const int seq = s_task / nslice_eff;
+                    const int slice = s_task % nslice_eff;
+                    const int ge = s_ge[seq];
+                    const int wv = s_gw[seq];
+                    const int owr =
+                        mxk::gs_rank_of_member(a->R, gs_grp, ge / kEPR);
+                    const int c = s_gscount[ge];
+                    const int remain = c - wv * a->win_cap;
+                    s_expert = ge;
+                    s_window = wv;
+                    s_seq = seq;
+                    s_owner = owr;
+                    s_slice = slice;
+                    s_count_w = remain < a->win_cap ? remain : a->win_cap;
+                    s_epoch = *(volatile const uint32_t*)(
+                        a->rwk->lf.bar[cycle] + kBarTaskReadyIdx);
+                    if constexpr (kPhase == MegaPhase::Both) {
+                        // ring 门：pool_slot=seq%kGSRing；target=(rep+seq/ring)*nslice。
+                        if (seq >= kGSRing || rep > 0) {
+                            l2_gate_wait(a->rwk->lf.bar[cycle],
+                                         (int)kBarL2DoneIdx, 0, seq, rep, kGSRing,
+                                         nslice_eff, slice, -1, 0u,
+                                         a->rwk->lf.dbg, a->max_spins, ctr);
+                        }
+                    }
+                } else
+#endif
+                {
                 // [R35] 物理任务 → 窗号/物理 slice（每任务覆盖 merge 个逻辑 slice）
                 // [BALANCE·docs/20 §4.2b] K 切开启时任务再含 kseg（尾维）。
 #if R19_BLOCK_KSPLIT
@@ -889,6 +999,7 @@ __device__ __forceinline__ void dispatch_pull_body(
                                      -1, 0u, a->rwk->lf.dbg, a->max_spins, ctr);
                     }
                 }
+                }
             }
         }
         __syncthreads();
@@ -899,6 +1010,14 @@ __device__ __forceinline__ void dispatch_pull_body(
         const int count = s_count_w;
         const int slice = s_slice;
         const unsigned epoch = s_epoch;
+#if MX_GROUP_SCHED
+        const int seq = gs_on ? s_seq : 0;
+        const int owner = gs_on ? s_owner : -1;
+#else
+        const int seq = 0;
+        const int owner = -1;
+#endif
+        (void)seq; (void)owner;
         // [BALANCE·docs/20 §4.2b] K 段号（未启用时为 0）。
         int kseg = 0;
 #if R19_BLOCK_KSPLIT
@@ -907,7 +1026,8 @@ __device__ __forceinline__ void dispatch_pull_body(
         // [L1L2-SPLIT] 旗槽（ring，容量 EPR*ring）与数据槽（拆分下每窗口独占）：
         //   slot_win = ceil(kMaxTPR/win_cap) 覆盖 count<=kMaxTPR 的全部窗口；
         //   Both 下两者相同（e*ring + w%ring），行为逐字不变。
-        const int pool_slot = e * kRing + w % kRing;
+        // [MX_GROUP_SCHED] gs 下 pool/旗 ring 槽 = 本 rank 窗口序号 seq % kGSRing。
+        const int pool_slot = gs_on ? (seq % kGSRing) : (e * kRing + w % kRing);
         const int slot_win = (kMaxTPR + a->win_cap - 1) / a->win_cap;
         const int data_slot =
             (kPhase == MegaPhase::Both) ? pool_slot : (e * slot_win + w);
@@ -916,18 +1036,21 @@ __device__ __forceinline__ void dispatch_pull_body(
         if (count > kM) {
             r19_big_task<kPhase>(S, task, e, w, count, slice, kseg,
                                                  epoch, data_slot, pfx,
-                                                 a_smem, b_smem);
+                                                 a_smem, b_smem, owner, seq);
         } else {
             r19_small_task<kPhase>(S, task, e, w, count, slice, kseg,
                                              epoch, data_slot, pfx,
-                                             a_smem, b_smem);
+                                             a_smem, b_smem, owner, seq);
         }
         // ---- 任务尾 l2_done 递增（仅后续窗口会复用该槽或多轮时）----
         // [H3] 不发布 l2_done 时省略全线程 threadfence（无消费者，协议语义不变）
         // [L1L2-SPLIT] 拆分下无环复用（数据槽每窗口独占）→ 跳过 ring 门与发布。
         bool h_pub = false;
         if constexpr (kPhase == MegaPhase::Both) {
-            h_pub = (s_count[e] > (w + kRing) * a->win_cap) || n_reps > 1;
+            if (gs_on)
+                h_pub = (seq + kGSRing < s_nwin) || n_reps > 1;
+            else
+                h_pub = (s_count[e] > (w + kRing) * a->win_cap) || n_reps > 1;
         }
         // [BALANCE·docs/20 §4.2b] K 切下仅 owner（kseg==0）发布 l2_done：每窗口
         //   仍恰好 nslice_eff 次，ring 门 target 语义不变；非 owner 不发布。
@@ -937,7 +1060,7 @@ __device__ __forceinline__ void dispatch_pull_body(
             if (h_pub)
                 atomicAdd(reinterpret_cast<uint32_t*>(
                               a->rwk->lf.bar[cycle] + kBarL2DoneIdx +
-                              (size_t)(e * kRing + w % kRing)),
+                              (size_t)pool_slot),
                           1u);
             ++processed;
             a->rwk->lf.out_processed[blockIdx.x] = processed;
