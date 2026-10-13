@@ -297,7 +297,7 @@ class SymmBuffer:
             # 避免合成均衡路由污染 _launch_cfg。
             _C.fp8_mega_moe(self._y_fp32, tl1.view(torch.uint8),
                             tl2.view(torch.uint8), self._impl, T, 1e30,
-                            int(self.expert_window), False, 0)
+                            int(self.expert_window), 0)
             torch.cuda.synchronize()
         del l1, l2, tl1, tl2
         torch.cuda.empty_cache()
@@ -309,6 +309,12 @@ class SymmBuffer:
         按 member 序拼成 (kGE, ...) 供 _C 拷进 w1g[0..kGE)。
         集合通信不能在 graph capture 内做：capture 前（预热）gather 一次并缓存，
         capture 内复用缓存。world 不整除组数或组为空时原样返回（base 路径）。"""
+        # [GS-OOM 安全闸] 默认不做组权重 all-gather：全 32-rank 暂存（峰值 ~36GiB）
+        #   与逐层常驻缓冲（~4.5GiB/层 × 层数）对大模型（GLM-5.2 78 层）不可承受；
+        #   且均衡路由下 kernel 的 gs 倾斜门本就关闭、无需组权重。仅当显式
+        #   MXK_GS_GROUP_GATHER=1（倾斜且显存允许的小规模/bench 场景）才聚合。
+        if os.environ.get("MXK_GS_GROUP_GATHER", "0") != "1":
+            return l1, l2
         try:
             gr = int(_C.mega_group_ranks())
         except Exception:  # noqa: BLE001
