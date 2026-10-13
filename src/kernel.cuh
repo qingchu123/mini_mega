@@ -50,7 +50,8 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     __shared__ MegaArgs s_a;
     if (threadIdx.x == 0) s_a = a;
     if (kTick) a.rwk->lf.pre_ticks[6] = clock64();
-    mx_preclear_ct2(&a.rwk->lf, &a.unk->rf, /*skip_xbar=*/a.skip_prologue >= 2);
+    mx_preclear_ct2(&a.rwk->lf, &a.unk->rf, &a.unk->rd,
+                    /*skip_xbar=*/a.skip_prologue >= 2);
     __syncthreads();
     if (!a.skip_prologue) {
         // 1) PROLOGUE：ROUTE_BUILD + PUBLISH_COUNTS（仅 block0）
