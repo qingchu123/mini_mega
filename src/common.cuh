@@ -13,7 +13,7 @@
 #include <cstring>
 
 // ---------------------------------------------------------------- 场景常量 --
-constexpr int kMaxTPR = 512;              // 每 rank 最大发送tokens数目
+constexpr int kMaxTPR = 1024;             // 每 rank 最大发送tokens数目
 constexpr int kEPR = 8;              // 每 rank 专家数
 constexpr int kTopk = 8;             // 每 token 路由专家数
 constexpr int kHidden = 6144;        // H（K_IN / K_OUT）
