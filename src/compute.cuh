@@ -53,6 +53,10 @@ struct MegaArgs {
     const uint8_t* self;          // 本 rank 对称区基址
     uint8_t* const* peer_bases;   // 各 rank 对称区基址表（拉 x / weights）
     const int64_t* topk_idx;      // 本 rank 输入路由（对称区内视图）
+    // [W-PASS] base 路径权重直读指针（零拷贝）；gs 路径用 rwk->ld.w1g/w2g。
+    const uint8_t* w1;
+    const uint8_t* w2;
+    int group_weights_ready;      // gs 组权重是否已聚合就绪
     // -- 数据缓冲偏移（self / peer sym 内）--
     //   pool / prefix 已移入本 rank 私有 rwk->ld（kernel 从 a->rwk->ld 取）；
     //   [UNK-MERGE] token_route_weights/token_src_meta/prefold/combine_rows 已并入
@@ -732,7 +736,7 @@ __device__ __forceinline__ void dispatch_pull_body(
                        ((long long)mx * kGE > (long long)MX_GS_SKEW_NUM * sum);
         }
         __syncthreads();
-        gs_on = s_gsskew != 0;
+        gs_on = (s_gsskew != 0) && (a->group_weights_ready != 0);
         if (gs_on) {
             // 原地把暂存的原值转成前缀和（s_prefix[ge*(R+1)+src]=Σ_{r'<src} 计数）；
             //   无需再读 peer FG（省一遍串行远端读）。
@@ -867,16 +871,18 @@ __device__ __forceinline__ void dispatch_pull_body(
     // [WP-G1 S2] 组内 32 专家权重：默认 owner-only 时本 rank 的 ge 块起点 =
     //   (rank%kGroupRanks)*kEPR；[MX_GROUP_SCHED] gs 下按组内专家序 ge 直接索引
     //   （基址 = w1g[0]）。
-    if (gs_on) {
+    if (gs_on && a->group_weights_ready) {
+        // gs：本组 kGE 个专家权重已由 torch 聚合进 w1g[0..kGE)，按 ge 索引。
         S.w1_base = &a->rwk->ld.w1g[0][0][0];
         S.w2_base = &a->rwk->ld.w2g[0][0][0];
     } else {
-        S.w1_base = &a->rwk->ld.w1g[(a->rank % kGroupRanks) * kEPR][0][0];
-        S.w2_base = &a->rwk->ld.w2g[(a->rank % kGroupRanks) * kEPR][0][0];
+        // [W-PASS] base 零拷贝：直接读 host 传入的每层权重指针（不再暂存 rwk->ld）。
+        S.w1_base = a->w1;
+        S.w2_base = a->w2;
     }
 #else
-    S.w1_base = &a->rwk->ld.w1[0][0][0];
-    S.w2_base = &a->rwk->ld.w2[0][0][0];
+    S.w1_base = a->w1 ? a->w1 : &a->rwk->ld.w1[0][0][0];
+    S.w2_base = a->w2 ? a->w2 : &a->rwk->ld.w2[0][0][0];
 #endif
     S.bar_flags = a->rwk->lf.bar[cycle];
     S.dbg = a->rwk->lf.dbg;

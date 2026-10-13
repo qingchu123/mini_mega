@@ -73,6 +73,11 @@ struct MegaLaunchArgs {
     const uint8_t* self = nullptr;         // 本 rank 对称区基址
     uint8_t* const* peer_bases = nullptr;  // 各 rank 对称区基址表（设备数组）
     const int64_t* topk_idx = nullptr;     // 本 rank 输入路由
+    // -- [W-PASS] base（非 gs）路径权重直读指针（零拷贝：避免 RWK-LD 每层
+    //    D2D 暂存）；gs 路径用 rwk->ld 的 w1g/w2g（需 group_weights_ready=1）。--
+    const uint8_t* w1 = nullptr;           // 本层打包权重 [epr][2I][H] lane 序
+    const uint8_t* w2 = nullptr;           // 本层打包权重 [epr][H][I] lane 序
+    int group_weights_ready = 0;           // gs 组权重是否已聚合就绪（torch 置）
     // -- 前序 / REDUCE 偏移（self 内）--
     int64_t topk_idx_off = 0;              // REDUCE：self + topk_idx_off = topk_idx 基址
     // -- 数据缓冲偏移（self / peer sym 内）--

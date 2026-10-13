@@ -97,6 +97,9 @@ MegaArgs to_mega_args(const MegaLaunchArgs& a) {
     //   （torch 层不干预，见 mxk_select_win / src/win_select.cuh）。
     MegaArgs m{};
     m.topk_idx = a.topk_idx;
+    m.w1 = a.w1;
+    m.w2 = a.w2;
+    m.group_weights_ready = a.group_weights_ready;
     m.self = a.self;
     m.peer_bases = a.peer_bases;
     m.R = a.R;

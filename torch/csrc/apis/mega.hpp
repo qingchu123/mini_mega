@@ -204,9 +204,26 @@ inline void destroy_symm_buffer(SymmBuffer* b) {
 // win_cap/skip_prologue 是逐 launch 决策（Python 侧自适应
 // 或调用方显式指定）：win_cap=0 表示用物理容量 b.win；
 // 缺省粗化到单波（kMegaGrid）。
+// [W-PASS] 若传入的是"组权重"（n_group_blocks>1，按 member 序拼接），取本 rank
+//   自身 member 块首地址作为 base 路径直读指针；否则原样返回（本地 epr 权重）。
+inline void member_weight_slice(const SymmBuffer* b, const uint8_t* w1,
+                                const uint8_t* w2, int n_group_blocks,
+                                const uint8_t** bw1, const uint8_t** bw2) {
+  *bw1 = w1; *bw2 = w2;
+  if (n_group_blocks <= 1 || w1 == nullptr || w2 == nullptr) return;
+  const size_t w1_esz = 2u * (size_t)b->intermediate_hidden * (size_t)b->hidden;
+  const size_t w2_esz = (size_t)b->hidden * (size_t)b->intermediate_hidden;
+  const int gr = (int)mxk_group_ranks();
+  const int ng = (gr > 0 && b->R > 0) ? (int)(b->R / gr) : 1;
+  const int member = (int)(b->rank / (size_t)(ng > 0 ? ng : 1));
+  *bw1 = w1 + (size_t)member * b->epr * w1_esz;
+  *bw2 = w2 + (size_t)member * b->epr * w2_esz;
+}
+
 inline fp8mega::MegaLaunchArgs make_mega_args(
     const SymmBuffer& b, float* y, int64_t num_tokens, int64_t win_cap = 0,
-    int64_t skip_prologue = 0) {
+    int64_t skip_prologue = 0, const uint8_t* w1 = nullptr,
+    const uint8_t* w2 = nullptr, int group_weights_ready = 0) {
   namespace L = deep_gemm::layout;
   const int64_t wc = (win_cap > 0) ? win_cap : b.win;
   if (wc < 8 || wc > b.win || wc > 128) {
@@ -231,7 +248,10 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
   a.weights_off = b.L.topk_weights_off;
   a.max_spins = 4000000;
   a.skip_prologue = (int)skip_prologue;
-  // [RWK-LD] w1/w2/ffn_hidden/l2_out 由 kernel 从 b.rwk->ld 派生，不再传。
+  // [W-PASS] base 路径权重直读（零拷贝）；gs 路径用 rwk->ld.w1g/w2g。
+  a.w1 = w1;
+  a.w2 = w2;
+  a.group_weights_ready = group_weights_ready;
   a.in_bf16 = b.L.in_bf16;
   a.y = y;
   a.grid = (int)kMegaGrid();
@@ -240,14 +260,18 @@ inline fp8mega::MegaLaunchArgs make_mega_args(
   return a;
 }
 
-inline void ensure_mega_weights(SymmBuffer* b, const uint8_t* w1,
-                                const uint8_t* w2, mcStream_t st,
-                                int n_group_blocks = 1) {
+inline int ensure_mega_weights(SymmBuffer* b, const uint8_t* w1,
+                               const uint8_t* w2, mcStream_t st,
+                               int n_group_blocks = 1) {
+  // [W-PASS] 只有"组权重"（nb>1，gs 远端 helper 用）才暂存进 rwk->ld.w1g；
+  //   base 路径零拷贝（kernel 直接读 make_mega_args 传入的 w1/w2 指针）。
+  if (n_group_blocks <= 1) return 0;
+  const int nb = n_group_blocks;
   if (w1 == b->w1_cached && w2 == b->w2_cached &&
-      n_group_blocks == b->w1_cached_blocks) return;
-  // [RWK-LD] w1/w2 一次性 D2D 拷进 rwk->ld（仅来源指针变化时）。用
-  //   mcMemcpyAsync 走本 stream：capture 合法，且与本 launch 天然排序。
-  const int nb = (n_group_blocks > 0) ? n_group_blocks : 1;
+      nb == b->w1_cached_blocks)
+    return 1;
+  // [RWK-LD] 组权重一次性 D2D 拷进 rwk->ld.w1g（仅来源指针变化时）。mcMemcpyAsync
+  //   走本 stream：capture 合法，且与本 launch 天然排序。
   const size_t w1_esz = 2u * (size_t)b->intermediate_hidden * (size_t)b->hidden;
   const size_t w2_esz = (size_t)b->hidden * (size_t)b->intermediate_hidden;
   // [GS] kernel 从 w1g[ge] 读权重，ge 为组内专家序（kGE=gr*epr）。上层应传
@@ -265,6 +289,7 @@ inline void ensure_mega_weights(SymmBuffer* b, const uint8_t* w1,
   b->w1_cached = w1;
   b->w2_cached = w2;
   b->w1_cached_blocks = nb;
+  return 1;
 }
 
 inline void launch_fp8_mega_moe(SymmBuffer* b, float* y, const uint8_t* w1,
@@ -279,9 +304,11 @@ inline void launch_fp8_mega_moe(SymmBuffer* b, float* y, const uint8_t* w1,
     throw std::runtime_error("launch_fp8_mega_moe: num_tokens 越界");
   }
   mcStream_t st = reinterpret_cast<mcStream_t>(stream);
-  ensure_mega_weights(b, w1, w2, st, (int)n_group_blocks);
-  fp8mega::MegaLaunchArgs a =
-      make_mega_args(*b, y, num_tokens, win_cap, skip_prologue);
+  const int ready = ensure_mega_weights(b, w1, w2, st, (int)n_group_blocks);
+  const uint8_t* bw1 = w1; const uint8_t* bw2 = w2;
+  member_weight_slice(b, w1, w2, (int)n_group_blocks, &bw1, &bw2);
+  fp8mega::MegaLaunchArgs a = make_mega_args(
+      *b, y, num_tokens, win_cap, skip_prologue, bw1, bw2, ready);
   if (num_tokens > 0) {
     fp8mega::launch_full(a, st);
   } else {
@@ -313,9 +340,11 @@ inline void launch_fp8_mega_moe_compute(SymmBuffer* b, const uint8_t* w1,
     throw std::runtime_error("launch_fp8_mega_moe_compute: num_tokens 越界");
   }
   mcStream_t st = reinterpret_cast<mcStream_t>(stream);
-  ensure_mega_weights(b, w1, w2, st, (int)n_group_blocks);
-  fp8mega::MegaLaunchArgs a =
-      make_mega_args(*b, nullptr, num_tokens, win_cap, skip_prologue);
+  const int ready = ensure_mega_weights(b, w1, w2, st, (int)n_group_blocks);
+  const uint8_t* bw1 = w1; const uint8_t* bw2 = w2;
+  member_weight_slice(b, w1, w2, (int)n_group_blocks, &bw1, &bw2);
+  fp8mega::MegaLaunchArgs a = make_mega_args(
+      *b, nullptr, num_tokens, win_cap, skip_prologue, bw1, bw2, ready);
   fp8mega::launch_compute(a, st);
   b->launch_count += 1;
 }

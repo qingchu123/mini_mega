@@ -363,6 +363,11 @@ inline fp8mega::MegaLaunchArgs make_args(const Geo& g, const Dev& d, int tokens,
     a.max_spins = (int)kSpinLimit;
     // [RWK-LD] w1/w2/ffn_hidden/l2_out 由 kernel 从 d.rwk->ld 派生，不再经 args 传。
 
+    // [W-PASS] base 路径权重直读：用本地已填好的 w1g 基址；group_ready=1 时
+    //   gs 走 w1g（与旧行为一致）。
+    a.w1 = d.w1;
+    a.w2 = d.w2;
+    a.group_weights_ready = 1;
     a.y = y;
     a.grid = kGrid;
     a.threads = g.threads;
