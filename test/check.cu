@@ -358,7 +358,7 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
     CHECK(mcSetDevice(0));
     std::vector<uint8_t> xd((size_t)rows * kHidden);
     CHECK(mcMemcpy(xd.data(),
-                   (e.d.rd ? &e.d.rd->expert_tokens[0][0][0][0]
+                   (e.d.rd ? &e.d.rd->expert_tokens[0][0][0]
                            : e.d.sym + L.expert_tokens_off) +
                        (size_t)pool_slot * win * kHidden,
                    xd.size(), mcMemcpyDeviceToHost));

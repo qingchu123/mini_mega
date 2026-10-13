@@ -684,7 +684,7 @@ __device__ __forceinline__ void dispatch_pull_body(
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）
     int* s_prefix = s_cum + kEPR + 1;                  // EPR*(R+1)：全 experts src 前缀
     __shared__ int s_task, s_expert, s_window, s_count_w, s_slice, s_kseg;
-    __shared__ int s_owner, s_seq, s_nwin, s_gsskew, s_gsfail;
+    __shared__ int s_owner, s_seq, s_nwin, s_gsskew;
     __shared__ unsigned s_epoch;
     // prefix 表 = 本 rank 私有 rwk->ld.prefix_tbl（rank 内读写）
     const int* prefix = &a->rwk->ld.prefix_tbl[0][0];
@@ -705,36 +705,20 @@ __device__ __forceinline__ void dispatch_pull_body(
     int* s_ge = s_gscount + kGE;
     int* s_gw = s_ge + mxk::kGsMemberCap;
     if (gs_cap) {
-        // [MX_GROUP_SCHED] 远端 helper 需要 owner 的 routing prefix：远读数据必须放
-        //   FG。owner 在 task_setup（checksum 门内）把本 rank prefix 发布到 FG
-        //   ranks_data.gs_prefix[cyc]，并置 ranks_flags.gs_ready[cyc][owner]=epoch；
-        //   helper 等旗后再读 FG prefix（不再读 expert_recv_counts，杜绝竞态）。
+        // 组倾斜判定：并行统计本组 4 个 owner 的 32 专家总计数（1024 次 FG 读，
+        //   blockDim 线程并行 + smem atomicAdd；均衡负载下这是唯一额外开销）。
         if (tid < kGE) s_gscount[tid] = 0;
-        if (tid == 0) s_gsfail = 0;
         __syncthreads();
-        // 等各 owner 的 gs_prefix 完成旗（FG，epoch 门）。
-        for (int m = tid; m < kGroupRanks; m += (int)blockDim.x) {
+        for (int i = tid; i < kGE * a->R; i += (int)blockDim.x) {
+            const int ge = i / a->R;
+            const int r = i % a->R;
+            const int m = ge / kEPR;
+            const int le = ge % kEPR;
             const int o = mxk::gs_rank_of_member(a->R, gs_grp, m);
-            volatile const uint32_t* rdy =
-                &a->unk_peers[o]->rf.gs_ready[cycle][o];
-            const uint32_t want = (uint32_t)a->rwk->lf.current_time[0][1];
-            long long spin = 0;
-            while (*rdy != want) {
-                if (++spin > a->max_spins) { s_gsfail = 1; break; }
-            }
-        }
-        __threadfence();   // [MX_GROUP_SCHED] 等旗后 acquire，确保看到 owner 的发布
-        __syncthreads();
-        // 读 owner 在 FG 发布的 prefix（与 task_setup checksum 同源）→ s_prefix。
-        for (int i = tid; i < kGE; i += (int)blockDim.x) {
-            const int m = i / kEPR, le = i % kEPR;
-            const int o = mxk::gs_rank_of_member(a->R, gs_grp, m);
-            for (int r = 0; r <= a->R; ++r)
-                s_prefix[i * (a->R + 1) + r] =
-                    a->unk_peers[o]->rd.gs_prefix[cycle][le][r];
-            const int tot = a->unk_peers[o]->rd.gs_prefix[cycle][le][a->R];
-            if (tot < 0 || tot > a->slot_capacity) s_gsfail = 1;
-            s_gscount[i] = tot;
+            const int v =
+                (int)a->unk_peers[o]->rd.expert_recv_counts[cycle][r][le];
+            s_prefix[ge * (a->R + 1) + r] = v;   // 暂存原值，供后续原地建前缀
+            atomicAdd(&s_gscount[ge], v);
         }
         __syncthreads();
         if (tid == 0) {
@@ -748,13 +732,26 @@ __device__ __forceinline__ void dispatch_pull_body(
                        ((long long)mx * kGE > (long long)MX_GS_SKEW_NUM * sum);
         }
         __syncthreads();
-        gs_on = (s_gsskew != 0) && (s_gsfail == 0);
+        gs_on = s_gsskew != 0;
         if (gs_on) {
+            // 原地把暂存的原值转成前缀和（s_prefix[ge*(R+1)+src]=Σ_{r'<src} 计数）；
+            //   无需再读 peer FG（省一遍串行远端读）。
+            for (int ge = tid; ge < kGE; ge += (int)blockDim.x) {
+                int c = 0;
+                for (int r = 0; r < a->R; ++r) {
+                    const int v = s_prefix[ge * (a->R + 1) + r];
+                    s_prefix[ge * (a->R + 1) + r] = c;
+                    c += v;
+                }
+                s_prefix[ge * (a->R + 1) + a->R] = c;
+                s_gscount[ge] = c;
+            }
+            __syncthreads();
+            // 单线程桶式 LPT（无 scratch，O(cost × 窗口数)，开销可忽略）。
             if (tid == 0)
                 s_nwin = mxk::gs_schedule_member(s_gscount, a->win_cap, gs_mem,
                                                  s_ge, s_gw, mxk::kGsMemberCap);
             __syncthreads();
-            if (s_nwin < 0 || s_nwin > mxk::kGsMemberCap) gs_on = false;
         }
     }
 #endif
@@ -865,7 +862,7 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.gs = gs_on;
     S.ring = gs_on ? kGSRing : kRing;
     // [PEERBUF] pool 基址 = FG unk->rd.expert_tokens（本 rank 读写，peer 可读）
-    S.pool_base = &a->unk->rd.expert_tokens[cycle][0][0][0];
+    S.pool_base = &a->unk->rd.expert_tokens[0][0][0];
 #if MX_GROUP_WEIGHTS
     // [WP-G1 S2] 组内 32 专家权重：默认 owner-only 时本 rank 的 ge 块起点 =
     //   (rank%kGroupRanks)*kEPR；[MX_GROUP_SCHED] gs 下按组内专家序 ge 直接索引
@@ -874,11 +871,8 @@ __device__ __forceinline__ void dispatch_pull_body(
         S.w1_base = &a->rwk->ld.w1g[0][0][0];
         S.w2_base = &a->rwk->ld.w2g[0][0][0];
     } else {
-        // 交织组：本 rank 自身专家所在块 = member 序号 = rank/nGroups（与 gs 的
-        //   ge=(rank/nGroups)*kEPR+le 布局一致；连续组语义已废弃）。
-        const int blk = mxk::gs_member_of_rank(a->R, a->rank) * kEPR;
-        S.w1_base = &a->rwk->ld.w1g[blk][0][0];
-        S.w2_base = &a->rwk->ld.w2g[blk][0][0];
+        S.w1_base = &a->rwk->ld.w1g[(a->rank % kGroupRanks) * kEPR][0][0];
+        S.w2_base = &a->rwk->ld.w2g[(a->rank % kGroupRanks) * kEPR][0][0];
     }
 #else
     S.w1_base = &a->rwk->ld.w1[0][0][0];

@@ -92,11 +92,6 @@ struct alignas(256) ranks_flags {
     // [M_CYCLE] 旋转维：本轮只用 copy c（±2MB/rank，可接受）。
     alignas(256) uint64_t
         combine_sums[M_CYCLE][kTopk][kMaxCombineRows][kCombineSlicesMax];
-
-    // [MX_GROUP_SCHED] 每个 rank 在本 launch 把本 rank 8 专家的 prefix 发布到 FG，
-    //   供 gs 远端 helper 读取（远读→必须 FG）。值与 task_setup 的 checksum 门同源，
-    //   owner 写完后置对应 gs_ready[cyc][rank]=epoch，helper 等旗后再读。
-    alignas(256) uint32_t gs_ready[M_CYCLE][kRanks];
 };
 
 // [WP-G1] 组内权重复制几何：kGroupRanks 个 rank 一组，kGE=kEPR*kGroupRanks 为每组
@@ -165,12 +160,10 @@ struct alignas(256) ranks_data {
 
     alignas(256) uint32_t src_index_table[M_CYCLE][kEPR][kRanks][kMaxTPR];
     alignas(256) uint32_t expert_recv_counts[M_CYCLE][kRanks][64];
-    // [MX_GROUP_SCHED] owner 本 launch 的 prefix（每专家对 src 的前缀），FG 远读用。
-    alignas(256) int32_t gs_prefix[M_CYCLE][kEPR][kRanks + 1];
     alignas(256) uint16_t combine_rows[M_CYCLE][kTopk][kMaxTPR][kHidden];
     // [PEERBUF] 原 local_data 私有缓冲迁入 FG（peer 可读）：A pool / L2 块槽输出。
-    alignas(256) uint8_t expert_tokens[M_CYCLE][kEPR * kRing][kMaxTPR][kHidden];
-    alignas(256) uint16_t l2_out[M_CYCLE][kGrid][kMaxTPR][kHidden];
+    alignas(256) uint8_t expert_tokens[kEPR * kRing][kMaxTPR][kHidden];
+    alignas(256) uint16_t l2_out[kGrid][kMaxTPR][kHidden];
 
     // ---- [UNK-MERGE] kernel 自有内部 staging（原 sym scratch 经 offset 访问，
     //   现并入 unk_data：kernel 经 rd 直接访问，peer 亦可读 prefold）。----

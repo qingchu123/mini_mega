@@ -213,8 +213,8 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     d.w1 = &d.ld->w1g[0][0][0];
     d.w2 = &d.ld->w2g[0][0][0];
     if (std::getenv("MT_GS_MEMBER_ONLY")) {
-        // [REPRO] 复现 torch 层：只填本 rank 的 member 块，其余块清零（gs helper
-        //   远端窗口无权重 → 与 torch harness 同口径）。
+        // [REPRO] 复现 torch 层旧行为：只填本 rank 的 member 块、其余清零（gs helper
+        //   远端窗口无权重 → 复现"缺组权重 all-gather"导致的 graph/eager 发散）。
         const int ng = g.R / kGroupRanks;
         const int mem = d.rank / (ng > 0 ? ng : 1);
         CHECK(mcMemset(d.w1, 0, sizeof(d.ld->w1g)));
@@ -225,15 +225,14 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
         fp8mega::fill_weights_lane(
             d.w2 + (size_t)mem * kEPR * kHidden * kIntermediate,
             kEPR * kHidden, kIntermediate, 91u, 0);
-    } else {
-        for (int b = 0; b < kGroupRanks; ++b) {
-            fp8mega::fill_weights_lane(
-                d.w1 + (size_t)b * kEPR * 2 * kIntermediate * kHidden,
-                kEPR * 2 * kIntermediate, kHidden, 17u, 0);
-            fp8mega::fill_weights_lane(
-                d.w2 + (size_t)b * kEPR * kHidden * kIntermediate,
-                kEPR * kHidden, kIntermediate, 91u, 0);
-        }
+    } else
+    for (int b = 0; b < kGroupRanks; ++b) {
+        fp8mega::fill_weights_lane(
+            d.w1 + (size_t)b * kEPR * 2 * kIntermediate * kHidden,
+            kEPR * 2 * kIntermediate, kHidden, 17u, 0);
+        fp8mega::fill_weights_lane(
+            d.w2 + (size_t)b * kEPR * kHidden * kIntermediate,
+            kEPR * kHidden, kIntermediate, 91u, 0);
     }
 #else
     d.w1 = &d.ld->w1[0][0][0];
@@ -247,7 +246,7 @@ inline void alloc_dev(Dev& d, const Geo& g, int rank, int ynode_rows, int nodes)
     CHECK(mcDeviceSynchronize());
 
     d.ffn = &d.ld->ffn_hidden[0][0][0];
-    d.l2 = &d.rd->l2_out[0][0][0][0];   // [PEERBUF] l2_out 迁至 FG unk->rd
+    d.l2 = &d.rd->l2_out[0][0][0];   // [PEERBUF] l2_out 迁至 FG unk->rd
     const size_t y_bytes = (size_t)ynode_rows * kHidden * sizeof(float);
     // [DEL-Y] ld.y 已删除（zero-ref）：REDUCE 输出 d.y 独立分配，容量 kMaxTPR*H
     //   （≥ 任一 launch 的 tokens*H），零初始化与原来 ld.y 随 rwk 清零等价。

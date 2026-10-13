@@ -267,15 +267,14 @@ __device__ __forceinline__ uint32_t warp_sum_u32_64(uint32_t value, int lane) {
 // leader=block0（bench:443-588）：checksum → prefix_tbl → count/cum 窗口表 →
 // task_counter/l2_done 重置 → task_ready=epoch；非 leader 等 task_ready 后重建窗口表。
 __device__ __forceinline__ int task_setup_body(
-        const uint8_t* self, ranks_data* remote, int R, int rank,
+        const uint8_t* self, const ranks_data* remote, int R, int rank,
         int slot_capacity, int64_t prefix_off, local_flags* lf,
         int64_t task_ready_idx, int64_t task_counter_idx, int64_t l2_done_idx,
         int* out_total, int* dbg,
         int max_spins, int recv_stride = (int)kRecvStride,
         bool reset_ring = true, int tid_base = 0, volatile int* sb_cnt = nullptr,
         int smem_off = 0, int* prefix_ptr = nullptr,
-        uint32_t* ck_dbg = nullptr, unsigned long long* ctr = nullptr,
-        ranks_flags* rf = nullptr) {
+        uint32_t* ck_dbg = nullptr, unsigned long long* ctr = nullptr) {
     // [M_CYCLE] 本轮 copy c：task_setup 相位用 current_time[b][1]（入口尚未自增，
     //   全 block 同为 L ⇒ c 一致）。bar 取第 c 片，与 xbar 用同一 c（两计数器
     //   每 launch 各同步 +1，模 M_CYCLE 恒相等）。自增仍写回 current_time。
@@ -425,11 +424,9 @@ __device__ __forceinline__ int task_setup_body(
             int c = 0;
             for (int r = 0; r < R; ++r) {
                 prefix[e * (R + 1) + r] = c;
-                remote->gs_prefix[cyc][e][r] = c;   // [MX_GROUP_SCHED] FG 发布给 helper
                 c += (int)s_recv[(size_t)r * recv_stride + e];
             }
             prefix[e * (R + 1) + R] = c;
-            remote->gs_prefix[cyc][e][R] = c;
             s_count[e] = c;   // [P5c] 计数与 prefix 同批并行写
             wrote_task_prefix = true;
         }
@@ -460,14 +457,6 @@ __device__ __forceinline__ int task_setup_body(
         // ③ 发布 task_ready（ring/prefix/表/任务计数已在上一条 barrier 前放行）
         if (tid == 0) {
             __threadfence();
-            // [MX_GROUP_SCHED] 跨 GPU 可见：gs_prefix 普通写需 system fence，否则
-            //   helper（别的 GPU）经 FG 看不到 → 等 gs_ready 超时 → 回退 base →
-            //   丢失分配给它的 group 窗口 → 组内 token 少算。
-            __threadfence_system();
-            // [MX_GROUP_SCHED] 发布本 rank 的 gs_prefix 完成旗（FG，供 helper 远读前等旗）
-            if (rf != nullptr)
-                __stwt(reinterpret_cast<uint32_t*>(&rf->gs_ready[cyc][rank]),
-                       my_epoch);
             // 同设备旗：普通写 + fence（理由同 xbar release）；
             // [P5d] 尾 fence 删除：task_ready 之后 tid0 不再发布依赖它的数据
             *reinterpret_cast<volatile uint32_t*>(bar_flags + task_ready_idx) =
