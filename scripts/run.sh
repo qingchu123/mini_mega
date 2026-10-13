@@ -7,7 +7,7 @@
 #     程序：mybench（默认）| check
 #
 # 示例：
-#   scripts/run.sh mybench -R 32 -s 1 -tprs 1,4,16,32,33,64,128,256,512   # 均衡
+#   scripts/run.sh mybench -R 32 -s 1 -tprs 1,2,4,6,8,12,18,24,30,36,42,48,54,60,66,72,78,84,90,128,256   # 均衡
 #   scripts/run.sh mybench -R 32 -s 2 -top 50                              # TK 前 50
 #   scripts/run.sh mybench -R 32 -s 2 -cases 804900,807500                 # 指定 case
 #   scripts/run.sh check --smoke                                           # 冒烟（<10s）

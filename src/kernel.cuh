@@ -97,7 +97,7 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
                         kRecvStride, /*reset_ring=*/true, /*tid_base=*/0,
                         /*sb_cnt=*/nullptr, /*smem_off=*/0,
                         &a.rwk->ld.prefix_tbl[0][0],
-                        a.rwk->lf.ck_dbg, ctr);
+                        a.rwk->lf.ck_dbg, ctr, /*rf=*/&a.unk->rf);
     }
     if (kTick) a.rwk->lf.pre_ticks[3] = clock64();
     // 4) 任务循环（DISPATCH -> L1 -> L2 -> tail(COMBINE)）

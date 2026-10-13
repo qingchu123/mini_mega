@@ -14,6 +14,8 @@
 extern "C" {
 int64_t mxk_rwk_bytes();
 int64_t mxk_unk_bytes();
+int mxk_select_win(const uint32_t* counts, int E, int cap_hint, int win_min);
+int mxk_group_ranks();
 }
 
 namespace mxk {
@@ -49,6 +51,21 @@ torch::Tensor wrap_device_ptr(int64_t ptr, int64_t nbytes, int64_t device) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "mini_mega torch 层 _C：布局 + 平台显存/IPC + fp8_mega_moe 发射";
+
+  // ---------------- 选窗（C++ 逻辑，供 torch 层调用）----------------
+  // 与 mybench/check 同源：src/win_select.cuh::select_win。
+  m.def("mega_group_ranks", &mxk_group_ranks,
+        "组内 rank 数 kGroupRanks（torch 层按此 all-gather 组权重）");
+
+  m.def("select_win_mega_moe",
+        [](const torch::Tensor& counts, int64_t cap_hint, int64_t win_min) {
+          auto c = counts.to(torch::kCPU).contiguous();
+          if (c.scalar_type() != torch::kUInt32) c = c.to(torch::kUInt32);
+          return (int64_t)mxk_select_win(
+              reinterpret_cast<const uint32_t*>(c.data_ptr()), (int)c.numel(),
+              (int)cap_hint, (int)win_min);
+        },
+        "按每专家计数用 C++ select_win 选窗口容量");
 
   // ---------------- host 布局 ----------------
   m.def("get_symm_layout_for_mega_moe",
@@ -194,16 +211,71 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       "l1/l2 weights must be CUDA uint8 tensors");
           TORCH_CHECK(l1.is_contiguous() && l2.is_contiguous(),
                       "l1/l2 weights must be contiguous");
+          // [RWK-LD] 权重拷进 rwk->ld.w1/w2（[EPR][2I][H] / [EPR][H][I]），
+          //   校验字节数匹配，避免越界写入。
+          TORCH_CHECK(buf != nullptr, "sym_buffer must not be null");
+          const int64_t w1_need =
+              buf->epr * 2 * buf->intermediate_hidden * buf->hidden;
+          const int64_t w2_need =
+              buf->epr * buf->hidden * buf->intermediate_hidden;
+          TORCH_CHECK(l1.numel() % w1_need == 0 && l2.numel() % w2_need == 0 &&
+                          l1.numel() / w1_need == l2.numel() / w2_need,
+                      "l1/l2 numel must be an integer multiple of the per-rank "
+                      "weight (group all-gather)");
+          const int64_t nblk = l1.numel() / w1_need;
           (void)activation_clamp;
           mxk::launch_fp8_mega_moe(buf, y_fp32.data_ptr<float>(),
                                    l1.data_ptr<uint8_t>(), l2.data_ptr<uint8_t>(),
                                    num_tokens, current_stream(), win_cap,
-                                   skip_prologue);
+                                   skip_prologue, nblk);
         },
         py::arg("y_fp32"), py::arg("l1_weights"), py::arg("l2_weights"),
         py::arg("sym_buffer"), py::arg("num_tokens"),
         py::arg("activation_clamp") = 1e30, py::arg("win_cap") = 0,
         py::arg("skip_prologue") = 0);
+
+  // [SPLIT-REDUCE] 拆分发射：compute（前序+任务循环+COMBINE，不写 y）与
+  //   reduce（topk 加权归约 → y）。框架层可在两者之间插入无关 kernel 以隐藏
+  //   reduce 的跨 rank 等待；语义与 fp8_mega_moe 一致（需成对使用）。
+  m.def("fp8_mega_moe_compute",
+        [](torch::Tensor l1, torch::Tensor l2, mxk::SymmBuffer* buf,
+           int64_t num_tokens, double activation_clamp, int64_t win_cap,
+           int64_t skip_prologue) {
+          TORCH_CHECK(l1.is_cuda() && l2.is_cuda() &&
+                          l1.scalar_type() == torch::kUInt8 &&
+                          l2.scalar_type() == torch::kUInt8,
+                      "l1/l2 weights must be CUDA uint8 tensors");
+          TORCH_CHECK(l1.is_contiguous() && l2.is_contiguous(),
+                      "l1/l2 weights must be contiguous");
+          TORCH_CHECK(buf != nullptr, "sym_buffer must not be null");
+          const int64_t w1_need =
+              buf->epr * 2 * buf->intermediate_hidden * buf->hidden;
+          const int64_t w2_need =
+              buf->epr * buf->hidden * buf->intermediate_hidden;
+          TORCH_CHECK(l1.numel() % w1_need == 0 && l2.numel() % w2_need == 0 &&
+                          l1.numel() / w1_need == l2.numel() / w2_need,
+                      "l1/l2 numel must be an integer multiple of the per-rank "
+                      "weight (group all-gather)");
+          const int64_t nblk = l1.numel() / w1_need;
+          (void)activation_clamp;
+          mxk::launch_fp8_mega_moe_compute(
+              buf, l1.data_ptr<uint8_t>(), l2.data_ptr<uint8_t>(), num_tokens,
+              current_stream(), win_cap, skip_prologue, nblk);
+        },
+        py::arg("l1_weights"), py::arg("l2_weights"), py::arg("sym_buffer"),
+        py::arg("num_tokens"), py::arg("activation_clamp") = 1e30,
+        py::arg("win_cap") = 0, py::arg("skip_prologue") = 0);
+
+  m.def("fp8_mega_moe_reduce",
+        [](torch::Tensor y_fp32, mxk::SymmBuffer* buf, int64_t num_tokens) {
+          TORCH_CHECK(y_fp32.is_cuda() &&
+                          y_fp32.scalar_type() == torch::kFloat32,
+                      "y_fp32 must be a CUDA float32 tensor");
+          TORCH_CHECK(buf != nullptr, "sym_buffer must not be null");
+          mxk::launch_fp8_mega_moe_reduce(buf, y_fp32.data_ptr<float>(),
+                                          num_tokens, current_stream());
+        },
+        py::arg("y_fp32"), py::arg("sym_buffer"), py::arg("num_tokens"));
 
   // ---------------- mini_mega kernel 探针 ----------------
   m.def("mega_launch_empty",

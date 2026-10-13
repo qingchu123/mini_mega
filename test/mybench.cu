@@ -2,13 +2,13 @@
 // test/mybench.cu — 每进程一张卡的 MoE mega kernel 性能基准（MPI）
 //
 // 启动（经 scripts/run.sh，R=32 个进程）：
-//   scripts/run.sh mybench -R 32 -s 1 -tprs 1,4,16,32,33,64,128,256,512   # 均衡（默认）
+//   scripts/run.sh mybench -R 32 -s 1 -tprs 1,2,4,6,8,12,18,24,30,36,42,48,54,60,66,72,78,84,90,128,256   # 均衡（默认）
 //   scripts/run.sh mybench -R 32 -s 2 -top 50                              # TK 前 50 个
 //   scripts/run.sh mybench -R 32 -s 2 -cases 804900,807500                 # 指定 TK launch
 //
 // 选项（单横杠或双横杠均可）：
 //   -s 1|2          场景：1=均衡（默认）；2=TK 实录（不均衡路由）
-//   -tprs L         [s1] TPR 列表（默认 1,4,16,32,33,64,128,256,512）
+//   -tprs L         [s1] TPR 列表（默认 1,2,4,6,8,12,18,24,30,36,42,48,54,60,66,72,78,84,90,128,256）
 //   -top N          [s2] 取日志中前 N 个合法 complete launch（默认 50）
 //   -cases L        [s2] 指定 launch 号列表（与 -top 互斥，优先 -cases）
 //   -tk-info F      [s2] TK_INFO 日志（默认 test/70.r32_tpr_perf/0928_tk_info.log）
@@ -46,7 +46,8 @@ namespace {
 
 struct Opts {
     int scene = 1;
-    std::vector<int> tprs = {1, 4, 16, 32, 33, 64, 128, 256, 512};
+    std::vector<int> tprs = {1, 2, 4, 6, 8, 12, 18, 24, 30, 36,
+                             42, 48, 54, 60, 66, 72, 78, 84, 90, 128, 256};
     int top = 50;
     std::vector<int> cases;
     std::string tk_info = mt::kDefaultTkLog;
@@ -60,7 +61,7 @@ void usage(const char* p) {
     std::fprintf(stderr,
                  "用法: %s [选项]（须用 scripts/run.sh mybench -R R 启动）\n"
                  "  -s 1|2        场景：1=均衡（默认）；2=TK 实录\n"
-                 "  -tprs L       [s1] TPR 列表（默认 1,4,16,32,33,64,128,256,512）\n"
+                 "  -tprs L       [s1] TPR 列表（默认 1,2,4,6,8,12,18,24,30,36,42,48,54,60,66,72,78,84,90,128,256）\n"
                  "  -top N        [s2] 前 N 个合法 launch（默认 50）\n"
                  "  -cases L      [s2] 指定 launch 号列表\n"
                  "  -tk-info F    [s2] TK_INFO 日志\n"

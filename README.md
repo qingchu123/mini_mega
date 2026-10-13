@@ -106,11 +106,44 @@ scripts/run.sh check --all       # 全量（均衡 TPR 表 + 全部 TK launch）
 | `run.sh mybench -R 32 -s 1 -tprs 1..512` | 7.2s |
 | `run.sh mybench -R 32 -s 2 -cases 804900,807500` | 6.7s |
 | `run.sh mybench -R 32 -s 2 -top 50` | 13.1s |
-| `run.sh check --smoke` | 8.0 ~ 9.0s（3 次） |
+| `run.sh check --smoke` | 7.5s（10 例：均衡 + 实录 case0/case2） |
 | `run.sh check --all` | 约 4 分钟（762 用例） |
 
 `check --all` 结果见 `test/77.correctness/测试流程.md`（L0/REDUCE/graph 全 PASS；
 36 例 TK 用例 L1 未解决）。
+
+## 冒烟新增实录 case2（`809200`，对齐 MXMOEMega `--routing-fixed-cases 2`）
+
+时间标签 `[261013_12_32]`。`--smoke` 原覆盖实录 case0（`804900`）与均衡窗；本次把
+MXMOEMega 固定路由语料的 **case 2 = launch `809200`**（32 卡 × 16 token × topk8 = 4096
+pair，实录 skew 14.56x / 40 个零专家 / 单专家 max 233 / 每 rank 收行 17..450）也纳入
+冒烟，逐例跑前序/eager/graph×1 与 graph×50（`test/check.cu`，`fixed_case_spec`）。
+
+- 复现命令（无 python）：`scripts/run.sh check --smoke`；用例数 8→10，仍 **<10s**。
+- 正确性：**10/10 PASS**（7.51s，R=32）；case2 的 L0/L1L2/REDUCE 全 PASS，
+  `graph×1`/`graph×50` 的 `rel=0.00e+00`（旧 wheel 曾在此例报
+  `50-in-1 graph diverges rel_max_diff=1.021e+00`，当前 C++ 内核已不复现）。
+
+## torch (`mxmegakernel`) gs 组权重 all-gather 修复（`[261013_13_45]`）
+
+时间标签 `[261013_13_45]`。修复 torch 层 `--routing-fixed-cases 2` 的
+`50-in-1 graph diverges rel_max_diff=1.021e+00`。
+
+- **根因**：`torch/csrc/apis/mega.hpp` 未 include `common.cuh`，`MX_GROUP_WEIGHTS` 在
+  该 TU 内未定义（当作 0），`ensure_mega_weights` 走了 `#else` 非组分支——**所有 rank
+  都写到 `w1g/w2g` 第 0 块**并忽略 `member` 块，且只拷本地 1 块；gs 远端 helper /
+  `member>0` 的 owner 因此读到错/零权重，结果与调度绑定，graph 与 eager 发散。
+- **修复**：`flags_bridge.cu` 暴露 `mxk_group_ranks()`；`mega.hpp` 的
+  `ensure_mega_weights` 增加"组块数"参数、按 `w1g[0..kGE)` 连续写满；`python_api.cpp`
+  权重 `numel` 校验放宽为每 rank 权重字节数的整数倍并透传块数；`mega/__init__.py`
+  新增 `SymmBuffer.group_weights()`——按 gs 组（`rank%ng` 的 4 个成员、member 序）
+  `all_gather` 打包权重成 `(kGE,...)`，capture 前建缓存 / capture 内复用，
+  `fp8_mega_moe` 与 `fp8_mega_moe_compute` 调用。
+- **验证**：MXMOEMega `--skip-baseline --routing-fixed-cases 0..7`（graph×50）
+  `compare-graph-check` **全部 `rel_max_diff=0.000e+00`**；`check --all` 762/762、
+  `check --smoke` PASS。
+- **回归探针**：`MT_GS_MEMBER_ONLY=1 scripts/run.sh check --smoke`（~5s）会复现同类
+  发散（check 用"仅本 rank 块"权重模拟缺 all-gather）。
 
 ## 测试（R=32 TPR=16/64/256）
 

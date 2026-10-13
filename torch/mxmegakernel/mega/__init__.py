@@ -46,7 +46,7 @@ _WIN_ADAPT_MIN = 48
 # [FIXED-WIN] 固定窗口容量（本 wheel 打包默认 48）：>0 时所有 launch 强制该 win，
 #   覆盖自适应。用 MXK_FORCE_WIN=0 恢复自适应、或设其它 16 倍数。值会被夹到
 #   [48, min(win_phys, num_max_tokens_per_rank)]，区间为空时回退逻辑窗口。
-_FORCE_WIN_DEFAULT = int(os.environ.get("MXK_FORCE_WIN", "48") or 0)
+_FORCE_WIN_DEFAULT = int(os.environ.get("MXK_FORCE_WIN", "0") or 0)
 
 # 物理窗口容量缺省：与调用方逻辑窗口解耦，按最大值分配（AUTO 表最大 80、
 # 长尾自适应最大 64）；可用 MXK_WIN_PHYS 覆盖（不超过 EXPERT_WINDOW_MAX）。
@@ -302,6 +302,43 @@ class SymmBuffer:
         del l1, l2, tl1, tl2
         torch.cuda.empty_cache()
 
+    # ------------------------------------------------------ 组权重 all-gather
+    def group_weights(self, l1, l2):
+        """[GS] gs 远端 helper 需要组内全部 member 的权重（kernel 从 w1g[ge] 读，
+        ge/kEPR=owner 的 member）。本 rank 只持有本地 epr 个 → 跨组 all-gather，
+        按 member 序拼成 (kGE, ...) 供 _C 拷进 w1g[0..kGE)。
+        集合通信不能在 graph capture 内做：capture 前（预热）gather 一次并缓存，
+        capture 内复用缓存。world 不整除组数或组为空时原样返回（base 路径）。"""
+        try:
+            gr = int(_C.mega_group_ranks())
+        except Exception:  # noqa: BLE001
+            return l1, l2
+        ws = int(self.world_size)
+        if gr <= 1 or ws % gr != 0 or self.group is None:
+            return l1, l2
+        key = (l1.data_ptr(), l2.data_ptr(), l1.shape)
+        cache = getattr(self, "_gath_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1], cache[2]
+        if _is_stream_capturing():
+            # capture 内禁止集合通信；有旧缓存则用（形状一致），否则退回本地。
+            if cache is not None:
+                return cache[1], cache[2]
+            return l1, l2
+        ng = ws // gr
+        g = int(self.rank) % ng
+        members = [g + m * ng for m in range(gr)]
+        l1c = l1.contiguous()
+        l2c = l2.contiguous()
+        o1 = [torch.empty_like(l1c) for _ in range(ws)]
+        o2 = [torch.empty_like(l2c) for _ in range(ws)]
+        dist.all_gather(o1, l1c, group=self.group)
+        dist.all_gather(o2, l2c, group=self.group)
+        g1 = torch.cat([o1[m] for m in members], dim=0).contiguous()
+        g2 = torch.cat([o2[m] for m in members], dim=0).contiguous()
+        self._gath_cache = (key, g1, g2)
+        return g1, g2
+
     # ---------------------------------------------------------- 自适应发射配置
     def _select_adaptive_cfg(self, num_tokens: int):
         """按真实路由选择本次 launch 的 win_cap。
@@ -336,24 +373,12 @@ class SymmBuffer:
                 counts.scatter_add_(0, idx,
                                     torch.ones_like(idx, dtype=torch.int64))
             dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=self.group)
-            max_expert = int(counts.max().item())
-            nz = counts[counts > 0]
-            med = int(nz.median().item()) if nz.numel() > 0 else 1
-            if max_expert >= 3 * max(1, med):
-                if med >= 32:
-                    tgt = (max_expert + _KERNEL_RING - 1) // _KERNEL_RING
-                else:
-                    tgt = min(48, max_expert)
-                tgt = ((tgt + _KERNEL_M_TILE - 1) // _KERNEL_M_TILE) * _KERNEL_M_TILE
-                # 对齐到 kernel 守卫放行区间：16 的倍数，且 48 <= win <= min(win_phys, slot)
-                hi = min(int(self.win_phys), int(self.num_max_tokens_per_rank))
-                hi = (hi // _KERNEL_M_TILE) * _KERNEL_M_TILE
-                win = max(_WIN_ADAPT_MIN, min(hi, tgt))
-                if win < _WIN_ADAPT_MIN or win > hi:
-                    self._launch_cfg = base
-                    return base   # 放行区间为空：回退 base，不伪造 win
-                self._launch_cfg = win
-                return win
+            # [C++ 选窗] torch 不做启发式：把每专家计数交给 C++ select_win 决定
+            #   （与 mybench/check 同源：src/win_select.cuh；win_min=32、cap=slot）。
+            cap_hint = min(int(self.win_phys), int(self.num_max_tokens_per_rank))
+            win = int(_C.select_win_mega_moe(counts.to(torch.uint32), cap_hint, 32))
+            self._launch_cfg = win
+            return win
         except Exception:  # noqa: BLE001
             return base
         self._launch_cfg = base
@@ -538,6 +563,8 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
         sym_buffer.expert_window = ew
     # 逐 launch 配置：eager 按路由自适应，capture 复用缓存。
     win_cap, skip = sym_buffer.launch_config(num_tokens)
+    # [GS] 组权重 all-gather（capture 前建缓存，capture 内复用）。
+    l1_weights, l2_weights = sym_buffer.group_weights(l1_weights, l2_weights)
     # 首次 launch 兜底预热（建档预热失败时）：捕获中禁止，避免捕获流阻塞。
     if not getattr(sym_buffer, "_mega_moe_warmed", False):
         sym_buffer._mega_moe_warmed = True
@@ -554,6 +581,63 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
     sym_buffer.launch_count += 1
     if num_tokens > 0:
         y.copy_(sym_buffer._y_fp32[:num_tokens].to(torch.bfloat16))
+
+
+def fp8_mega_moe_compute(l1_weights: torch.Tensor, l2_weights: torch.Tensor,
+                         sym_buffer: SymmBuffer, num_tokens: int,
+                         activation: str = "swiglu", activation_clamp=None,
+                         expert_window: Optional[int] = None) -> None:
+    """[SPLIT-REDUCE] 只发 compute 段：前序 + 任务循环 + COMBINE（不写 y）。
+
+    与 :func:`fp8_mega_moe_reduce` 成对使用（内部按 ``combine_sums`` 同步）。
+    用途：框架可在 compute 与 reduce 之间插入**与本 MoE 输出无关**的 kernel，
+    把 REDUCE 的跨 rank 等待重叠隐藏。中间插入的核不得触碰 kernel 的
+    ``current_time``/M_CYCLE 契约。
+    """
+    if sym_buffer.mma_type not in ("fp8xfp8", "bf16xfp8"):
+        raise ValueError(
+            f"fp8_mega_moe_compute requires fp8xfp8/bf16xfp8 SymmBuffer, got "
+            f"{sym_buffer.mma_type!r}")
+    if activation != "swiglu":
+        raise ValueError(f"fp8xfp8 requires activation='swiglu', got {activation!r}")
+    num_tokens = int(num_tokens)
+    if num_tokens < 0 or num_tokens > sym_buffer.num_max_tokens_per_rank:
+        raise ValueError(
+            f"num_tokens={num_tokens} exceeds capacity "
+            f"{sym_buffer.num_max_tokens_per_rank}")
+    clamp = 1e30 if activation_clamp is None else float(activation_clamp)
+    if expert_window is not None:
+        ew = int(expert_window)
+        if ew < EXPERT_WINDOW_MIN or ew > sym_buffer.win_phys:
+            raise ValueError(
+                f"expert_window={ew} 超出 [8, {sym_buffer.win_phys}]")
+        sym_buffer.expert_window = ew
+    win_cap, skip = sym_buffer.launch_config(num_tokens)
+    # [GS] 组权重 all-gather（同 fp8_mega_moe）。
+    l1_weights, l2_weights = sym_buffer.group_weights(l1_weights, l2_weights)
+    _C.fp8_mega_moe_compute(l1_weights.view(torch.uint8),
+                            l2_weights.view(torch.uint8), sym_buffer._impl,
+                            num_tokens, clamp, win_cap, skip)
+    # launch_count 已由 C++ 侧递增。
+
+
+def fp8_mega_moe_reduce(y: torch.Tensor, sym_buffer: SymmBuffer,
+                        num_tokens: Optional[int] = None) -> None:
+    """[SPLIT-REDUCE] 只发 REDUCE 段：topk 加权归约 → y（BF16）。
+
+    必须在同一 rank 的 :func:`fp8_mega_moe_compute` 之后调用；内部等所有 rank
+    的 COMBINE 完成标记（``combine_sums``）。
+    """
+    if sym_buffer.mma_type not in ("fp8xfp8", "bf16xfp8"):
+        raise ValueError(
+            f"fp8_mega_moe_reduce requires fp8xfp8/bf16xfp8 SymmBuffer, got "
+            f"{sym_buffer.mma_type!r}")
+    nt = int(num_tokens) if num_tokens is not None else int(y.shape[0])
+    if nt <= 0 or nt > sym_buffer.num_max_tokens_per_rank:
+        raise ValueError(
+            f"num_tokens={nt} 越界 (capacity {sym_buffer.num_max_tokens_per_rank})")
+    _C.fp8_mega_moe_reduce(sym_buffer._y_fp32, sym_buffer._impl, nt)
+    y.copy_(sym_buffer._y_fp32[:nt].to(torch.bfloat16))
 
 
 def bf16_mega_moe(*args, **kwargs):
@@ -602,5 +686,6 @@ __all__ = [
     "get_token_alignment_for_mega_moe", "get_block_m_for_mega_moe",
     "transform_weights_for_mega_moe",
     "fp8_mega_moe", "bf16_mega_moe", "bf16_fp8_mega_moe", "fp8_fp4_mega_moe",
+    "fp8_mega_moe_compute", "fp8_mega_moe_reduce",
     "read_phase_ticks", "read_dbg_report", "read_block_marks",
 ]

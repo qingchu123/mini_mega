@@ -157,13 +157,30 @@ constexpr int kGsMaxWin = kGE * ((kMaxTPR + 15) / 16);
 #endif
 constexpr int kGsMemberCap = MX_GS_MEMBER_CAP;
 
+// [防御] 组总窗口数上限：超此值判为异常（远端计数未就绪/垃圾）→ 调度失败，
+//   调用方回退 base 路径。kMaxTPR=512、win 下界 8 ⇒ 每专家 ≤64 窗；kGE=32 ⇒ ≤2048。
+#ifndef MX_GS_WIN_TOTAL_MAX
+#define MX_GS_WIN_TOTAL_MAX (kGE * 256)
+#endif
+constexpr int kGsWinTotalMax = MX_GS_WIN_TOTAL_MAX;
+
 // 桶式无 scratch LPT：直接算出 member 名下的窗口序列（按分配顺序 = cost 降序、
 //   同 cost 内 (ge,w) 升序，与 gs_enum+gs_sort+gs_assign 等价）。
 //   cost 只取 [1, ceil(win/16)]，逐 cost 降序扫描全部窗口即可，无需暂存全部任务。
-//   out_ge/out_w 容量 cap；返回本 member 的窗口数（可能 > cap，仅写前 cap）。
+//   out_ge/out_w 容量 cap。
+//   返回值：>=0 = 本 member 窗口数；-1 = 判定失败（组窗口数超 kGsWinTotalMax，
+//   或本 member 窗口数超 cap）——调用方必须回退 base，禁止越界使用 out_*。
 __host__ __device__ inline int gs_schedule_member(
         const int* cg, int win_cap, int member, int* out_ge, int* out_w,
         int cap) {
+    // 先统计组总窗口数：远端计数异常（未就绪/垃圾）时直接失败，避免三重循环失控。
+    int total = 0;
+    for (int ge = 0; ge < kGE; ++ge) {
+        const int c = cg[ge];
+        if (c < 0) return -1;
+        total += gs_win_count(c, win_cap);
+        if (total > kGsWinTotalMax) return -1;
+    }
     long long load[kGroupRanks];
     for (int m = 0; m < kGroupRanks; ++m) load[m] = 0;
     const int maxcost = gs_max_cost(win_cap);
@@ -182,6 +199,9 @@ __host__ __device__ inline int gs_schedule_member(
                 for (int m = 1; m < kGroupRanks; ++m)
                     if (load[m] < minl) minl = load[m];
                 int chosen = owner;
+#ifdef GS_DIAG_OWNER_ONLY
+                chosen = owner;   // [诊断] 每个窗口都归其 owner（无远端 helper）
+#else
                 if (load[owner] != minl) {
                     chosen = 0;
                     for (int m = 0; m < kGroupRanks; ++m)
@@ -190,12 +210,12 @@ __host__ __device__ inline int gs_schedule_member(
                             break;
                         }
                 }
+#endif
                 load[chosen] += cost;
                 if (chosen == member) {
-                    if (nout < cap) {
-                        out_ge[nout] = ge;
-                        out_w[nout] = w;
-                    }
+                    if (nout >= cap) return -1;  // 超容量 → 回退（不越界写）
+                    out_ge[nout] = ge;
+                    out_w[nout] = w;
                     ++nout;
                 }
             }

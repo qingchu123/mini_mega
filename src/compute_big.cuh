@@ -2002,7 +2002,7 @@ __device__ __forceinline__ void r19_tail_common(
         if (fused)
             combine_mark_rows(c, count, lane, warp, 8);
         else
-            combine_push_pair(c, reinterpret_cast<const uint8_t*>((&S.a->unk->rd.l2_out[0][0][0])),
+            combine_push_pair(c, reinterpret_cast<const uint8_t*>((&S.a->unk->rd.l2_out[S.cycle][0][0][0])),
                               count, lane, warp, 8);
     }
     __syncthreads();
@@ -2039,7 +2039,7 @@ __device__ R19_BIG_ATTR void r19_big_task(
     CombineFuseCtx fuse;
     fuse.capable = cctx.combine_on;
     fuse.c = &cctx;
-    fuse.out_base = reinterpret_cast<const uint8_t*>((&S.a->unk->rd.l2_out[0][0][0]));
+    fuse.out_base = reinterpret_cast<const uint8_t*>((&S.a->unk->rd.l2_out[S.cycle][0][0][0]));
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
     r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx, kseg,
@@ -2370,8 +2370,8 @@ __device__ R19_BIG_ATTR void r19_big_task(
             ((&S.a->rwk->ld.ffn_hidden[0][0][0]) != nullptr)
                 ? (&S.a->rwk->ld.ffn_hidden[0][0][0]) + (size_t)pool_slot * S.a->win_cap * kIntermediate
                 : nullptr;
-        uint16_t* out_slot = ((&S.a->unk->rd.l2_out[0][0][0]) != nullptr)
-            ? (&S.a->unk->rd.l2_out[0][0][0]) + (size_t)blockIdx.x * S.a->win_cap * kHidden
+        uint16_t* out_slot = ((&S.a->unk->rd.l2_out[S.cycle][0][0][0]) != nullptr)
+            ? (&S.a->unk->rd.l2_out[S.cycle][0][0][0]) + (size_t)blockIdx.x * S.a->win_cap * kHidden
             : nullptr;
         const uint8_t* w2_e = S.w2_base + (size_t)e * MT_WSTRIDE(kHidden, kIntermediate);
         // L2 的 A 走 local_data.frag2 的 fragment 副本
@@ -2667,8 +2667,8 @@ __device__ R19_SMALL_ATTR void r19_small_task(
             ((&S.a->rwk->ld.ffn_hidden[0][0][0]) != nullptr)
                 ? (&S.a->rwk->ld.ffn_hidden[0][0][0]) + (size_t)pool_slot * S.a->win_cap * kIntermediate
                 : nullptr;
-        uint16_t* out_slot = ((&S.a->unk->rd.l2_out[0][0][0]) != nullptr)
-            ? (&S.a->unk->rd.l2_out[0][0][0]) + (size_t)blockIdx.x * S.a->win_cap * kHidden
+        uint16_t* out_slot = ((&S.a->unk->rd.l2_out[S.cycle][0][0][0]) != nullptr)
+            ? (&S.a->unk->rd.l2_out[S.cycle][0][0][0]) + (size_t)blockIdx.x * S.a->win_cap * kHidden
             : nullptr;
         const uint8_t* w2_e = S.w2_base + (size_t)e * MT_WSTRIDE(kHidden, kIntermediate);
         // [FRAG-ALL] L2 的 A 走 L1 的 frag2 fragment 副本

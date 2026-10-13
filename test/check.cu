@@ -42,7 +42,15 @@ namespace {
 using mt::Spec;
 
 constexpr int kCase0 = 804900;               // 实录 launch（= MXMOEMega FIXED_CASES['804900']）
+constexpr int kCase2 = 809200;               // 实录 launch（= MXMOEMega --routing-fixed-cases 2）
 const std::vector<int> kBalancedTprs = {1, 4, 16, 32, 33, 64, 128, 256, 512};
+
+// 实录固定路由 case：label 带 corpus 编号（= MXMOEMega --routing-fixed-cases <idx>）。
+mt::Spec fixed_case_spec(const mt::TkLaunch& t, int case_index) {
+    mt::Spec s = mt::tk_spec(t);
+    s.label = "case" + std::to_string(case_index) + "=" + std::to_string(t.id);
+    return s;
+}
 
 struct Flags {
     bool l0 = false;      // 前序检查
@@ -350,7 +358,7 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
     CHECK(mcSetDevice(0));
     std::vector<uint8_t> xd((size_t)rows * kHidden);
     CHECK(mcMemcpy(xd.data(),
-                   (e.d.rd ? &e.d.rd->expert_tokens[0][0][0]
+                   (e.d.rd ? &e.d.rd->expert_tokens[0][0][0][0]
                            : e.d.sym + L.expert_tokens_off) +
                        (size_t)pool_slot * win * kHidden,
                    xd.size(), mcMemcpyDeviceToHost));
@@ -807,12 +815,13 @@ bool run_spec(Env& e, const Spec& s, const Flags& f) {
 void usage(const char* p) {
     std::printf(
         "用法: %s --smoke | --all  [选项]（经 scripts/run.sh check 启动，R=32）\n"
-        "  --smoke           冒烟：均衡 16 + TK launch %d（前序/eager/graph×1/graph×N）\n"
+        "  --smoke           冒烟：均衡 16 + 实录 case0(%d)/case2(%d)"
+        "（前序/eager/graph×1/graph×N）\n"
         "  --all             全量：均衡 TPR 表 + 全部 TK 合法 launch（每个含前序/eager/graph×N）\n"
         "  --tk-info F       TK_INFO 日志（缺省 %s）\n"
         "  --graph-nodes N   graph 图内节点数（缺省 50）\n"
         "  --check-rows N    L1/L2 核验行数（缺省 16）\n",
-        p, kCase0, mt::kDefaultTkLog);
+        p, kCase0, kCase2, mt::kDefaultTkLog);
 }
 
 }  // namespace
@@ -879,17 +888,23 @@ int main(int argc, char** argv) {
         }
     }
     if (smoke) {
-        const mt::TkLaunch* c0 = nullptr;
-        for (const auto& t : tk)
-            if (t.id == kCase0) c0 = &t;
-        if (!c0) {
-            if (rank == 0)
-                std::fprintf(stderr, "[check] TK_INFO 中无 launch=%d（R=%d）\n", kCase0, R);
-            MPI_Finalize();
-            return 2;
+        // 实录固定路由 case0/case2（corpus 编号 0/2）：前序+eager+graph×1，再 graph×N。
+        const int case_ids[2] = {kCase0, kCase2};
+        for (int ci = 0; ci < 2; ++ci) {
+            const mt::TkLaunch* c = nullptr;
+            for (const auto& t : tk)
+                if (t.id == case_ids[ci]) c = &t;
+            if (!c) {
+                if (rank == 0)
+                    std::fprintf(stderr, "[check] TK_INFO 中无 launch=%d（R=%d）\n",
+                                 case_ids[ci], R);
+                MPI_Finalize();
+                return 2;
+            }
+            const mt::Spec sp = fixed_case_spec(*c, ci == 0 ? 0 : 2);
+            plan.push_back({sp, Flags{true, true, 1}});
+            plan.push_back({sp, Flags{false, true, graph_nodes}});
         }
-        plan.push_back({mt::tk_spec(*c0), Flags{true, true, 1}});
-        plan.push_back({mt::tk_spec(*c0), Flags{false, true, graph_nodes}});
         plan.push_back({mt::balanced_spec(R, 16), Flags{false, true, graph_nodes}});
         plan.push_back({mt::balanced_spec(R, 128), Flags{false, true, graph_nodes}});
         plan.push_back({mt::balanced_spec(R, 24), Flags{false, true, graph_nodes}});

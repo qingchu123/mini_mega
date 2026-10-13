@@ -27,3 +27,4 @@ __pycache__/
 .agents/*
 tmp/*
 test/*
+build/*
