@@ -333,17 +333,54 @@ class SymmBuffer:
             return l1, l2
         ng = ws // gr
         g = int(self.rank) % ng
-        members = [g + m * ng for m in range(gr)]
+        sg = self._gs_subgroup()
+        if sg is None:
+            return l1, l2
         l1c = l1.contiguous()
         l2c = l2.contiguous()
-        o1 = [torch.empty_like(l1c) for _ in range(ws)]
-        o2 = [torch.empty_like(l2c) for _ in range(ws)]
-        dist.all_gather(o1, l1c, group=self.group)
-        dist.all_gather(o2, l2c, group=self.group)
-        g1 = torch.cat([o1[m] for m in members], dim=0).contiguous()
-        g2 = torch.cat([o2[m] for m in members], dim=0).contiguous()
+        g1 = self._gather_chunked(l1c, gr, sg)
+        g2 = self._gather_chunked(l2c, gr, sg)
         self._gath_cache = (key, g1, g2)
         return g1, g2
+
+    def _gs_subgroup(self):
+        """[GS] 本 rank 的 gs 组（rank%ng + m*ng）对应的 torch 子组：全体 rank 集体
+        创建 ng 个子组（只建一次，缓存），避免对全 world（32 rank）聚合。"""
+        if getattr(self, "_gs_sg_tried", False):
+            return getattr(self, "_gs_sg", None)
+        self._gs_sg_tried = True
+        gr = int(_C.mega_group_ranks())
+        ws = int(self.world_size)
+        if gr <= 1 or ws % gr != 0 or self.group is None:
+            return None
+        ng = ws // gr
+        r = int(self.rank)
+        mine = None
+        for gi in range(ng):
+            mem = [gi + m * ng for m in range(gr)]
+            sub = dist.new_group(mem)
+            if r in mem:
+                mine = sub
+        self._gs_sg = mine
+        return mine
+
+    @staticmethod
+    def _gather_chunked(t, gr, sg, target_bytes=256 << 20):
+        """[GS] 沿 dim0 分块 all_gather 进同一常驻输出：瞬时暂存仅 ~target_bytes
+        （而非 gr×全量），去掉全 world 32 份暂存。返回 (gr*rows, ...)。"""
+        rows = int(t.shape[0])
+        row_bytes = max(1, int(t[0].numel() * t.element_size()))
+        chunk = max(1, min(rows, int(target_bytes // max(1, gr * row_bytes))))
+        out = torch.empty((gr * rows,) + tuple(t.shape[1:]), dtype=t.dtype,
+                          device=t.device)
+        for a in range(0, rows, chunk):
+            b = min(rows, a + chunk)
+            inc = t[a:b].contiguous()
+            recv = [torch.empty_like(inc) for _ in range(gr)]
+            dist.all_gather(recv, inc, group=sg)
+            for m in range(gr):
+                out[m * rows + a: m * rows + b].copy_(recv[m])
+        return out
 
     # ---------------------------------------------------------- 自适应发射配置
     def _select_adaptive_cfg(self, num_tokens: int):
