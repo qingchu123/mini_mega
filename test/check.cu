@@ -41,7 +41,10 @@ namespace {
 
 using mt::Spec;
 
-constexpr int kCase0 = 804900;               // 实录 launch（= MXMOEMega FIXED_CASES['804900']）
+constexpr int kCase0 = 804900;
+// [--score] 精度探针：记录 L1/L2 相对 fp32 参考的最大相对误差（仅 rank0 更新）。
+static double g_l1_rel = 0.0, g_l2_rel = 0.0;
+static bool g_score = false;               // 实录 launch（= MXMOEMega FIXED_CASES['804900']）
 constexpr int kCase2 = 809200;               // 实录 launch（= MXMOEMega --routing-fixed-cases 2）
 const std::vector<int> kBalancedTprs = {1, 4, 16, 32, 33, 64, 128, 256, 512};
 
@@ -405,6 +408,7 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
                                                                         : nullptr,
                                       (int)ffn_exp_f.size(), 7e-2, 2e-3);
     print_check_stats("L1 ffn_hidden(expert0)", s1);
+    g_l1_rel = std::max(g_l1_rel, s1.max_rel);
     if (std::getenv("MT_L1_DIAG") != nullptr) l1_diag(e, s, routes, ex, rows, xd, ffn_d);
     // L2：CPU 参考（以设备 ffn 字节为输入）vs 各 block 的 l2_out 槽。
     // 每个 block 只写自己负责的 N-slice 列；对每个 slice 查找「存在一个 block 与参考一致」。
@@ -436,6 +440,7 @@ bool check_l1l2(Env& e, const Spec& s, const mt::Routes& routes) {
         char tag[64];
         std::snprintf(tag, sizeof(tag), "L2 out slice%d(block%d)", sl, best_block);
         print_check_stats(tag, best);
+        g_l2_rel = std::max(g_l2_rel, best.max_rel);
         l2_ok = l2_ok && best.pass();
     }
     return s1.pass() && l2_ok;
@@ -795,6 +800,14 @@ bool run_spec(Env& e, const Spec& s, const Flags& f) {
             const CheckStats red = check_reduce(e, s, routes, y);
             r.red = agree(red.pass());
             r.red_max_abs = agree_max(red.max_abs);
+            if (g_score && e.rank == 0) {
+                const double l1 = g_l1_rel;   // 仅 rank0 统计，勿做集合通信
+                const double l2 = g_l2_rel;
+                const double rel = std::max(l1, l2);
+                std::printf("    [精度] case=%s L1_max_rel=%.3e L2_max_rel=%.3e "
+                            "score=%.2f/100\n",
+                            s.label.c_str(), l1, l2, 100.0 * (1.0 - rel));
+            }
         }
     }
     if (f.graph > 0) {
@@ -818,6 +831,8 @@ void usage(const char* p) {
         "  --smoke           冒烟：均衡 16 + 实录 case0(%d)/case2(%d)"
         "（前序/eager/graph×1/graph×N）\n"
         "  --all             全量：均衡 TPR 表 + 全部 TK 合法 launch（每个含前序/eager/graph×N）\n"
+        "  --score           精度探针：跑均衡 16 eager，打印 L1/L2 相对 fp32 参考的\n"
+        "                    最大相对误差与 0-100 精度分（<10s）\n"
         "  --tk-info F       TK_INFO 日志（缺省 %s）\n"
         "  --graph-nodes N   graph 图内节点数（缺省 50）\n"
         "  --check-rows N    L1/L2 核验行数（缺省 16）\n",
@@ -843,6 +858,7 @@ int main(int argc, char** argv) {
         auto val = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
         if (a == "--smoke") smoke = true;
         else if (a == "--all") all = true;
+        else if (a == "--score") { g_score = true; smoke = true; }
         else if (a == "--tk-info") tk_path = val();
         else if (a == "--only") only = mt::parse_csv_ints(val());
         else if (a == "--tprs") tprs = mt::parse_csv_ints(val());
@@ -909,6 +925,9 @@ int main(int argc, char** argv) {
         plan.push_back({mt::balanced_spec(R, 128), Flags{false, true, graph_nodes}});
         plan.push_back({mt::balanced_spec(R, 24), Flags{false, true, graph_nodes}});
         plan.push_back({mt::balanced_spec(R, 32), Flags{false, true, graph_nodes}});
+        // [GS-STRESS] 大 token 用例：配合 -DMX_GS_SKEW_NUM=0（恒启用 gs）压测
+        //   helper 拉远端 owner 表路径 + M_CYCLE 槽跨轮复用（--graph-nodes 放大）。
+        plan.push_back({mt::balanced_spec(R, 512), Flags{false, true, graph_nodes}});
     }
     if (all) {
         // --tprs 子集：仍自动包含 TPR=512，保证 max_tokens=512 的全局布局与全量一致
