@@ -47,6 +47,21 @@ __global__ void mxk_dbg_capture_kernel(
         sink[0] = (unsigned long long)topk_idx[0];   // 防 DCE
 }
 
+// ============================================================================
+// [CT-PRINT] 轮数诊断打印 kernel：rank==0 且轮数 %1000==0 时打印当前轮数/token
+//   等元信息，便于把 ATU/异常定位到具体轮次。常开（开销仅一次 rank0 比较；
+//   graph capture 时随图录制，replay 下每 1000 轮打印一次）。
+// ============================================================================
+__global__ void mxk_ct_print_kernel(const int64_t* __restrict__ ct, int rank,
+                                    int tokens, int slot_capacity, int grid) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (rank != 0) return;
+    const int64_t c = (ct != nullptr) ? *ct : -1LL;
+    if (c < 0 || (c % 1000) != 0) return;
+    printf("[CT-PRINT] round=%lld tokens=%d slot_cap=%d grid=%d rank=%d\n",
+           (long long)c, tokens, slot_capacity, grid, rank);
+}
+
 // 设备侧权重生成（16B/lane supertile 布局；替代 host 生成 + 大体积上传）。
 __global__ void __launch_bounds__(256) fill_w_lane_kernel(
                                    uint8_t* __restrict__ w, int n_rows,
@@ -145,6 +160,19 @@ void dbg_capture_launch(const MegaLaunchArgs& a, mcStream_t stream) {
         stream_is_capturing(stream), nullptr);
 }
 
+// [CT-PRINT] 轮数诊断打印：rank0 && 轮数 %1000==0 时打印元信息。
+void ct_print_launch(const MegaLaunchArgs& a, mcStream_t stream) {
+    // [CT-PRINT] 默认不发射（避免加 graph 节点/扰动）；MX_CT_PRINT=1 才启用。
+    static const bool on = [] {
+        const char* e = std::getenv("MX_CT_PRINT");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    if (!on) return;
+    mxk_ct_print_kernel<<<1, 1, 0, stream>>>(
+        a.rwk ? &a.rwk->lf.current_time[0][1] : nullptr, a.rank, a.tokens,
+        a.slot_capacity, a.grid);
+}
+
 // [L1L2-SPLIT] 运行期开关：MX_L1L2_SPLIT=1 时 launch_compute 拆成
 //   L1/L2 两个 kernel（同 stream 顺序）。首次调用读 env 定型（graph capture
 //   期间只读 env、无设备操作，合法）。
@@ -194,6 +222,8 @@ void launch_l2(const MegaLaunchArgs& a, mcStream_t stream) {
 void launch_compute(const MegaLaunchArgs& a, mcStream_t stream) {
     // [MEGA_DEBUG=4] 采集 kernel（mega 之前；默认关，零开销）
     dbg_capture_launch(a, stream);
+    // [CT-PRINT] 轮数诊断打印（rank0 && 轮数%1000==0；常开，极低开销）
+    ct_print_launch(a, stream);
     // [L1L2-SPLIT] 拆分模式：L1 → L2 两个 launch（同 stream；graph capture
     //   下两节点依次录入，replay 顺序不变）。
 #if CM_L1L2_SPLIT
