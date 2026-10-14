@@ -47,7 +47,7 @@ _WIN_ADAPT_MIN = 48
 # [FIXED-WIN] 固定窗口容量（本 wheel 打包默认 48）：>0 时所有 launch 强制该 win，
 #   覆盖自适应。用 MXK_FORCE_WIN=0 恢复自适应、或设其它 16 倍数。值会被夹到
 #   [48, min(win_phys, num_max_tokens_per_rank)]，区间为空时回退逻辑窗口。
-_FIXED_WIN = 48   # [FIXED-WIN] 本包固定 win_cap=48（不受 MXK_FORCE_WIN/自适应影响）
+_FIXED_WIN = 64   # [FIXED-WIN] 本包固定 win_cap=64（不受 MXK_FORCE_WIN/自适应影响）
 _FORCE_WIN_DEFAULT = 0
 
 # 物理窗口容量缺省：与调用方逻辑窗口解耦，按最大值分配（AUTO 表最大 80、
