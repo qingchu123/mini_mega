@@ -39,6 +39,7 @@ _L1_BLOCK_N = 256
 
 # kernel 常量（与 src/common.cuh 对齐）
 _KERNEL_RING = 8        # kRing：每专家窗口槽数
+_KERNEL_GRID = int(_C.kernel_grid())   # kGridBlocks：每卡 block 数（与 kernel 同源）
 _KERNEL_M_TILE = 16     # kM：M tile 行数（win_cap 对齐粒度）
 # 自适应 win 下限：kernel 守卫（src/megakernel.cu）仅放行 win==slot 或
 # 16 的倍数且 48<=win<=slot；win<48 的小窗在 REDUCE/graph 上未验证。

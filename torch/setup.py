@@ -52,6 +52,11 @@ if _grp:
     cxx_flags.append(f"-DMX_GROUP_RANKS={int(_grp)}")
     print(f"[setup] MX_GROUP_RANKS={int(_grp)}", flush=True)
 
+# kernel grid：与 scripts/build.sh 的 MXK_KERNEL_GRID 同一个值（缺省 28，见 src/grid_config.h）
+_kgrid = os.environ.get("MXK_KERNEL_GRID")
+if _kgrid:
+    cxx_flags.append(f"-DKGRID_OVERRIDE={int(_kgrid)}")
+    print(f"[setup] KERNEL_GRID={int(_kgrid)}", flush=True)
 sources = [
     os.path.join("csrc", "python_api.cpp"),
     os.path.join("csrc", "kernel_bridge.cpp"),

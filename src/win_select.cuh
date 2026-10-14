@@ -17,6 +17,8 @@
 
 #include <cstdint>
 
+#include "grid_config.h"
+
 namespace mxk {
 
 // 候选窗口集合（16 的倍数，守卫区间 32..slot；16 仅在 win==slot 时合法、不含）
@@ -25,7 +27,7 @@ static constexpr int kWinCandN = (int)(sizeof(kWinCandidates) / sizeof(int));
 
 // 固定常数（与 common.cuh 对齐：N=kNSlice、G=kGrid）
 static constexpr int kWinNSlice = 4;
-static constexpr int kWinGrid = 32;
+static constexpr int kWinGrid = kGridBlocks;
 
 // [261012 重标定] 专家窗口 ring 槽数（与 common.cuh 的 kRing 对齐）。
 //   单专家窗口数 ceil(c_e/win) 超过该值时，后续窗口需在 l2_gate_wait 上等待前一窗

@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+
+#include "grid_config.h"
 #include <cstring>
 
 // ---------------------------------------------------------------- 场景常量 --
@@ -18,7 +20,7 @@ constexpr int kEPR = 8;              // 每 rank 专家数
 constexpr int kTopk = 8;             // 每 token 路由专家数
 constexpr int kHidden = 6144;        // H（K_IN / K_OUT）
 constexpr int kIntermediate = 2048;  // I（中间维度）
-constexpr int kGrid = 32;            // grid 块数（= SM 数）
+constexpr int kGrid = kGridBlocks;   // grid 块数（= SM 数，见 grid_config.h）
 constexpr int kRanks = 32;           
 #ifndef KNSLICE_OVERRIDE
 #define KNSLICE_OVERRIDE 4

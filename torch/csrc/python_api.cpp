@@ -57,6 +57,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mega_group_ranks", &mxk_group_ranks,
         "组内 rank 数 kGroupRanks（torch 层按此 all-gather 组权重）");
 
+  // kernel grid（= 每卡 block 数，与 kernel 同源的 kGridBlocks）及设备 SM 校验。
+  m.def("kernel_grid", []() { return (int64_t)mxk::kMegaGrid(); },
+        "kernel grid = 每卡 block 数（kGridBlocks，默认 28）");
+  m.def("check_grid_for_device", [](int64_t dev) {
+          int sms = 0;
+          if (mcDeviceGetAttribute(&sms, mcDeviceAttributeMultiProcessorCount,
+                                   (int)dev) != mcSuccess)
+            throw std::runtime_error("mcDeviceGetAttribute(SM count) 失败");
+          if (mxk::kMegaGrid() > sms)
+            throw std::runtime_error(
+                "grid=" + std::to_string(mxk::kMegaGrid()) + " 超出设备 SM 数 " +
+                std::to_string(sms) + "；请用 MXK_KERNEL_GRID=<SM 数> 重新构建");
+          return (int64_t)sms;
+        },
+        "校验 kernel grid ≤ 设备 SM 数，返回设备 SM 数");
+
   m.def("select_win_mega_moe",
         [](const torch::Tensor& counts, int64_t cap_hint, int64_t win_min) {
           auto c = counts.to(torch::kCPU).contiguous();

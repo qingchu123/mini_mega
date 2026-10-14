@@ -76,6 +76,10 @@ MPI_INC=(-I"$MACA_PATH/ompi/include")
 MPI_LIB=(-L"$MACA_PATH/ompi/lib" -lmpi -Wl,-rpath,'$ORIGIN' -Wl,-rpath,"$MACA_PATH/ompi/lib")
 # [OPT] 扫描用额外编译宏（默认空；用于 -D 参数实验）
 KERNEL_CFLAGS=${KERNEL_CFLAGS:-}
+# kernel grid（= 每卡 block 数）：MXK_KERNEL_GRID 与 torch 侧同一个值（缺省 28，见 src/grid_config.h）
+if [ -n "${MXK_KERNEL_GRID:-}" ]; then
+  KERNEL_CFLAGS="$KERNEL_CFLAGS -DKGRID_OVERRIDE=$MXK_KERNEL_GRID"
+fi
 
 # 依赖文件（-MMD 生成）中是否存在比 target 更新的文件；有则返回 0（需重编）
 deps_newer() {

@@ -14,6 +14,7 @@
 #include "layout.hpp"
 #include "memory.hpp"
 #include "megakernel.h"  // fp8mega::MegaLaunchArgs / launch_compute / launch_reduce
+#include "grid_config.h"  // kGridBlocks：与 kernel 同源的 grid（SM 数）
 
 // flags_bridge.cu 导出：rwk_data / unk_data 的字节数与 ld 内 w1/w2 偏移
 // （host 头不包含设备定义）
@@ -59,7 +60,7 @@ struct SymmBuffer {
 };
 
 inline int64_t kMegaRing() { return 8; }
-inline int64_t kMegaGrid() { return 32; }
+inline int64_t kMegaGrid() { return kGridBlocks; }
 inline int64_t kMegaBlockN() { return 256; }
 
 // 释放已分配部分（创建失败回滚共用）。
