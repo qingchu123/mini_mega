@@ -50,7 +50,7 @@ constexpr int kFp8BarFlagsNumInt32 = 2568;
 //   kCombineSlicesMax 与 include/deep_gemm/layout/mega_moe.cuh 的
 //   kMegaMoeMaxCombineSlices=32 一致；kMaxCombineRows = max_tokens 上限 512。
 constexpr int kCombineSlicesMax = 32;
-constexpr int kMaxCombineRows = 768;
+constexpr int kMaxCombineRows = 512;
 
 // ---- 本 rank 私有（普通显存）----
 struct alignas(256) local_flags {

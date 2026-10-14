@@ -24,7 +24,7 @@ namespace mxk {
 // [调优] 组倾斜判定阈值：max·kGE > MX_GS_SKEW_NUM·Σ 时启用 gs（默认 3，与 win_select
 //   同族）。=0 表示恒启用（均衡组也重分配，仅用于实验）。
 #ifndef MX_GS_SKEW_NUM
-#define MX_GS_SKEW_NUM 0
+#define MX_GS_SKEW_NUM 2
 #endif
 // [调优] LPT 代价模型：0=ceil(rows/16)（默认）；1=rows（更细粒度）。
 #ifndef MX_GS_COST_MODEL
