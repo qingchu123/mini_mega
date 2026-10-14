@@ -915,3 +915,89 @@ env GPU_LOCK=0 bash scripts/run.sh check --all      # 762 用例 ~100s
 - NSLICE=8（g_l2=3）构建下 count 33..48 有同类 L2 空洞（`count<=48` 分支要求
   `g_l2%6==0`，g_l2=3 走不到 [OPT-33]）；49..63 已被本修复顺带覆盖
   （本修复分支无 g_l2 门控）。NSLICE=8 几何未在本轮实测，需单独构建验证。
+
+### 9) [261014_21_59] 排空支配模型 + 17/18 断崖量化（诊断基建 + ISA 实证；生产路径零改动）
+
+#### 结论先行
+
+1. **`__stwt` 在本平台 ≡ 普通缓存写（ISA 位级证据）**：cucc 对 `__stwt`/`__stwb`
+   生成的编码与普通写完全相同（`stg_b64 ... devc`，`bc 00 00 30…`）；仅
+   `__stcs`/`__stcg` 带 sysc 位（`bc 00 00 70…`）。即项目全部跨 rank 推送
+   （行 + 完成标记）实为**惰性缓存写**，靠驱逐/排空才到达对端——统一解释历史现象：
+   标记早写晚见（wend ≈ −23k 但 rspan 300–600k）、run 间 rspan 波动 380k→605k、
+   原子读探针不可见（atomicOr(…,0) 实验无效果，`coh_ctrl.log`）。
+   volatile 读 = `ldx … sysc devc`（一致读），**读侧无陈旧问题，延迟全部来自写侧排空**。
+2. **迭代周期受「外发洪峰排空」支配**：kspan+rspan 跨配置近乎恒定（TPR=64 各档
+   ~2.8–3.0M cycles）。三个 store 风味实验只把记账在 kspan↔rspan 间搬家：
+   | 实验 | TPR64 period | kspan | rspan | wall |
+   |---|---:|---:|---:|---:|
+   | 基线 __stwt | 2.876M | 2.180M | 605k | 1480.7µs |
+   | MARK-STCS（标记→__stcs） | 2.928M | 2.414M | 406k | 1485.7µs |
+   | MARK-ATOMIC（标记→atomicExch） | 2.924M | 2.914M(in=194k) | 127k | 1571.1µs |
+   | ROW-STCS（行推送→__stcs） | 2.75–2.80M | 2.288M | 466k | 1489.2µs |
+   → store 风味不是杠杆；有效外发带宽 D≈2–4GB/s/rank 是墙（用 `atomicExch` 把标记
+   挪进请求路径后 rspan 崩塌至 127k，但 kspan 同步 +500k，period 不变）。
+3. **64 vs 65 真实结构差 ≈ 末波洪峰**：TPR=64 末波 = el7 整窗 768KB/rank 突发收尾
+   （无后续计算遮挡）；65/66 的 el7 大窗在 wave1 完成，末尾 1–2 行 tiny 波吸收排空
+   → 快 ~180µs。属调度结构涌现差，非路径缺陷。
+4. **17/18 断崖量化（36 行 tile 量化）**：16→17 突增 +184µs，全部落在 mega loop
+   内：L2 相位 17..24 全程平坦（~16.3–17.2M ticks，不随行数下降）——17 行必须开第
+   2 个 16 行 MMA tile，tile2 近空转仍付全价（固定 ~145µs）；33/49 台阶经
+   [OPT-33]/[L1TUNE-D]/L2TUNE-49 已收敛（+9µs/+70µs）。属 16 行 tile 粒度结构性
+   差，无廉价通用修复（小档路径仅支持 ≤16 行，win_cap=64 不可动）。
+   分档台阶实测（us_mean）：16:627 · 17:809 · 24:910 · 32:987 · 33:997 · 48:1178
+   · 49:1248 · 64:1493。
+
+#### 诊断基建（`R24_DIAG_PHASE=1` 构建；生产构建零影响）
+
+- 内核侧 5 时间戳 bank（`local_flags.pre_ticks` 扩展）：bank0 原有；第三 bank
+  （+kGrid*16）逐 block 起止 + 任务循环入口/出口；第四 bank（+kGrid*24）单任务
+  span min/max/sum/n；第五 bank（+kGrid*32）REDUCE 逐块 start/end/spin/token +
+  逐切片自旋 + 逐 (k,s2) 标记到达时刻。**条件化分配**：诊断 bank 仅在
+  `#if R24_DIAG_PHASE` 下扩展数组，生产构建 `pre_ticks[kGrid*16]` 与基线布局
+  逐字节一致（`sizeof(rwk_data)=1543676672` 已核对）。
+- mybench 侧（同样 `#if R24_DIAG_PHASE`）：`MYBENCH_PHASE=1` 输出
+  `[span-graph]`（period/kspan/b0span/in/loop/post）、`[spanR-graph]`
+  （gap1/rblk0/rspan/gap2/wend）、`[spanT-*]`（单任务分布）、`[spanR2/3/4-*]`
+  （reduce 逐块/逐切片/逐 k 标记到达）；`MYBENCH_PHASE_RANK=0` 输出
+  `[phase-blk-*]`（逐 block L1/L2/pull/move/wait/pw/loop/tail/tasks）。
+- ISA 探针（`tmp/stwt_probe/probe2.cu`，19 行：plain/__stwt/__stcs/__stcg/__stwb
+  写 + volatile/__ldcv/__ldcs/__ldcg 读 + atomicExch/Max）：
+
+```bash
+# 环境同 6)；wt 内
+cd /home/fuyx/mini_mega/.agents/work/glm52a/tmp/stwt_probe
+/opt/maca/tools/cu-bridge/bin/cucc -O3 -std=c++17 -I$CUDA_HOME/include \
+  -I/opt/maca/include --offload-arch=xcore1600 -c probe2.cu -o probe2.o
+/opt/maca/mxgpu_llvm/bin/mxobjdump --print-code --print-instruction-encoding \
+  --target-kind=maca-mxc-metax-macahca--xcore1600 --demangle probe2.o
+# 判读：k_stwt 与 k_plain 编码相同（bc 00 00 30）；k_stcs/k_stcg 为 bc 00 00 70（sysc）
+```
+
+#### 复现命令
+
+```bash
+cd /home/fuyx/mini_mega/.agents/work/glm52a/wt
+# 诊断构建（5 bank + span 输出）
+export MACA_PATH=/opt/maca CUDA_HOME=/opt/maca/tools/cu-bridge   # 分条 export
+export DJ_JIT_NVCC_COMPILER=$HOME/cucc_maca_include.sh
+export LD_LIBRARY_PATH=/opt/maca/ompi/lib:/opt/maca/tools/cu-bridge/lib:/opt/maca/mxgpu_llvm/lib:/opt/maca/lib
+touch src/combine.cuh && rm -f test/megakernel.so test/mybench
+KERNEL_CFLAGS="--offload-arch=xcore1600 -DR24_DIAG_PHASE=1" bash scripts/build.sh mybench
+# 6 点快筛（对比 kspan/rspan 记账；16..24 断崖）
+flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+env GPU_LOCK=0 MT_FORCE_WIN=64 MYBENCH_PHASE=1 MYBENCH_PHASE_RANK=0 \
+bash scripts/run.sh mybench -R 32 -s 1 -tprs 64,65,65,64,63,66 -quiet
+# 生产构建（无 -D）：布局/行为回归基线
+KERNEL_CFLAGS="--offload-arch=xcore1600" bash scripts/build.sh mybench
+```
+
+#### 门禁与产物
+
+- 生产重建 `f6beeb10`：21 点 coverage（`cov21_gate.log`）全部落 ±10µs 噪声带
+  （TPR256 +21µs=0.6%）；`check --all` **762/762**（112.5s，`check_all_gate.log`）。
+  与上一部署产物 e3485a54 的差异 = cucc 变体漂移（同源异码，见 8)），行为经双门禁
+  等价。mybench `b95a7289`（打印门控，`MYBENCH_PHASE=1` 下生产构建零 span 垃圾输出）。
+- 实验日志：`tmp/{spanw,stcs,matom,rowstcs,cliff,tier}_ctrl.log`、`cov21_gate.log`。
+- 未采用/回退：`[EXP-COH]`（reduce 自旋内原子读探针，无效果，已回退）；
+  `combine_push_pair`/`combine_mark_rows` 均已回 `__stwt` 基线语义。

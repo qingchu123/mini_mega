@@ -259,75 +259,260 @@ int main(int argc, char** argv) {
         mcEventDestroy(e1);
         mcGraphExecDestroy(ex);
 
+        // [诊断锚点] 采样对齐用：本用例 graph 计时结束的 epoch 秒（立即 flush）
+        if (rank == 0) {
+            const double te = std::chrono::duration<double>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+            std::printf("[anchor] TPR=%d t_meas_end=%.3f us=%.2f\n", tokens, te, us);
+            std::fflush(stdout);
+        }
+
         // [诊断] MYBENCH_PHASE=1：计时后做一次 reset + 单次 eager launch，读取 kernel 内置相位 tick。
         // 注意：route..reduce 与 chain 只来自 block0 的时间线（kernel 结束要等所有 block），
         // 真正的关键路径需看逐 block 数据（MYBENCH_PHASE_RANK=<rank>，需 -DR24_DIAG_PHASE=1）。
         if (std::getenv("MYBENCH_PHASE") != nullptr) {
-            mt::reset_dev(geo, d, routes, tokens);
-            MPI_Barrier(MPI_COMM_WORLD);
-            fp8mega::launch_full(a, d.st);
-            MYCHK(mcStreamSynchronize(d.st));
-            MPI_Barrier(MPI_COMM_WORLD);
-            unsigned long long tp[16] = {0};
-            MYCHK(mcMemcpy(tp, d.lf->pre_ticks, sizeof(tp), mcMemcpyDeviceToHost));
-            std::vector<unsigned long long> tr((size_t)kGrid * 8, 0ull);
-            MYCHK(mcMemcpy(tr.data(), d.lf->pre_ticks + (size_t)kGrid * 8,
-                           tr.size() * sizeof(unsigned long long), mcMemcpyDeviceToHost));
-            int proc[kGrid] = {0};
-            MYCHK(mcMemcpy(proc, d.lf->out_processed, sizeof(proc), mcMemcpyDeviceToHost));
-            // 行：route publish xbar setup dispatch L1 L2tail compute reduce chain | trL1max trL2max maxtasks
-            auto cyc = [&](int hi, int lo) {
-                return (double)((long long)tp[hi] - (long long)tp[lo]);
-            };
-            double rowv[12];
-            rowv[0] = cyc(0, 6);
-            rowv[1] = cyc(1, 0);
-            rowv[2] = cyc(2, 1);
-            rowv[3] = cyc(3, 2);
-            rowv[4] = cyc(4, 3);
-            rowv[5] = cyc(5, 4);
-            rowv[6] = cyc(7, 5);
-            rowv[7] = cyc(7, 6);
-            rowv[8] = cyc(15, 7);
-            rowv[9] = cyc(15, 6);
-            unsigned long long l1max = 0, l2max = 0;
-            for (int b = 0; b < kGrid; ++b) {
-                l1max = std::max(l1max, tr[(size_t)b * 8 + 0]);
-                l2max = std::max(l2max, tr[(size_t)b * 8 + 1]);
-            }
-            rowv[10] = (double)l1max;
-            rowv[11] = (double)l2max;
-            int maxtasks = 0;
-            for (int b = 0; b < kGrid; ++b) maxtasks = std::max(maxtasks, proc[b]);
-            // 指定 rank 的逐 block 明细（需 R24_DIAG_PHASE=1；L1/L2 为 atomicAdd 累计周期）
-            if (const char* pr = std::getenv("MYBENCH_PHASE_RANK")) {
-                if (std::atoi(pr) == rank) {
-                    std::printf("[phase-blk] rank=%d block: L1cyc L2cyc tasks\n", rank);
-                    for (int b = 0; b < kGrid; ++b)
-                        std::printf("[phase-blk] b=%02d %10llu %10llu %d\n", b,
-                                    tr[(size_t)b * 8 + 0], tr[(size_t)b * 8 + 1], proc[b]);
-                    std::fflush(stdout);
+            // [诊断·第三 bank] 内核首尾/循环入口出口时间戳（需 R24_DIAG_PHASE=1 构建）。
+            // 在 reset 之前调用 = 取「最后一次 graph replay」的时间线；eager 后调用 = eager 的。
+#if R24_DIAG_PHASE
+            auto dump_span = [&](const char* tag, double wall_us) {
+                unsigned long long gg[4] = {0, 0, 0, 0};
+                std::vector<unsigned long long> tg((size_t)kGrid * 8, 0ull);
+                if (mcMemcpy(gg, d.lf->pre_ticks + 8, sizeof(gg),
+                             mcMemcpyDeviceToHost) != mcSuccess)
+                    return;
+                if (mcMemcpy(tg.data(), d.lf->pre_ticks + (size_t)kGrid * 16,
+                             tg.size() * sizeof(unsigned long long),
+                             mcMemcpyDeviceToHost) != mcSuccess)
+                    return;
+                if (rank != 0) return;
+                const unsigned long long period =
+                    (gg[1] != 0 && gg[0] > gg[1]) ? gg[0] - gg[1] : 0;
+                unsigned long long span_max = 0, smin = ~0ull, emax = 0;
+                int bi = -1;
+                for (int b = 0; b < kGrid; ++b) {
+                    const unsigned long long* q = &tg[(size_t)b * 8];
+                    if (q[0] == 0 || q[1] < q[0] || q[1] > (1ull << 60)) continue;
+                    if (q[1] - q[0] > span_max) { span_max = q[1] - q[0]; bi = b; }
+                    smin = std::min(smin, q[0]);
+                    emax = std::max(emax, q[1]);
                 }
-            }
-            std::vector<double> allrow((size_t)R * 13, 0.0);
-            double sendrow[13];
-            for (int i = 0; i < 12; ++i) sendrow[i] = rowv[i];
-            sendrow[12] = (double)maxtasks;
-            MPI_Gather(sendrow, 13, MPI_DOUBLE, allrow.data(), 13, MPI_DOUBLE, 0,
-                       MPI_COMM_WORLD);
-            if (rank == 0) {
-                std::printf("[phase] 单位=GPU 周期（clock64，block0 时间线）；trL1max/trL2max 需 R24_DIAG_PHASE=1\n");
-                std::printf("%-4s %9s %8s %8s %8s %8s %8s %8s %9s %8s %9s %9s %9s\n", "rank",
-                            "route", "publish", "xbar", "setup", "dispatch", "L1", "L2tail",
-                            "compute", "reduce", "chain", "trL1max", "trL2max");
-                for (int r = 0; r < R; ++r) {
-                    const double* q = allrow.data() + (size_t)r * 13;
-                    std::printf("%-4d %9.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %9.0f %8.0f %9.0f %9.0f %9.0f  tasks=%d\n",
-                                r, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8],
-                                q[9], q[10], q[11], (int)q[12]);
+                if (bi < 0) {
+                    std::printf("[span-%s] TPR=%d 无第三 bank 数据（需 -DR24_DIAG_PHASE=1 构建）\n",
+                                tag, tokens);
+                    std::fflush(stdout);
+                    return;
+                }
+                const unsigned long long* qb = &tg[(size_t)bi * 8];
+                const unsigned long long* q0 = &tg[0];
+                auto dd = [](unsigned long long hi, unsigned long long lo) {
+                    return hi >= lo ? hi - lo : 0ull;
+                };
+                std::printf("[span-%s] TPR=%d wall=%.2fus clk=%.0fc/us period=%llu | "
+                            "total=%llu kspan=%llu(b%d s+%llu in=%llu loop=%llu post=%llu) "
+                            "| b0span=%llu(in=%llu loop=%llu post=%llu)\n",
+                            tag, tokens, wall_us,
+                            (period && wall_us > 0) ? (double)period / wall_us : 0.0,
+                            period, emax - smin, span_max, bi, dd(qb[0], smin),
+                            dd(qb[2], qb[0]), dd(qb[3], qb[2]), dd(qb[1], qb[3]),
+                            dd(q0[1], q0[0]), dd(q0[2], q0[0]), dd(q0[3], q0[2]),
+                            dd(q0[1], q0[3]));
+                // [诊断·headroom 分解] reduce 时间戳（第三 bank block0 区 +4..+6；
+                // 无 reduce 发射（MX_SKIP_REDUCE）或未编译时恒 0）
+                if (q0[4] != 0) {
+                    const unsigned long long r_end = q0[6] != 0 ? q0[6] : q0[5];
+                    const unsigned long long next_start = period ? gg[0] + period : 0;
+                    std::printf("[spanR-%s] TPR=%d gap1=%llu rblk0=%llu rspan=%llu gap2=%llu"
+                                " wend=%lld\n",
+                                tag, tokens, dd(q0[4], emax), dd(q0[5], q0[4]),
+                                dd(r_end, q0[4]), next_start ? dd(next_start, r_end) : 0,
+                                gg[3] ? (long long)(gg[3] - emax) : 0LL);
+                } else {
+                    std::printf("[spanR-%s] TPR=%d reduce 未发射（时间戳为 0）\n", tag,
+                                tokens);
+                }
+                // [诊断·任务粒度] 第四 bank：单任务 span 分布（跨全部发射累计，
+                // 需 -DR24_DIAG_PHASE 构建；n = 该 block 累计任务数）
+                {
+                    std::vector<unsigned long long> t4((size_t)kGrid * 8, 0ull);
+                    if (mcMemcpy(t4.data(), d.lf->pre_ticks + (size_t)kGrid * 24,
+                                 t4.size() * sizeof(unsigned long long),
+                                 mcMemcpyDeviceToHost) == mcSuccess) {
+                        auto pr4 = [&](int b) {
+                            const unsigned long long* q = &t4[(size_t)b * 8];
+                            const unsigned long long n = q[3];
+                            std::printf(
+                                "[spanT-%s] TPR=%d b=%02d n=%llu tmin=%llu tmax=%llu tavg=%llu\n",
+                                tag, tokens, b, n, q[0], q[1],
+                                n ? q[2] / n : 0ull);
+                        };
+                        pr4(0);
+                        if (bi != 0) pr4(bi);
+                    }
+                }
+                // [诊断·reduce 逐块] 第五 bank：最晚 reduce 块的 token/自旋分解 +
+                // 逐切片全局自旋（累计值；waiters=80 发射 × 每块 ~32 等待线程）
+                {
+                    std::vector<unsigned long long> t5(256 * 8 + 64, 0ull);
+                    if (mcMemcpy(t5.data(), d.lf->pre_ticks + (size_t)kGrid * 32,
+                                 t5.size() * sizeof(unsigned long long),
+                                 mcMemcpyDeviceToHost) == mcSuccess) {
+                        unsigned long long smin5 = ~0ull, emax5 = 0;
+                        int bmax = -1, nblk = 0;
+                        for (int b = 0; b < 256; ++b) {
+                            const unsigned long long* q = &t5[(size_t)b * 8];
+                            if (q[0] == 0 || q[1] < q[0] || q[1] > (1ull << 60))
+                                continue;
+                            ++nblk;
+                            smin5 = std::min(smin5, q[0]);
+                            if (q[1] > emax5) { emax5 = q[1]; bmax = b; }
+                        }
+                        if (bmax >= 0) {
+                            int c50 = 0, c100 = 0, c200 = 0;
+                            for (int b = 0; b < 256; ++b) {
+                                const unsigned long long* q = &t5[(size_t)b * 8];
+                                if (q[0] == 0 || q[1] < q[0] || q[1] > (1ull << 60))
+                                    continue;
+                                if (q[1] - smin5 > 50000) ++c50;
+                                if (q[1] - smin5 > 100000) ++c100;
+                                if (q[1] - smin5 > 200000) ++c200;
+                            }
+                            const unsigned long long* q = &t5[(size_t)bmax * 8];
+                            std::printf(
+                                "[spanR2-%s] TPR=%d nblk=%d lastblk=%d token=%llu "
+                                "start+=%llu end+=%llu spin_sum=%llu waiters=%llu "
+                                "long_w=%llu top=(%llu,slot=%llu) | "
+                                "late50=%d late100=%d late200=%d\n",
+                                tag, tokens, nblk, bmax, q[4], q[0] - smin5,
+                                q[1] - smin5, q[2], q[3], q[6], q[5] >> 8,
+                                q[5] & 255ull, c50, c100, c200);
+                            const unsigned long long* g5 = &t5[256 * 8];
+                            std::printf(
+                                "[spanR3-%s] TPR=%d 逐切片自旋/等待: s0=%llu/%llu "
+                                "s1=%llu/%llu s2=%llu/%llu s3=%llu/%llu\n",
+                                tag, tokens, g5[0], g5[4], g5[1], g5[5], g5[2],
+                                g5[6], g5[3], g5[7]);
+                            // [spanR4] 逐 k 标记到达时刻（相对 reduce 起点，
+                            //   取该 k 下 4 个 slice 的最晚）
+                            const unsigned long long* g6 = &t5[256 * 8 + 16];
+                            std::printf("[spanR4-%s] TPR=%d 标记到达(k=topk槽):", tag,
+                                        tokens);
+                            for (int k = 0; k < 8; ++k) {
+                                unsigned long long arr = 0;
+                                for (int s = 0; s < 4; ++s)
+                                    arr = std::max(arr, g6[k * 4 + s]);
+                                if (arr) std::printf(" k%d=+%llu", k, dd(arr, q0[4]));
+                            }
+                            std::printf("\n");
+                        }
+                    }
                 }
                 std::fflush(stdout);
-            }
+            };
+#endif  // R24_DIAG_PHASE（dump_span：读第三/四/五 bank，仅诊断构建有数据）
+            // [诊断] 逐 rank 相位表：graph 稳态（reset 前读取 = 最后一次 replay）与
+            // eager（单发后读取）分开打印。行：route publish xbar setup dispatch
+            //   L1 L2tail compute reduce chain | trL1max trL2max maxtasks
+            auto phase_tables = [&](const char* tag, double wall_us) {
+                unsigned long long tp[16] = {0};
+                MYCHK(mcMemcpy(tp, d.lf->pre_ticks, sizeof(tp), mcMemcpyDeviceToHost));
+                std::vector<unsigned long long> tr((size_t)kGrid * 8, 0ull);
+                MYCHK(mcMemcpy(tr.data(), d.lf->pre_ticks + (size_t)kGrid * 8,
+                               tr.size() * sizeof(unsigned long long),
+                               mcMemcpyDeviceToHost));
+                int proc[kGrid] = {0};
+                MYCHK(mcMemcpy(proc, d.lf->out_processed, sizeof(proc),
+                               mcMemcpyDeviceToHost));
+                auto cyc = [&](int hi, int lo) {
+                    return (double)((long long)tp[hi] - (long long)tp[lo]);
+                };
+                double rowv[12];
+                rowv[0] = cyc(0, 6);
+                rowv[1] = cyc(1, 0);
+                rowv[2] = cyc(2, 1);
+                rowv[3] = cyc(3, 2);
+                rowv[4] = cyc(4, 3);
+                rowv[5] = cyc(5, 4);
+                rowv[6] = cyc(7, 5);
+                rowv[7] = cyc(7, 6);
+                rowv[8] = cyc(15, 7);
+                rowv[9] = cyc(15, 6);
+                unsigned long long l1max = 0, l2max = 0;
+                for (int b = 0; b < kGrid; ++b) {
+                    l1max = std::max(l1max, tr[(size_t)b * 8 + 0]);
+                    l2max = std::max(l2max, tr[(size_t)b * 8 + 1]);
+                }
+                rowv[10] = (double)l1max;
+                rowv[11] = (double)l2max;
+                int maxtasks = 0;
+                for (int b = 0; b < kGrid; ++b) maxtasks = std::max(maxtasks, proc[b]);
+                // 指定 rank 的逐 block 明细（需 R24_DIAG_PHASE=1；L1/L2 为 atomicAdd 累计周期）
+                if (const char* pr = std::getenv("MYBENCH_PHASE_RANK")) {
+                    if (std::atoi(pr) == rank) {
+                        std::printf("[phase-blk-%s] rank=%d wall=%.1fus block: L1 L2 pull move wait pw loop tail tasks\n",
+                                    tag, rank, wall_us);
+                        for (int b = 0; b < kGrid; ++b)
+                            std::printf("[phase-blk-%s] b=%02d %10llu %10llu %10llu %10llu %10llu %10llu %10llu %10llu %d\n",
+                                        tag, b, tr[(size_t)b * 8 + 0], tr[(size_t)b * 8 + 1],
+                                        tr[(size_t)b * 8 + 2], tr[(size_t)b * 8 + 5],
+                                        tr[(size_t)b * 8 + 6], tr[(size_t)b * 8 + 3],
+                                        tr[(size_t)b * 8 + 4], tr[(size_t)b * 8 + 7], proc[b]);
+                        unsigned long long m0 = 0, m1 = 0, m2 = 0, m3 = 0, m4 = 0, m5 = 0,
+                                           m6 = 0, m7 = 0;
+                        unsigned long long s2 = 0, s3 = 0, s5 = 0, s6 = 0, s7 = 0;
+                        for (int b = 0; b < kGrid; ++b) {
+                            const unsigned long long* q = &tr[(size_t)b * 8];
+                            m0 = std::max(m0, q[0]); m1 = std::max(m1, q[1]);
+                            m2 = std::max(m2, q[2]); m3 = std::max(m3, q[3]);
+                            m4 = std::max(m4, q[4]); m5 = std::max(m5, q[5]);
+                            m6 = std::max(m6, q[6]); m7 = std::max(m7, q[7]);
+                            s2 += q[2]; s3 += q[3]; s5 += q[5]; s6 += q[6]; s7 += q[7];
+                        }
+                        std::printf("[phase-sum-%s] max: L1=%llu L2=%llu pull=%llu move=%llu wait=%llu "
+                                    "pw=%llu loop=%llu tail=%llu | sum pull=%llu move=%llu wait=%llu "
+                                    "pw=%llu tail=%llu\n", tag, m0, m1, m2, m5, m6, m3, m4, m7,
+                                    s2, s5, s6, s3, s7);
+                        std::fflush(stdout);
+                    }
+                }
+                std::vector<double> allrow((size_t)R * 13, 0.0);
+                double sendrow[13];
+                for (int i = 0; i < 12; ++i) sendrow[i] = rowv[i];
+                sendrow[12] = (double)maxtasks;
+                MPI_Gather(sendrow, 13, MPI_DOUBLE, allrow.data(), 13, MPI_DOUBLE, 0,
+                           MPI_COMM_WORLD);
+                if (rank == 0) {
+                    std::printf("[phase-%s] 单位=GPU 周期（clock64，block0 时间线）；trL1max/trL2max 需 R24_DIAG_PHASE=1\n",
+                                tag);
+                    std::printf("%-4s %9s %8s %8s %8s %8s %8s %8s %9s %8s %9s %9s %9s\n", "rank",
+                                "route", "publish", "xbar", "setup", "dispatch", "L1", "L2tail",
+                                "compute", "reduce", "chain", "trL1max", "trL2max");
+                    for (int r = 0; r < R; ++r) {
+                        const double* q = allrow.data() + (size_t)r * 13;
+                        std::printf("%-4d %9.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %9.0f %8.0f %9.0f %9.0f %9.0f  tasks=%d\n",
+                                    r, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8],
+                                    q[9], q[10], q[11], (int)q[12]);
+                    }
+                    std::fflush(stdout);
+                }
+            };
+            phase_tables("graph", us);
+#if R24_DIAG_PHASE
+            dump_span("graph", us);
+#endif
+            mt::reset_dev(geo, d, routes, tokens);
+            MPI_Barrier(MPI_COMM_WORLD);
+            auto tw0 = std::chrono::steady_clock::now();
+            fp8mega::launch_full(a, d.st);
+            MYCHK(mcStreamSynchronize(d.st));
+            auto tw1 = std::chrono::steady_clock::now();
+            MPI_Barrier(MPI_COMM_WORLD);
+            const double eager_us =
+                std::chrono::duration<double, std::micro>(tw1 - tw0).count();
+            phase_tables("eager", eager_us);
+#if R24_DIAG_PHASE
+            dump_span("eager", eager_us);
+#endif
         }
 
         std::vector<double> all(R, -1.0);

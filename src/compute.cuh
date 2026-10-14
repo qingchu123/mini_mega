@@ -1041,8 +1041,17 @@ __device__ __forceinline__ void dispatch_pull_body(
     S.nslice_eff = nslice_eff;
     // [集71] 计数缓冲下传任务体
     S.ctr = ctr;
+#if R24_DIAG_PHASE
+    const unsigned long long t_loop0 = (tid == 0) ? clock64() : 0ull;
+    if (tid == 0 && S.pt != nullptr)
+        S.pt[(size_t)kGrid * 16 + (size_t)blockIdx.x * 8 + 2] = t_loop0;
+#endif
     int processed = 0;
     while (true) {
+#if R24_DIAG_PHASE
+        // [spanT] 单任务 span 起点（含领号/解码/ring 门 + 任务体 + 任务尾）
+        const unsigned long long t_tsk0 = (tid == 0) ? clock64() : 0ull;
+#endif
         // ---- 领号 + 解码 + ring 门（仅 tid0）----
         if (tid == 0) {
             // [L1L2-SPLIT] L2 阶段用静态任务划分（block b → {b, b+grid, ...}）：
@@ -1208,10 +1217,31 @@ __device__ __forceinline__ void dispatch_pull_body(
                 MX_CTR_ADD(ctr, kCtrL2DonePublish, h_pub ? 1 : 0);
             }
         }
+#if R24_DIAG_PHASE
+        // [spanT] 单任务 span 落盘（第四 bank：+0 min / +1 max / +2 sum / +3 n）
+        if (tid == 0 && S.pt != nullptr) {
+            const unsigned long long span = clock64() - t_tsk0;
+            unsigned long long* q4 =
+                S.pt + (size_t)kGrid * 24 + (size_t)blockIdx.x * 8;
+            if (processed == 1) q4[0] = span;
+            else atomicMin(&q4[0], span);
+            atomicMax(&q4[1], span);
+            atomicAdd(&q4[2], span);
+            atomicAdd(&q4[3], 1ull);
+        }
+#endif
         // 单波（任务数不超过 grid）做完首波即退出
         if (total_tasks <= (int)gridDim.x) break;
         __syncthreads();
     }
+#if R24_DIAG_PHASE
+    if (tid == 0 && S.pt != nullptr) {
+        const unsigned long long t_loop1 = clock64();
+        S.pt[(size_t)kGrid * 16 + (size_t)blockIdx.x * 8 + 3] = t_loop1;
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 4,
+                  t_loop1 - t_loop0);
+    }
+#endif
     // [集71] 任务循环结束 block 数 + 单 block 任务数 max/min
     if (tid == 0) {
         if constexpr (kPhase != MegaPhase::L1) {

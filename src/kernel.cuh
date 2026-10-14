@@ -50,6 +50,19 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
     __shared__ MegaArgs s_a;
     if (threadIdx.x == 0) s_a = a;
     if (kTick) a.rwk->lf.pre_ticks[6] = clock64();
+#if R24_DIAG_PHASE
+    // [诊断·第三 bank] 每 block 起始时间戳；block0 维护跨轮起始对（时钟探针）。
+    {
+        unsigned long long* pb =
+            a.rwk->lf.pre_ticks + (size_t)kGrid * 16 + (size_t)blockIdx.x * 8;
+        if (threadIdx.x == 0) pb[0] = clock64();
+        if (kTick) {
+            unsigned long long* lfp = a.rwk->lf.pre_ticks;
+            lfp[9] = lfp[8];
+            lfp[8] = pb[0];
+        }
+    }
+#endif
     mx_preclear_ct2(&a.rwk->lf, &a.unk->rf, &a.unk->rd,
                     /*skip_xbar=*/a.skip_prologue >= 2);
     __syncthreads();
@@ -109,6 +122,15 @@ __global__ void __launch_bounds__(512) mega_kernel(MegaArgs a) {
             &s_a, cyc, &s_ab.raw[0], nullptr, ctr);
     }
     if (kTick) a.rwk->lf.pre_ticks[15] = clock64();
+#if R24_DIAG_PHASE
+    // [诊断·第三 bank] 每 block 结束时间戳；block0 同步写全局结束槽。
+    if (threadIdx.x == 0) {
+        unsigned long long* pb =
+            a.rwk->lf.pre_ticks + (size_t)kGrid * 16 + (size_t)blockIdx.x * 8;
+        pb[1] = clock64();
+        if (blockIdx.x == 0) a.rwk->lf.pre_ticks[10] = pb[1];
+    }
+#endif
 }
 
 // [multi_compile] 显式实例化在 src/multi_compile/kernel_*.cu；此处抑制隐式实例化。

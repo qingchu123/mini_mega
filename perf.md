@@ -1816,3 +1816,61 @@ TK top50 mybench A/B（每产物 3 跑交替均值）：Δ 均值 **−14.35µs*
 e3485a54（旧 65bd0632 备份 `backup_pre_l2fix/`）。残余：TPR=49 仍高出 48↔64
 弦线 ~66µs（MT3→MT4 16 行 tile 量化 + 单窗任务并行度），属结构差。
 详录：README「coverage 均衡 21 点调研」8)。
+
+## [261014_21_59] agent/glm52a/opt：排空支配模型（__stwt≡普通写 ISA 实证）+ 17/18 断崖量化 —— 性能中性（生产路径零改动），含诊断基建
+
+> 结论性调查轮：单窗 TPR 49..64「慢」与 17/18 断崖的机制已定性。
+> **无可落地加速**（三实验证伪全部廉价杠杆），生产路径零改动，净产出 =
+> 机制结论 + 诊断基建（`R24_DIAG_PHASE`，生产布局逐字节兼容）+ 门禁记录。
+
+### 1. 关键发现：`__stwt` 在本平台与普通写位级同一编码（ISA 实证）
+
+- `k_stwt`/`k_plain`/`k_stwb` → `stg_b64 ... devc`（`bc 00 00 30…`），无写通语义；
+  仅 `__stcs`/`__stcg` 带 sysc 位（`bc 00 00 70…`）。volatile 读 = `ldx … sysc devc`
+  （与 `__ldcg` 同）。探针 `tmp/stwt_probe/probe2.cu` + `mxobjdump`
+  `--print-instruction-encoding`，命令见 README 9)。
+- 推论：全部跨 rank 推送（行 + 完成标记）实为**惰性缓存写**，到达对端靠驱逐/排空。
+  统一解释：标记在 mega 内 22.6k 周期前即写出（wend≈−23k）而 rspan 300–600k；
+  run 间 rspan 大幅波动（380k→605k）；`atomicOr(…,0)` 一致读探针无效果（`coh_ctrl.log`）。
+
+### 2. 排空支配：kspan+rspan ≈ 恒定，store 风味只搬家不加速
+
+6 点快筛（`-tprs 64,65,65,64,63,66`，W64，us_mean；诊断构建同基线语义）：
+
+| 实验（TPR=64） | period | kspan | rspan | wall µs |
+|---|---:|---:|---:|---:|
+| 基线 `__stwt`（spanw_ctrl） | 2.876M | 2.180M | 605k | 1480.7 |
+| MARK-STCS（标记→`__stcs`） | 2.928M | 2.414M | 406k | 1485.7 |
+| MARK-ATOMIC（标记→`atomicExch`） | 2.924M | 2.914M(in=194k) | 127k | 1571.1 |
+| ROW-STCS（行推送→`__stcs`） | 2.75–2.80M | 2.288M | 466k | 1489.2 |
+
+- `atomicExch` 把标记挪进请求路径后 rspan 崩塌（605k→127k）**但 kspan 同步 +500k、
+  period 不变**、wall 更差 → 迭代受外发总量/排空吞吐支配（D≈2–4GB/s/rank），
+  记账位置可移，墙不动。
+- **64 vs 65 结构差**：64 末波 = el7 整窗 768KB/rank 洪峰收尾（无遮挡）；65/66 的
+  el7 大窗在 wave1 完成、末尾 1–2 行 tiny 波吸收排空 → 快 ~180µs。非路径缺陷。
+
+### 3. 17/18 断崖量化：16 行 tile 量子（L2 tile2 空转固定开销）
+
+| TPR | 16 | 17 | 18 | 20 | 24 | 32 | 33 | 48 | 49 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| us_mean | 627 | 809 | 824 | 875 | 910 | 987 | 997 | 1178 | 1248 | 1493 |
+
+- 16→17 突增 **+184µs**：phase-blk 显示全部落在 mega loop 内；L2 相位在
+  17..24 全程平坦（16.3–17.2M ticks，不随行数下降）= 17 行必须开第 2 个 16 行
+  MMA tile，tile2 近空转仍付全价（~145µs 固定）。33/49 台阶经
+  [OPT-33]/[L1TUNE-D]/L2TUNE-49 已收敛至 +9/+70µs。
+- 修复不可行性：小档路径（≤16 行，compute.cuh:1181 分派）不支持 >16 行循环；
+  17 行在第 2 tile 中占 1 行，MTAct 裁剪无法跳过（16 行 tile 量化），需 M 维细分
+  或 win_cap 细分（win_cap=64 为 65 case 验证过的固定值，不可动）。
+
+### 4. 诊断基建与门禁
+
+- `R24_DIAG_PHASE=1`：5 时间戳 bank + mybench `span/spanR/spanT/spanR2/3/4/phase-blk`
+  输出；**生产构建（无 -D）`pre_ticks[kGrid*16]` 布局逐字节回归基线**
+  （`sizeof(rwk_data)=1543676672` 已核对），mybench 打印门控（生产零垃圾输出）。
+- 生产重建 `f6beeb10`（旧 e3485a54）：coverage 21 点全部 ±10µs 噪声带
+  （最大 TPR256 +21µs=0.6%）；`check --all` **762/762**（112.5s）。
+  差异归因 cucc 变体漂移（同源异码），双门禁等价。
+- 复现：README「coverage 均衡 21 点调研」9)；日志 `tmp/{spanw,stcs,matom,rowstcs,
+  cliff,tier}_ctrl.log`、`cov21_gate.log`、`check_all_gate.log`。
