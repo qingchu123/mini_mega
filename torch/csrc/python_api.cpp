@@ -16,6 +16,8 @@ int64_t mxk_rwk_bytes();
 int64_t mxk_unk_bytes();
 int mxk_select_win(const uint32_t* counts, int E, int cap_hint, int win_min);
 int mxk_group_ranks();
+int64_t mxk_rwk_ticks_off();
+int64_t mxk_ticks_count();
 }
 
 namespace mxk {
@@ -188,6 +190,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     return reinterpret_cast<int64_t>(b->sym); }, py::arg("buf"));
   m.def("symm_unk_ptr", [](mxk::SymmBuffer* b) {
     return reinterpret_cast<int64_t>(b->unk); }, py::arg("buf"));
+  // [TICKS] rwk 基址 + pre_ticks 偏移/槽数（诊断读 block0 时间线用）。
+  m.def("symm_rwk_ptr", [](mxk::SymmBuffer* b) {
+    return reinterpret_cast<int64_t>(b->rwk); }, py::arg("buf"));
+  m.def("rwk_ticks_off", []() { return mxk_rwk_ticks_off(); });
+  m.def("ticks_count", []() { return mxk_ticks_count(); });
   m.def("symm_sym_bytes", [](mxk::SymmBuffer* b) {
     return b->L.total_bytes; }, py::arg("buf"));
   m.def("symm_export_handles", [](mxk::SymmBuffer* b) {

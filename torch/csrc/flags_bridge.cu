@@ -40,4 +40,14 @@ int mxk_select_win(const uint32_t* counts, int E, int cap_hint, int win_min) {
   return mxk::select_win(counts, E, cap_hint, win_min);
 }
 
+// [TICKS] block0 时间线 pre_ticks 相对 rwk 基址的字节偏移 + 槽数（kGrid*16）。
+//   诊断用：host 拷回后按 mybench 同款下标解读（tp[6]=入口，tp[0]=route毕，
+//   tp[1]=publish毕，tp[2]=xbar毕，tp[3]=setup毕，tp[4]=dispatch毕，
+//   tp[5]=L1毕，tp[7]=L2/计算毕，tp[15]=出口）。kernel 零改动。
+int64_t mxk_rwk_ticks_off() {
+  return (int64_t)offsetof(rwk_data, lf) +
+         (int64_t)offsetof(local_flags, pre_ticks);
+}
+int64_t mxk_ticks_count() { return (int64_t)kGridBlocks * 16; }
+
 }  // extern "C"
