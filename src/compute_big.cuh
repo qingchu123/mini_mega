@@ -2450,13 +2450,21 @@ __device__ R19_BIG_ATTR void r19_big_task(
                     kHidden, nullptr, 0);
             }
         } else if (count > 48 && count <= 64 && f2 != nullptr &&
-                   (count % (4 * kM) == 0) &&
                    ((kIntermediate / 32) % R24_L2_KS == 0)) {
-            // [OPT-64] 49..64 档 L2 同样走 r24 A-smem（MT4 无掩码）
-            r24_l2_big<4, R24_L2_KS, 3, false, 4, kR24BPF, kBsmB>(
-                a_smem, f2, S.mt_total, w2_e, 0, count, kIntermediate,
-                kHidden, kL1BlockN, lane, warp, kComputeWarps,
-                S.l2_chk, g0_l2, g_l2, out_slot, kHidden, nullptr);
+            // [OPT-64] 49..64 档 L2 同样走 r24 A-smem（MT4）：整块 64 无掩码，
+            //   49..63 掩码（对齐 L1 的 [L1TUNE-D]）。原条件 count%64==0 只放行 64，
+            //   49..63 掉进 r19_l2_big<4,PF,3> 慢回退（W64 TPR49..63 断崖，
+            //   49 比线性趋势 +~160µs，54/60 为 coverage 命中点）。
+            if (count % (4 * kM) == 0)
+                r24_l2_big<4, R24_L2_KS, 3, false, 4, kR24BPF, kBsmB>(
+                    a_smem, f2, S.mt_total, w2_e, 0, count, kIntermediate,
+                    kHidden, kL1BlockN, lane, warp, kComputeWarps,
+                    S.l2_chk, g0_l2, g_l2, out_slot, kHidden, nullptr);
+            else
+                r24_l2_big<4, R24_L2_KS, 3, true, 4, kR24BPF, kBsmB>(
+                    a_smem, f2, S.mt_total, w2_e, 0, count, kIntermediate,
+                    kHidden, kL1BlockN, lane, warp, kComputeWarps,
+                    S.l2_chk, g0_l2, g_l2, out_slot, kHidden, nullptr);
         } else if (kAsyncL2) {
             // [R34] 同 L1：全块 + 尾块（尾块掩码；融合推送对两段都生效）
             const int full = count - count % (R19_L2_MT * kM);
