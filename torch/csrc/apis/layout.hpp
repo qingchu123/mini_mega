@@ -178,7 +178,13 @@ inline int64_t prod_smem(int R, int window, int block_n) {
                E * (int64_t)sizeof(int));
   const int64_t smem_data_aligned = ((smem_data + 15) / 16) * 16;
   const int64_t control = ((int64_t)8 * 2 + R + 2) * (int64_t)sizeof(int);
-  return smem_data_aligned + ((control + 127) / 128) * 128;
+  const int64_t base = smem_data_aligned + ((control + 127) / 128) * 128;
+  // [GS-SMEM-FIX] src/compute.cuh 的 [MX_GROUP_SCHED] smem 布局额外需要
+  //   s_count[8]+s_cum[9]+s_prefix[kGE*(R+1)]+s_gscount[kGE]+s_ge/s_gw[2*kGsMemberCap]，
+  //   R=32、kGroupRanks=4 时 = 2129*4 = 8516B > 上面 window=8 时的 ~8448B → 溢出
+  //   → 垃圾 ge → owner 越界远端 ATU。与 src/host_layout.cuh 的 gs 分支一致取 40KB。
+  const int64_t gs_smem = 40960;
+  return base > gs_smem ? base : gs_smem;
 }
 
 inline std::vector<int64_t> layout_to_vector(const SymmLayout& o) {

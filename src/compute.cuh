@@ -756,6 +756,10 @@ __device__ __forceinline__ void dispatch_pull_body(
                 s_nwin = mxk::gs_schedule_member(s_gscount, a->win_cap, gs_mem,
                                                  s_ge, s_gw, mxk::kGsMemberCap);
             __syncthreads();
+            // [GS-CAP] gs_schedule_member 只限写入不限返回（group_sched.cuh:192-200）；
+            //   返回窗口数 > smem 表容量时，后续按 seq 读 s_ge[seq] 越界到 s_gw/其它
+            //   smem → 垃圾 ge → owner 巨大 → unk_peers[owner] 远端 ATU。超容量回退 base。
+            if (s_nwin > mxk::kGsMemberCap) gs_on = false;
         }
     }
 #endif
