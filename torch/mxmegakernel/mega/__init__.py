@@ -46,7 +46,8 @@ _WIN_ADAPT_MIN = 48
 # [FIXED-WIN] 固定窗口容量（本 wheel 打包默认 48）：>0 时所有 launch 强制该 win，
 #   覆盖自适应。用 MXK_FORCE_WIN=0 恢复自适应、或设其它 16 倍数。值会被夹到
 #   [48, min(win_phys, num_max_tokens_per_rank)]，区间为空时回退逻辑窗口。
-_FORCE_WIN_DEFAULT = int(os.environ.get("MXK_FORCE_WIN", "0") or 0)
+_FIXED_WIN = 48   # [FIXED-WIN] 本包固定 win_cap=48（不受 MXK_FORCE_WIN/自适应影响）
+_FORCE_WIN_DEFAULT = 0
 
 # 物理窗口容量缺省：与调用方逻辑窗口解耦，按最大值分配（AUTO 表最大 80、
 # 长尾自适应最大 64）；可用 MXK_WIN_PHYS 覆盖（不超过 EXPERT_WINDOW_MAX）。
@@ -297,7 +298,7 @@ class SymmBuffer:
             # 避免合成均衡路由污染 _launch_cfg。
             _C.fp8_mega_moe(self._y_fp32, tl1.view(torch.uint8),
                             tl2.view(torch.uint8), self._impl, T, 1e30,
-                            int(self.expert_window), 0)
+                            _FIXED_WIN, 0)
             torch.cuda.synchronize()
         del l1, l2, tl1, tl2
         torch.cuda.empty_cache()
@@ -313,7 +314,7 @@ class SymmBuffer:
         #   与逐层常驻缓冲（~4.5GiB/层 × 层数）对大模型（GLM-5.2 78 层）不可承受；
         #   且均衡路由下 kernel 的 gs 倾斜门本就关闭、无需组权重。仅当显式
         #   MXK_GS_GROUP_GATHER=1（倾斜且显存允许的小规模/bench 场景）才聚合。
-        if os.environ.get("MXK_GS_GROUP_GATHER", "0") != "1":
+        if os.environ.get("MXK_GS_GROUP_GATHER", "1") != "1":   # [GS-ON] 默认开启组权重聚合
             return l1, l2
         try:
             gr = int(_C.mega_group_ranks())
@@ -579,6 +580,32 @@ def _is_stream_capturing() -> bool:
         return False
 
 
+_DUMP_CTR = [0]
+
+
+def _maybe_dump_topk(sym_buffer, num_tokens: int) -> None:
+    """[诊断] MXK_DUMP_TOPK=<dir>：把前 N 次调用的 topk_idx/weights 落盘（逐 rank），
+    供在本地 C++ check 里回放真实模型路由复现 gs 越界。默认不生效。"""
+    d = os.environ.get("MXK_DUMP_TOPK")
+    if not d or num_tokens <= 0 or _is_stream_capturing():
+        return
+    n = int(os.environ.get("MXK_DUMP_TOPK_N", "80"))
+    if _DUMP_CTR[0] >= n:
+        return
+    try:
+        os.makedirs(d, exist_ok=True)
+        r = int(sym_buffer.rank)
+        ti = sym_buffer.topk_idx[:num_tokens].detach().to("cpu").numpy()
+        tw = sym_buffer.topk_weights[:num_tokens].detach().to("cpu").numpy()
+        base = os.path.join(d, f"tk_r{r}_{_DUMP_CTR[0]:04d}")
+        ti.tofile(base + ".idx")
+        tw.tofile(base + ".wt")
+        open(base + ".meta", "w").write(f"{num_tokens} {ti.shape[1]}\n")
+        _DUMP_CTR[0] += 1
+    except Exception as e:  # noqa: BLE001
+        print(f"[mxmegakernel] MXK_DUMP_TOPK failed: {e}", flush=True)
+
+
 def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
                  l2_weights: torch.Tensor, sym_buffer: SymmBuffer,
                  cumulative_local_expert_recv_stats=None,
@@ -605,9 +632,10 @@ def fp8_mega_moe(y: torch.Tensor, l1_weights: torch.Tensor,
                 f"expert_window={ew} 超出 [8, {sym_buffer.win_phys}]")
         sym_buffer.expert_window = ew
     # 逐 launch 配置：eager 按路由自适应，capture 复用缓存。
-    win_cap, skip = sym_buffer.launch_config(num_tokens)
+    win_cap, skip = _FIXED_WIN, 0   # [FIXED-WIN] 固定 48
     # [GS] 组权重 all-gather（capture 前建缓存，capture 内复用）。
     l1_weights, l2_weights = sym_buffer.group_weights(l1_weights, l2_weights)
+    _maybe_dump_topk(sym_buffer, num_tokens)
     # 首次 launch 兜底预热（建档预热失败时）：捕获中禁止，避免捕获流阻塞。
     if not getattr(sym_buffer, "_mega_moe_warmed", False):
         sym_buffer._mega_moe_warmed = True
@@ -655,7 +683,7 @@ def fp8_mega_moe_compute(l1_weights: torch.Tensor, l2_weights: torch.Tensor,
             raise ValueError(
                 f"expert_window={ew} 超出 [8, {sym_buffer.win_phys}]")
         sym_buffer.expert_window = ew
-    win_cap, skip = sym_buffer.launch_config(num_tokens)
+    win_cap, skip = _FIXED_WIN, 0   # [FIXED-WIN] 固定 48
     # [GS] 组权重 all-gather（同 fp8_mega_moe）。
     l1_weights, l2_weights = sym_buffer.group_weights(l1_weights, l2_weights)
     _C.fp8_mega_moe_compute(l1_weights.view(torch.uint8),

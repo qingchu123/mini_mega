@@ -44,6 +44,14 @@ cxx_flags = [
     f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
 ]
 
+# [GS] 组内 rank 数需与 kernel（scripts/build.sh 的 KERNEL_CFLAGS）一致，否则
+#   mxk_group_ranks()/组权重 all-gather 的块数与 kernel 期望不符。用同一 env
+#   透传 `-DMX_GROUP_RANKS=<N>`（缺省不定义 → 走 common.cuh 默认 4）。
+_grp = os.environ.get("MXK_GROUP_RANKS")
+if _grp:
+    cxx_flags.append(f"-DMX_GROUP_RANKS={int(_grp)}")
+    print(f"[setup] MX_GROUP_RANKS={int(_grp)}", flush=True)
+
 sources = [
     os.path.join("csrc", "python_api.cpp"),
     os.path.join("csrc", "kernel_bridge.cpp"),
