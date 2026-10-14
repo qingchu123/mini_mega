@@ -145,6 +145,30 @@ pair，实录 skew 14.56x / 40 个零专家 / 单专家 max 233 / 每 rank 收�
 - **回归探针**：`MT_GS_MEMBER_ONLY=1 scripts/run.sh check --smoke`（~5s）会复现同类
   发散（check 用"仅本 rank 块"权重模拟缺 all-gather）。
 
+## gs-on 模型 ATU 修复（`[261014_06_00]`，commit `b82bbd5`）
+
+GLM-5.2 模型上 `MXK_GS_GROUP_GATHER=1`（gs 默认开）持续报
+`Xnack Error/ATU Fault(0x8)`（`mega_kernel<true,MegaPhase::0>`，集中在同一 gs 组
+rank 5/13/21/29），bench 无法跑完。
+
+- **根因**：`[MX_GROUP_SCHED]` 下 kernel 动态 smem 布局为
+  `s_count[8]+s_cum[9]+s_prefix[kGE*(R+1)]+s_gscount[kGE]+s_ge[512]+s_gw[512]`
+  = **2129 int = 8516B**（R=32、kGroupRanks=4），而 torch 发射侧
+  `torch/csrc/apis/layout.hpp::prod_smem`（`mega.hpp:259` 按 `window=8` 调用）只给
+  **8448B** → `s_prefix/s_gscount/s_ge/s_gw` **溢出到越界 smem** → 读到垃圾 `ge`/owner
+  → `unk_peers[owner]` 远端越界 → ATU。**bench/test 走 `src/host_layout.cuh` 的 40KB
+  分支故不复现**（本地单进程共享内存，物理上也无法复现 IPC/ATU）。
+- **修复**：`layout.hpp::prod_smem` 与 `host_layout.cuh` 一致，取 `max(原公式, 40960)`；
+  另加 `[GS-CAP]` 钳位（`gs_schedule_member` 只限写入不限返回，`s_nwin>kGsMemberCap`
+  时回退 base 路径）；`MX_GS_SKEW_NUM` 默认 3→0（恒启用 gs）。
+- **验证（模型 10.0.82.71，GLM-5.2-FP8，EP=32，MTP=512，win48）**：
+  `gs-on` bench **跑完、ATU=0**，Mean TPOT **26.78ms**、Output **4525 tok/s**
+  （优于 base 30.62ms / 4002 tok/s）；`check --all` **762/762**。
+- **排查过程**：否定跨 rank desync（32 rank round 全同步）；否定本地复现；
+  `kMaxTPR 512→768`（精确==模型 `slot_cap`）使 ATU 从 round ~16000 推迟到 ~141000
+  （量化了"越界随轮数漂移"）；`MX_GROUP_RANKS=1`（无跨 rank 远端读）→ ATU=0，把问题
+  锁定到 gs 跨 rank 路径。
+
 ## 测试（R=32 TPR=16/64/256）
 
 ```bash

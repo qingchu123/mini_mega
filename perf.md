@@ -1749,3 +1749,25 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
 ### 说明
 - 仅倾斜路由净收益；均衡路由有回退。默认开启为人类决定，后续需解决均衡回退。
 - `-DMX_GROUP_SCHED=0` 行为与 f0abe9e 之前默认逐字节一致（同一 gs_cap=false 路径）。
+
+## [261014_06_00] agent/gsfix：**修复 gs-on 模型 ATU**（commit `b82bbd5`）— gs-on 首次跑通且更快
+
+> 根因：`torch/csrc/apis/layout.hpp::prod_smem`（`mega.hpp:259` 按 `window=8` 调用）
+> 只给 ~8448B，而 `[MX_GROUP_SCHED]` kernel 动态 smem 需 **8516B**（R=32、kGroupRanks=4）
+> → `s_prefix/s_gscount/s_ge/s_gw` 越界 → 垃圾 `ge`/owner → 远端 ATU。bench 走
+> `host_layout.cuh` 的 40KB 故不复现。修复：`prod_smem` 取 `max(原公式, 40960)`；
+> 加 `[GS-CAP]` 钳位；`MX_GS_SKEW_NUM` 默认 3→0。另 `kMaxTPR 512→768`（精确==`slot_cap`）。
+
+模型：GLM-5.2-FP8 @ 10.0.82.71，EP=32，MTP=512，win48，CUDA graph decode，
+16k/1k、bs128、prefix-cache99%、`bench_serving.sh decode`：
+
+| 配置 | ATU | bench | Mean TPOT (ms) | Output (tok/s) |
+|---|---|---:|---:|---:|
+| base（gs off，win48） | 0 | 完成 | 30.62 | 4002 |
+| **gs-on（本修复，`b82bbd5`）** | **0** | **完成** | **26.78** | **4525** |
+
+> 结论：gs-on 修复后**首次跑通**，且 TPOT **−12.5%**（30.62→26.78ms）、
+> Output **+13%**（4002→4525 tok/s）。`check --all` 762/762。
+> 排查量化：`kMaxTPR` 512→768 使 ATU 从 round ~16000 推迟到 ~141000；
+> `MX_GROUP_RANKS=1`（无跨 rank 远端读）→ ATU=0，锁定 gs 跨 rank 路径。
+
