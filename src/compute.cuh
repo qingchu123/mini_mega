@@ -688,7 +688,7 @@ __device__ __forceinline__ void dispatch_pull_body(
     int* s_cum = s_count + kEPR;                       // EPR+1：窗口前缀（任务解码）
     int* s_prefix = s_cum + kEPR + 1;                  // EPR*(R+1)：全 experts src 前缀
     __shared__ int s_task, s_expert, s_window, s_count_w, s_slice, s_kseg;
-    __shared__ int s_owner, s_seq, s_nwin, s_gsskew;
+    __shared__ int s_owner, s_seq, s_nwin, s_gsskew, s_gsfb;
     __shared__ unsigned s_epoch;
     // prefix 表 = 本 rank 私有 rwk->ld.prefix_tbl（rank 内读写）
     const int* prefix = &a->rwk->ld.prefix_tbl[0][0];
@@ -708,7 +708,132 @@ __device__ __forceinline__ void dispatch_pull_body(
     int* s_gscount = s_prefix + kGE * (a->R + 1);
     int* s_ge = s_gscount + kGE;
     int* s_gw = s_ge + mxk::kGsMemberCap;
-    if (gs_cap) {
+    // [GS-BCAST] 倾斜判定+LPT 只由 block0 做（1024 FG 读×1），结果经 gs_mail
+    //   邮箱广播；其余 block 自旋等 (epoch,~epoch) 双字握手后拷入 smem。
+    //   判定/LPT 与原来逐字一致；均衡 case 下 31 个 block 省全部 FG 读。
+    //   超时/坏值回退 legacy 自算（保正确）；mailbox 命中即复用（R38/L2 分相
+    //   同 epoch 下输入相同，值必然一致）。
+    if (gs_cap && (a->R + 1) <= local_flags::kGsMailPfxStride &&
+        mxk::kGsMemberCap <= (int)local_flags::kGsMailGeCap) {
+        local_flags* lf = &a->rwk->lf;
+        // 本 launch 唯一 epoch（task_setup 已发布，各 block 读到相同值）。
+        const uint32_t gs_epoch = lf->bar[cycle][(int)kBarTaskReadyIdx];
+        const bool leader = (blockIdx.x == 0);
+        // 判定+LPT 本体（leader 必走；非 leader 仅回退时走；块内全线程统一调用）。
+        auto gs_detect = [&]() {
+        if (tid < kGE) s_gscount[tid] = 0;
+        __syncthreads();
+        for (int i = tid; i < kGE * a->R; i += (int)blockDim.x) {
+            const int ge = i / a->R;
+            const int r = i % a->R;
+            const int m = ge / kEPR;
+            const int le = ge % kEPR;
+            const int o = mxk::gs_rank_of_member(a->R, gs_grp, m);
+            const int v =
+                (int)a->unk_peers[o]->rd.expert_recv_counts[cycle][r][le];
+            s_prefix[ge * (a->R + 1) + r] = v;   // 暂存原值，供后续原地建前缀
+            atomicAdd(&s_gscount[ge], v);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int mx = 0;
+            long long sum = 0;
+            for (int i = 0; i < kGE; ++i) {
+                if (s_gscount[i] > mx) mx = s_gscount[i];
+                sum += s_gscount[i];
+            }
+            s_gsskew = (sum > 0) &&
+                       ((long long)mx * kGE > (long long)MX_GS_SKEW_NUM * sum);
+        }
+        __syncthreads();
+        gs_on = (s_gsskew != 0) && (a->group_weights_ready != 0);
+        if (gs_on) {
+            // 原地把暂存的原值转成前缀和（s_prefix[ge*(R+1)+src]=Σ_{r'<src} 计数）；
+            //   无需再读 peer FG（省一遍串行远端读）。
+            for (int ge = tid; ge < kGE; ge += (int)blockDim.x) {
+                int c = 0;
+                for (int r = 0; r < a->R; ++r) {
+                    const int v = s_prefix[ge * (a->R + 1) + r];
+                    s_prefix[ge * (a->R + 1) + r] = c;
+                    c += v;
+                }
+                s_prefix[ge * (a->R + 1) + a->R] = c;
+                s_gscount[ge] = c;
+            }
+            __syncthreads();
+            // 单线程桶式 LPT（无 scratch，O(cost × 窗口数)，开销可忽略）。
+            if (tid == 0)
+                s_nwin = mxk::gs_schedule_member(s_gscount, a->win_cap, gs_mem,
+                                                 s_ge, s_gw, mxk::kGsMemberCap);
+            __syncthreads();
+            // [GS-CAP] gs_schedule_member 只限写入不限返回（group_sched.cuh:192-200）；
+            //   返回窗口数 > smem 表容量时，后续按 seq 读 s_ge[seq] 越界到 s_gw/其它
+            //   smem → 垃圾 ge → owner 巨大 → unk_peers[owner] 远端 ATU。超容量回退 base。
+            if (s_nwin > mxk::kGsMemberCap) gs_on = false;
+        }
+        };  // gs_detect
+        if (leader) {
+            gs_detect();
+            // 发布：payload（仅 on 时拷表；off 时只发 on+epoch）→ 同步 → fence
+            //   → 双字 epoch（release，等待侧照 task_ready 同款模式）。
+            if (gs_on) {
+                const int npfx = kGE * (a->R + 1);
+                for (int i = tid; i < mxk::kGsMemberCap; i += (int)blockDim.x) {
+                    lf->gs_mail_ge[cycle][i] = s_ge[i];
+                    lf->gs_mail_gw[cycle][i] = s_gw[i];
+                }
+                for (int i = tid; i < kGE; i += (int)blockDim.x)
+                    lf->gs_mail_cnt[cycle][i] = s_gscount[i];
+                for (int i = tid; i < npfx; i += (int)blockDim.x)
+                    lf->gs_mail_pfx[cycle][i] = s_prefix[i];
+                lf->gs_mail_nwin[cycle] = s_nwin;
+            }
+            __syncthreads();
+            __threadfence();
+            lf->gs_mail_on[cycle] = gs_on ? 1u : 0u;
+            lf->gs_mail_epoch[cycle] = gs_epoch;
+            lf->gs_mail_epoch_inv[cycle] = ~gs_epoch;
+        } else {
+            // 等待：tid0 自旋（超时计入 s_gsfb 全块统一回退，避免线程分歧 hang）。
+            if (tid == 0) {
+                volatile const uint32_t* mep = &lf->gs_mail_epoch[cycle];
+                volatile const uint32_t* meq = &lf->gs_mail_epoch_inv[cycle];
+                long long spin = 0;
+                while (*mep != gs_epoch || *meq != ~gs_epoch) {
+                    if (++spin > (long long)a->max_spins) break;
+                }
+                s_gsfb = (spin > (long long)a->max_spins) ? 1 : 0;
+            }
+            __syncthreads();
+            if (s_gsfb != 0) {
+                gs_detect();   // 超时回退：自己算（保正确，慢路）
+            } else {
+                __threadfence();
+                gs_on = lf->gs_mail_on[cycle] != 0u;
+                if (gs_on) {
+                    s_nwin = lf->gs_mail_nwin[cycle];
+                    const int npfx = kGE * (a->R + 1);
+                    for (int i = tid; i < mxk::kGsMemberCap; i += (int)blockDim.x) {
+                        s_ge[i] = lf->gs_mail_ge[cycle][i];
+                        s_gw[i] = lf->gs_mail_gw[cycle][i];
+                    }
+                    for (int i = tid; i < kGE; i += (int)blockDim.x)
+                        s_gscount[i] = lf->gs_mail_cnt[cycle][i];
+                    for (int i = tid; i < npfx; i += (int)blockDim.x)
+                        s_prefix[i] = lf->gs_mail_pfx[cycle][i];
+                }
+                __syncthreads();
+                // 范围保险：坏值（垃圾/撕裂）回退自算。
+                bool ok = true;
+                if (gs_on) {
+                    ok = (s_nwin >= 0) && (s_nwin <= mxk::kGsMemberCap) &&
+                         (s_nwin == 0 ||
+                          (s_ge[0] >= 0 && s_ge[0] < kGE));
+                }
+                if (!ok) gs_detect();
+            }
+        }
+    } else if (gs_cap) {
         // 组倾斜判定：并行统计本组 4 个 owner 的 32 专家总计数（1024 次 FG 读，
         //   blockDim 线程并行 + smem atomicAdd；均衡负载下这是唯一额外开销）。
         if (tid < kGE) s_gscount[tid] = 0;

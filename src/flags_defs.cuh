@@ -27,6 +27,11 @@
 
 #include "common.cuh"
 
+// mailbox 维度需要组 rank 数：与 group_sched.cuh 同款默认（命令行 -D 覆盖二者）。
+#ifndef MX_GROUP_RANKS
+#define MX_GROUP_RANKS 4
+#endif
+
 // 相邻 block 的 current_time 不共享 cache line（对齐参考实现 NO_CACHE）。
 // 每 block 占用 MX_FLAGS_NO_CACHE 个 int64 = 512B，独立于邻块。
 constexpr int MX_FLAGS_NO_CACHE = 64;
@@ -63,6 +68,23 @@ struct alignas(256) local_flags {
     // [M_CYCLE] 旋转维：本轮只用 bar[c]，同一槽位每 M_CYCLE 轮才复用一次。
     alignas(256) uint32_t bar[M_CYCLE][kFp8BarFlagsNumInt32];
 
+    // [GS-BCAST] 组调度广播邮箱：block0 做倾斜判定+LPT，其余 block 自旋取。
+    //   payload 先写、syncthreads、fence，最后写 (epoch,~epoch) 双字握手；
+    //   M_CYCLE 旋转槽（与 dispatch 的 cycle 同槽）。首轮内存垃圾不可能恰好
+    //   等于 (E,~E)（E>=1 恒成立），天然安全。
+    //   容量：ge/gw 按 kGsMemberCap 上限 512（compute.cuh 用 if constexpr 回退
+    //   超限构建）；cnt/pfx 按 kEPR*MX_GROUP_RANKS（即 kGE，结构体在此定义之后，
+    //   故用表达式）；pfx 步长 33（R<=32，超限走 legacy）。
+    static constexpr int kGsMailGeCap = 512;
+    static constexpr int kGsMailPfxStride = 33;
+    alignas(256) uint32_t gs_mail_epoch[M_CYCLE];
+    alignas(256) uint32_t gs_mail_epoch_inv[M_CYCLE];
+    alignas(256) uint32_t gs_mail_on[M_CYCLE];
+    alignas(256) int gs_mail_nwin[M_CYCLE];
+    alignas(256) int gs_mail_ge[M_CYCLE][512];
+    alignas(256) int gs_mail_gw[M_CYCLE][512];
+    alignas(256) int gs_mail_cnt[M_CYCLE][kEPR * MX_GROUP_RANKS];
+    alignas(256) int gs_mail_pfx[M_CYCLE][kEPR * MX_GROUP_RANKS * 33];
     // ---- 控制/诊断状态（原 MegaArgs 独立指针迁入）----
     alignas(256) int out_total[kGrid];       // 每 block 总窗口数（TASK_SETUP 写）
     alignas(256) int out_processed[kGrid];   // 每 block 处理任务数（任务循环写）
