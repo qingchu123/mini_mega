@@ -1756,7 +1756,8 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
 > 只给 ~8448B，而 `[MX_GROUP_SCHED]` kernel 动态 smem 需 **8516B**（R=32、kGroupRanks=4）
 > → `s_prefix/s_gscount/s_ge/s_gw` 越界 → 垃圾 `ge`/owner → 远端 ATU。bench 走
 > `host_layout.cuh` 的 40KB 故不复现。修复：`prod_smem` 取 `max(原公式, 40960)`；
-> 加 `[GS-CAP]` 钳位；`MX_GS_SKEW_NUM` 默认 3→0。另 `kMaxTPR 512→768`（精确==`slot_cap`）。
+> 加 `[GS-CAP]` 钳位；`MX_GS_SKEW_NUM` 默认改 **2**。`kMaxTPR`/`kMaxCombineRows` 曾试
+> 512→768/1024（发现只是"推迟"ATU；真因确认后在 `[261014_07_00]` 回 512）。
 
 模型：GLM-5.2-FP8 @ 10.0.82.71，EP=32，MTP=512，win48，CUDA graph decode，
 16k/1k、bs128、prefix-cache99%、`bench_serving.sh decode`：
@@ -1764,10 +1765,23 @@ sym scratch 中的 `expert_tokens`/`prefix_tbl` 槽**保留未删**（`L.expert_
 | 配置 | ATU | bench | Mean TPOT (ms) | Output (tok/s) |
 |---|---|---:|---:|---:|
 | base（gs off，win48） | 0 | 完成 | 30.62 | 4002 |
-| **gs-on（本修复，`b82bbd5`）** | **0** | **完成** | **26.78** | **4525** |
+| gs-on（`b82bbd5`，kMaxTPR=768, SKEW=0） | 0 | 完成 | 26.78 | 4525 |
+| **gs-on（`5dd7ced`，kMaxTPR=512, SKEW=2）** | **0** | **完成** | **26.33** | **4610** |
 
-> 结论：gs-on 修复后**首次跑通**，且 TPOT **−12.5%**（30.62→26.78ms）、
-> Output **+13%**（4002→4525 tok/s）。`check --all` 762/762。
-> 排查量化：`kMaxTPR` 512→768 使 ATU 从 round ~16000 推迟到 ~141000；
-> `MX_GROUP_RANKS=1`（无跨 rank 远端读）→ ATU=0，锁定 gs 跨 rank 路径。
+> 结论：gs-on 修复后**首次跑通**，TPOT **−14%**（30.62→26.33ms）、Output **+15%**
+> （4002→4610 tok/s）；`kMaxTPR=512`（原始值）即足够，ATU 真因是 torch smem 溢出。
+> `check --all` 762/762。
+
+本地 `mybench`（R=32，均衡/倾斜，`us_mean`）：
+
+| 配置 | s1 TPR16 | s1 TPR32 | s1 TPR256 | s2 top50 mean |
+|---|---:|---:|---:|---:|
+| SKEW=0（曾默认） | 411 | 530 | 1804 | 583.6 |
+| **SKEW=2（当前默认）** | 379 | 457 | 1625 | 584.7 |
+| SKEW=3 | 366 | 471 | 1639 | 586.4 |
+
+> `s2 top50`（真实倾斜路由）与 SKEW_NUM 无关（2/3/0 都会启用 gs）；差异只在**均衡** s1：
+> SKEW=0 差、2 与 3 相当且远优于 0。kMaxTPR 512 vs 768 对本地 bench 基本无影响。
+> 热路径无调试代码（printf 全部 env/测试门控）。
+
 
