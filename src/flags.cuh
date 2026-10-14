@@ -103,8 +103,12 @@ __device__ __forceinline__ void mx_preclear_ct2(local_flags* lf,
                                                 bool skip_xbar = false) {
     const int c0 = (int)(lf->current_time[blockIdx.x][0] % M_CYCLE);
     const int ct2 = (c0 + 2) % M_CYCLE;
-    for (int i = (int)threadIdx.x; i < kFp8BarFlagsNumInt32;
-         i += (int)blockDim.x)
+    // [P-SHARD] 跨 block 分片：32 block 原来各清全量（~2MB×32 重复写），现
+    //   按全 grid lane 分片恰好覆盖一次。同 stream 内 launch 顺序执行、清零
+    //   幂等，ct2 槽两轮后才被读，分片安全。
+    const int lane = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int stride = (int)(gridDim.x * blockDim.x);
+    for (int i = lane; i < kFp8BarFlagsNumInt32; i += stride)
         lf->bar[ct2][i] = 0u;
     // [GS-CLEAR] 数据槽预清：src_index_table/expert_recv_counts 每轮只写 [0,count)，
     //   行尾残留上一次（M_CYCLE 轮前）的值；gs helper 若读到行尾 slot 会取到陈旧
@@ -113,16 +117,16 @@ __device__ __forceinline__ void mx_preclear_ct2(local_flags* lf,
     {
         const int nt = kEPR * kRanks * kMaxTPR;   // src_index_table 单 cycle 片
         uint32_t* t = &rd->src_index_table[ct2][0][0][0];
-        for (int i = (int)threadIdx.x; i < nt; i += (int)blockDim.x) t[i] = 0u;
+        for (int i = lane; i < nt; i += stride) t[i] = 0u;
         const int nc = kRanks * 64;               // expert_recv_counts 单 cycle 片
         uint32_t* rc = &rd->expert_recv_counts[ct2][0][0];
-        for (int i = (int)threadIdx.x; i < nc; i += (int)blockDim.x) rc[i] = 0u;
+        for (int i = lane; i < nc; i += stride) rc[i] = 0u;
     }
     // [R38] 复用前序节点跳过 xbar（该相位不执行），xbar_barrier 的旧值由 epoch
     //   单调性保证安全（读侧判 *mine - epoch >= 0），无需清零。
     if (skip_xbar) return;
     const int n = kGrid * kGrid;
-    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x)
+    for (int i = lane; i < n; i += stride)
         rf->xbar_barrier[ct2][i / kGrid][i % kGrid] = 0u;
 }
 
