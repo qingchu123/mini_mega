@@ -629,3 +629,176 @@ bash scripts/mx_scripts/run_mega_moe_all.sh --num-processes 32 \
 | REDUCE 融合进 mega 尾（`MXK_FUSE_REDUCE`） | 旧结论 −0.8%；新口径 REDUCE 本身仅 ~0.3µs，问题在尾部同步，融合不解决 |
 | coverage（均衡 21 点）整体优化 | 0/21；差距 = 固定 167µs + 4.28µs/token。断崖在 count>16 后 L2tail 尾部同步（+66µs）与 dispatch 随行数线性（+149µs@nt24→54），非 GEMM |
 | mybench 作为性能口径 | 间歇 NoBinaryForGpu、单点抖动 20%+；性能决策一律改用 harness + wheel（已验证 NoBinary=0） |
+
+---
+
+## coverage 均衡 21 点调研（2026-10-14，`agent/glm52a/opt` 分支）
+
+背景：65 fixed-case（倾斜路由）已到 64/65@1.176x，但 coverage 均衡 21 点
+（`--routing-mode coverage`，tokens=1..256，32 rank 负载严格均匀）仍是 0/21
+（0.54–0.81x）。本节记录根因定位的机制发现、实验数据与复现方法。所有实验在独立
+工作区 `mini_mega/.agents/work/glm52a/wt`（分支 `agent/glm52a/opt`）内执行。
+
+### 1) 现状复现（口径一致）
+
+`rd_cov_glm52a/summary.tsv`（本轮）与 `rd_cov_w64/summary.tsv`（历史）逐点差 ≤2%；
+mega 计时=图 50-in-1（graph_reps=50）+ bench_kineto 核时求和（核名
+`mega_reduce_kernel`+`mega_kernel`），rankavg，ms：
+
+| tokens | window(逻辑*) | baseline | mega | speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 8 | 0.3086 | 0.4153 | 0.74 |
+| 2 | 8 | 0.3224 | 0.4229 | 0.76 |
+| 4 | 8 | 0.3540 | 0.4439 | 0.80 |
+| 6 | 8 | 0.3705 | 0.4597 | 0.81 |
+| 8 | 8 | 0.3786 | 0.4809 | 0.79 |
+| 12 | 16 | 0.4260 | 0.5344 | 0.80 |
+| 18 | 24 | 0.5118 | 0.7703 | 0.66 |
+| 24 | 24 | 0.5037 | 0.8553 | 0.59 |
+| 30 | 32 | 0.5583 | 0.9168 | 0.61 |
+| 36 | 48 | 0.6275 | 0.9755 | 0.64 |
+| 42 | 48 | 0.6677 | 1.0522 | 0.64 |
+| 48 | 48 | 0.7004 | 1.1239 | 0.62 |
+| 54 | 64 | 0.7477 | 1.3630 | 0.55 |
+| 60 | 64 | 0.7902 | 1.4756 | 0.54 |
+| 66 | 80 | 0.8628 | 1.2155 | 0.71 |
+| 72 | 80 | 0.9038 | 1.2559 | 0.72 |
+| 78 | 80 | 0.9316 | 1.3348 | 0.70 |
+| 84 | 48 | 0.9773 | 1.4696 | 0.67 |
+| 90 | 48 | 1.0115 | 1.5660 | 0.65 |
+| 128 | 64 | 1.2731 | 2.2399 | 0.57 |
+| 256 | 64 | 2.5142 | 3.5902 | 0.70 |
+
+\* window 列=harness `compare-window` 打印的 `select_fp8_mega_moe_window()` 返回值，
+**不是**计时 launch 的实跑窗口（见 2）。
+
+coverage 分布（harness `compare-routing` 行）：total_pairs=tokens×256、
+load_per_rank=8×tokens（min=max，严格均衡）→ 每本地专家行数 = 每 rank tokens。
+
+### 2) 关键发现：wheel `_FIXED_WIN=64` —— 计时 launch 恒用 win_cap=64
+
+- `torch/mxmegakernel/mega/__init__.py:50`：`_FIXED_WIN = 64`；`fp8_mega_moe` /
+  `fp8_mega_moe_compute` 内 `win_cap, skip = _FIXED_WIN, 0`（:636/:687，注释残留
+  “固定 48”）；C++ 侧 `wc = (win_cap>0) ? win_cap : b->win`（`mega.hpp`
+  `make_mega_args`）→ 所有计时 launch 实跑 64。
+- harness 的 `compare-window` 行（8/16/…/64/80）只写入 `sym_buffer.expert_window`
+  （逻辑窗口：参与 launch 校验 ew∈[8, win_phys] 与 warmup），对计时 launch 无效；
+  `DG_MEGA_WIN_AUTO` 在 wheel 内无读取点（仅 harness CLI 帮助文本提及）。
+- 交叉验证：mybench `MT_FORCE_WIN=64` 与 harness coverage 逐点吻合（TPR=1:
+  415.7 vs 415.3；66: 1257.6 vs 1215.5；128: 2372 vs 2240；256: 3699 vs 3590；
+  mybench 系统偏高 1–6%），而 W48/W96 与 harness 数值明显偏离 → 证实计时恒 64。
+- 该 64 为 65 fixed-case 实测全局最优（commit 058f769），**保持默认**；下文的
+  逐点窗口仅为实验记录/待验证优化，不改默认。
+
+### 3) 实验 A：固定窗口扫描（MT_FORCE_WIN，mybench -R 32 -s 1，us_mean）
+
+| W \ TPR | 54 | 66 | 128 |
+|---:|---:|---:|---:|
+| 32 | 1390 | 1387 | 2424 |
+| 48 | **1137** | 1434 | 2269 |
+| 64 | 1446 | **1260** | 2318 |
+| 96 | 1505 | 1683 | **2229** |
+| 128 | 1505 | 1704 | 2809 |
+
+- 逐点最优≠全局：54 想 win48（−309µs vs 64）、66 想 win64（已最优）、128 想 win96
+  （−89µs）；单一全局窗口无法同时最优。
+- 非单调：win64 下 harness nt=60=1475.6µs > nt=66=1215.5µs（多 6 token 反快
+  260µs；nt=66 起每专家行数 66>64 → 每专家分 2 窗 64+2）。机制未完全归因
+  （候选：窗划分→两段流水、staging stride、`R19_BLOCK_KSPLIT_WINMAX=64` 门控组合）。
+- 窗口敏感性来源（源码）：win_cap 同时决定 ①每专家每窗行数上限
+  Σ_e ceil(count_e/win_cap) ②staging/pool/l1 行 stride ③fragment m 维
+  ceil(win_cap/16) ④K-split 门控（≤64 启用）。
+
+### 4) 实验 B：相位诊断（MYBENCH_PHASE=1，block0 pre_ticks 时间线）
+
+方法：`MT_FORCE_WIN=64 MYBENCH_PHASE=1 run.sh mybench -s 1 -tprs …`：常规计时后
+reset + 单发 eager launch 读 tick（**eager 口径**，非 graph 50-in-1，绝对值含冷启动
+成分，用于比较相位结构；graph lat 列=同 run 常规计时）。µs@≈1.497GHz：
+
+| TPR | graph lat | dispatch(r0) | L1(r0) | L2tail(r0 / max@rank) |
+|---:|---:|---:|---:|---:|
+| 1 | 416 | 28 | 171 | 92 / 291@23 |
+| 8 | 511 | 69 | 170 | 147 / 367@18 |
+| 24 | 916 | 182 | 201 | 351 / 687@29 |
+| 54 | 1415 | 341 | 232 | 561 / 1096@14 |
+| 60 | 1528 | 379 | 247 | 545 / 1147@23 |
+| 66 | 1258 | 278 | 214 | 794 / 1073@8 |
+| 128 | 2372 | 384 | 208 | 1833 / 2237@9 |
+| 256 | 3699 | 209 | 227 | 3219 / 3959@24 |
+
+相位语义（pre_ticks）：t3→t4=首任务 pull+staging+分片旗；t5→t7=L2tail 尾部同步；
+route/publish/xbar/setup 合计在热态约占 3–8%。
+
+窗口对照（同法）：W48@54 dispatch 198 / L2tail 677（max 914@22），graph lat 1095
+（vs W64@54 1415，**−320µs**）；W48@66 215 / 1007（比 W64 慢）；W96@128 431 /
+1524（max 1819），graph lat 2226（vs W64 −146µs）。→ 54 点的窗口收益主要来自首任务
+staging 缩小与最慢 rank L2tail 收缩。
+
+### 5) 结论与开放项
+
+- 已闭合：计时恒 win64 机制；窗口敏感性数据（逐点最优 ≈ 54→48、66→64、128→96）；
+  nt=60/66 非单调记录；权重路径（仅 GS 组指针变化才 D2D 拷入 rwk，无逐 launch
+  300MB 拷贝）与 pull 路径（按列分片、无冗余）复核。
+- 逐点窗口（env-gated，不动默认 64）预估可挽回：54 点 −320µs（≈0.55→0.70x）、
+  128 点 −90～150µs；仍不足以整体 >1x——21 点的结构性差距在 dispatch 随行数增长
+  与 L2tail 尾部同步（28 block 下由最慢 rank/block 决定）。
+- 未决：60→66 非单调的精确机制；kernel 内自适应选窗（已证伪，勿重试）；
+  设备码变体漂移（构建后 smoke 门禁，见上文“mybench 作为性能口径”条）。
+- 下一步候选：(a) env-gated 逐点窗口 + 21 点 harness 复测；(b) dispatch/staging
+  与 L2tail 同步的结构性优化；(c) 非单调机制定因。
+
+### 6) 复现命令
+
+```bash
+# 环境（SDK 重组后：/opt/maca 与 /opt/maca-20261011 指向
+#   ~/opt/maca-sdk-c600u-20261011；mybench 的 mpirun 需要它）
+export MACA_PATH=/opt/maca CUDA_HOME=/opt/maca/tools/cu-bridge \
+       CUCC_PATH=$CUDA_HOME CUBRIDGE_HOME=$HOME \
+       DG_JIT_NVCC_COMPILER=$HOME/cucc_maca_include.sh
+export LD_LIBRARY_PATH=$MACA_PATH/ompi/lib:$CUDA_HOME/lib:$MACA_PATH/mxgpu_llvm/lib:$MACA_PATH/lib
+export KERNEL_CFLAGS="--offload-arch=xcore1600"   # 缺省报 ErrorNoBinaryForGpu
+# 本机 32 卡（0..31）：test_env.sh 默认面向 16..23 卡，HCA/网卡需覆盖
+export MXSHMEM_HCA_LIST=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1
+export MCCL_IB_HCA=$MXSHMEM_HCA_LIST
+export MCCL_SOCKET_IFNAME=ens59f0np0 NCCL_SOCKET_IFNAME=ens59f0np0
+
+# 1) wheel（wt 内；产出 torch/dist/mxmegakernel-*.whl）
+cd /home/fuyx/mini_mega/.agents/work/glm52a/wt
+MACA_PATH=/opt/maca PYTHON=/home/fuyx/myenv/bin/python bash scripts/build.sh whl
+unzip -o torch/dist/mxmegakernel-*.whl -d /home/fuyx/wheel_glm52a_pb
+md5sum /home/fuyx/wheel_glm52a_pb/mxmegakernel/megakernel.so
+#   → 65bd063241300c388e2dd44f79329102（本轮已验证可用；
+#     设备码变体漂移时需重编回此 md5，或用 run.sh check --smoke 门禁）
+
+# 2) coverage 21 点（32 卡；持共享 GPU 锁）
+cd /home/fuyx/MXMOEMega
+DG_TEST_PACKAGE_ROOT=/home/fuyx/wheel_glm52a_pb \
+PYTHONPATH=/home/fuyx/wheel_glm52a_pb:/home/fuyx/pylibs-20261011 \
+OUT_DIR=/home/fuyx/rd_cov_glm52a MASTER_PORT=34553 \
+flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+bash scripts/mx_scripts/run_mega_moe_all.sh --num-processes 32 \
+  --routing-mode coverage --ep-backend=auto
+# 输出 summary.tsv / run_metadata.txt / profile.log；历史对照 /home/fuyx/rd_cov_w64/
+
+# 3) 相位诊断（wt 内；worktree 里 run.sh 的 GPU_LOCK 会落到私有锁，
+#    需外层持共享锁 + GPU_LOCK=0）
+cd /home/fuyx/mini_mega/.agents/work/glm52a/wt
+flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+env GPU_LOCK=0 MT_FORCE_WIN=64 MYBENCH_PHASE=1 \
+bash scripts/run.sh mybench -R 32 -s 1 -tprs 1,8,24,54,60,66,128,256 -quiet
+
+# 4) 固定窗口扫描
+for W in 32 48 64 96 128; do
+  flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+  env GPU_LOCK=0 MT_FORCE_WIN=$W bash scripts/run.sh mybench -R 32 -s 1 -tprs 54,66,128 -quiet
+done
+```
+
+### 7) 本轮产物清单
+
+- wheel：`torch/dist/mxmegakernel-0.0.0+mini.mega.2026101417-*.whl`（解包到
+  `/home/fuyx/wheel_glm52a_pb`，megakernel.so md5 65bd0632…）
+- coverage：`/home/fuyx/rd_cov_glm52a/{summary.tsv,run_metadata.txt,profile.log}`
+  + 完整日志 `.../glm52a/tmp/cov_pb_run.log`；历史对照 `/home/fuyx/rd_cov_w64/`
+- 相位/扫描日志：`.../glm52a/tmp/{phase_s1,phase_w64,phase_w48,phase_w96,winsweep}.log`
+- 可用构建备份：`.../glm52a/tmp/backup_good_1714/`（65bd0632 产物 + objs）
