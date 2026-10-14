@@ -629,3 +629,68 @@ bash scripts/mx_scripts/run_mega_moe_all.sh --num-processes 32 \
 | REDUCE 融合进 mega 尾（`MXK_FUSE_REDUCE`） | 旧结论 −0.8%；新口径 REDUCE 本身仅 ~0.3µs，问题在尾部同步，融合不解决 |
 | coverage（均衡 21 点）整体优化 | 0/21；差距 = 固定 167µs + 4.28µs/token。断崖在 count>16 后 L2tail 尾部同步（+66µs）与 dispatch 随行数线性（+149µs@nt24→54），非 GEMM |
 | mybench 作为性能口径 | 间歇 NoBinaryForGpu、单点抖动 20%+；性能决策一律改用 harness + wheel（已验证 NoBinary=0） |
+
+---
+
+## C600UL 优化实录·续（2026-10-14 下午，coverage 方向）
+
+前节 65-case（倾斜负载）64/65 已达标；本节是 GLM5.2 coverage 均衡 21 点
+（0/21）的归因与试错记录。结论先行：**coverage 口径无便宜可捡**，
+差距 = 固定 167µs + 4.28µs/token（拟合：base≈304+8.34·nt，mega≈471+12.62·nt）。
+
+### 稳态分相（pre_ticks，32 卡，`_C.symm_rwk_ptr/rwk_ticks_off/ticks_count`）
+
+| nt | dispatch | L1 | L2tail | prologue+xbar+setup | REDUCE | chain |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 97 (28%) | 140 (40%) | 76 (22%) | ~35 (10%) | 0.3 | ~350 |
+| 16→17 | +5 | +7 | **+66** | ~0 | 0 | +68 |
+| 24→54 | +149 | +52 | +110 | ~0 | 0 | +329 |
+
+- 之前"prologue+xbar+setup ~100µs"是误判，实际仅 ~35µs。
+- L1 全程平坦：斜率问题不在 GEMM 计算，在"等/搬"。
+- nt=16 双峰：热 rank L1~320（大路径多干活），冷 rank L2tail 最高 522µs
+  （空等）——不均衡税的定量形态。
+
+### nt=16→17 断崖（+177µs，阈值确认）
+
+- nt=16→0.578ms，nt=17→0.755ms（+177），nt=18→0.771ms（+16）：跳变精确
+  发生在 count 跨过 `kM=16` 处（`compute.cuh:1172` 小/大任务分派）。
+- 分相：L2tail +66 主导，L1 仅 +7——是大路径下任务完成方差放大的尾部税，
+  不是 M-tile 补齐。
+- 小路径撑不住 >16（R19_SMALL_MAX=32 实验：nt=17 graph rel=0.926 发散，
+  已回滚）。阈值是 load-bearing，不能动。
+
+### win64 在 nt=54/60 的回退（+320µs，三轮复现）
+
+- 计算段四位小数一致（L1/swiglu/L2 不动），REDUCE 排除（pre_ticks 0.3µs；
+  MX_SKIP_REDUCE 差 7–17µs 落噪音带）。
+- 机制：win64 把 count 54/60 推进 `(48,64]` B-smem 梯档
+  （`compute_big.cuh:2202`，`win_cap<=64` 才进）；win48 时同 count 切两窗
+  走 MT3 档。是"梯档阈值 vs 窗口"耦合，不是窗口本身错。
+- 同一 trade-off 的两面：win64 让倾斜 65-case 里 54 个受益。固定 win64
+  仍是正确选择。
+
+### R30_STAGGER=0 对照（无效果）
+
+- nt=17/24/54：+4/+5/+2µs，全在噪音带，rel 全过。
+- 结论：列块乱序不是关键路径；PUSH_DEFER 的前提（乱序能 overlap 推送）
+  已证伪，不再试。L2tail 方向暂时封存（只剩"让 4 个 slice 算得一样快"，
+  即负载均衡本身）。
+
+### 方法论修正（审计结论）
+
+- `stages.tsv` 只是 baseline 的单发 profiling，不能归因 mega。
+- `rel=0` 只是 graph-vs-eager 自洽；harness 无 mega-vs-baseline 数值对拍。
+- REDUCE 计入 mega 求和（日志 130 次确认双核名）；SKIP 差值在噪音带。
+- 两边计时对称（50-in-1/预热10/核时求和/暖L2/同输入），mega 侧残余
+  ~1–3% 优势（replay 前 sleep+对齐、输入拷贝核不进求和）。
+- win64 有轻微样本内偏差（3 选 1），幅度大，影响小；等新 case 做样本外验证。
+- 基线复现 0.913→0.914x，优化复现 1.168→1.176x（mega 列差异 <1%）。
+
+### 分支状态（2026-10-14 17:30）
+
+```
+main                        c122068（已复位，等审查合并）
+agent/opt/env-baseline      580ff40（环境基线：_FIXED_WIN=48/GS-ON/GROUP_RANKS）
+agent/opt/preclear-gs       …→058f769 win64→本节README（7→8提交，单链干净）
+```
