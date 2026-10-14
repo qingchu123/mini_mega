@@ -534,3 +534,98 @@ R=32/E=256 几何，随机权重 vs 参考）→ 32/32 PASS；本地 R=16 window
 48 请求 / 并发 8：`output_throughput=114.5 tok/s`。需要三个 sglang 侧补丁
 （权重原位接管、SwiGLU 缩放契约修复、预热），详见 `torch/README_torch.md`
 与 `torch/sglang_patches/`。
+
+---
+
+## C600UL 优化实录（2026-10-14，`agent/opt/preclear-gs` 分支）
+
+线上口径：GLM-5.2 形状（H=6144 / I=2048 / E=256 / topk=8 / R=32）、28 SM/C600-U、
+backend=mxmesh。性能口径为 MXMOEMega 的 `run_mega_moe_all.sh`：
+50-in-1 CUDA Graph、bench_kineto 核时求和、rankavg、`rel=0` 数值门禁。
+
+### 提交链（可复现）
+
+```
+c122068 — 环境原点
+580ff40 — 环境基线（FIXED-WIN=48 / GS-ON 组权重 / MXK_GROUP_RANKS 透传）
+92eed92 — preclear 跨 block 分片
+222ac89 — GS 判定+LPT 改 block0 广播（mailbox）
+a9af9ee — 28-SM 适配（kGrid 单一来源 src/grid_config.h，默认 28）
+1082058 — pre_ticks 诊断读口（symm_rwk_ptr/rwk_ticks_off/ticks_count）
+058f769 — _FIXED_WIN 48→64（65 个 case 实测最优全局窗口）
+```
+
+### 65 fixed-case 对比（R=32，rankavg，ms）
+
+| case | baseline | mega 原版 | mega 优化 | 加速 原版→优化 |
+|---|---:|---:|---:|---:|
+| 804900 | 0.7038 | 0.6898 | 0.5582 | 1.01x → **1.26x** |
+| 806600 | 1.8576 | 1.1411 | 1.1129 | 1.63x → **1.65x** |
+| 807500 | 0.7305 | 0.8538 | 0.6405 | 0.84x → **1.15x** |
+| 811800 | 0.6934 | 0.8397 | 0.6721 | 0.82x → **1.07x** |
+| 813900 | 0.7158 | 0.7616 | 0.5657 | 0.95x → **1.28x** |
+| 814500 | 0.6023 | 0.6744 | 0.5731 | 0.91x → **1.08x** |
+| 814900 | 0.6587 | 0.8151 | 0.5533 | 0.81x → **1.20x** |
+| 853900 | 0.6000 | 0.8540 | 0.6080 | 0.71x → **1.00x** |
+| 855800 | 0.6233 | 0.6601 | 0.5442 | 0.94x → **1.16x** |
+| 860900 | 0.9500 | 0.8791 | 0.6683 | 1.09x → **1.41x** |
+| 870000 | 0.5638 | 0.6815 | 0.5617 | 0.82x → **1.01x** |
+| 892800 | 0.6346 | 0.7792 | 0.5567 | 0.82x → **1.15x** |
+| **全量** | — | **13/65，0.914x** | **64/65，1.176x** | 全 case 提升 |
+
+- 重跑复现：基线 12/65@0.916x、优化 64/65@1.176x（同一二进制两次跑，mega 差 <1%）。
+- 审计：图结构/预热/计时（双方核时求和）/输入张量全部同口径；mega 侧有约
+  1–3% 优势（replay 前 `_sleep`+对齐、输入拷贝核不进求和）。`bench_kineto`
+  发现的核名确认包含 `mx_fp8_*` + `mega_reduce_kernel`（REDUCE 计入）。
+
+### 复现方法
+
+```bash
+# 环境（SDK 重组后：/opt/maca 与 /opt/maca-20261011 是指向
+#   ~/opt/maca-sdk-c600u-20261011 的软链；mybench 的 mpirun 需要它）
+export MACA_PATH=/opt/maca CUDA_HOME=/opt/maca/tools/cu-bridge \
+       CUCC_PATH=$CUDA_HOME CUBRIDGE_HOME=$HOME \
+       DG_JIT_NVCC_COMPILER=$HOME/cucc_maca_include.sh
+export LD_LIBRARY_PATH=$MACA_PATH/ompi/lib:$CUDA_HOME/lib:$MACA_PATH/mxgpu_llvm/lib:$MACA_PATH/lib
+export KERNEL_CFLAGS="--offload-arch=xcore1600"   # 缺省会报 ErrorNoBinaryForGpu
+
+# 1) kernel + wheel（grid 28 缺省；换卡用 MXK_KERNEL_GRID=<SM数>）
+cd mini_mega && bash scripts/build.sh mybench        # so（注意：test/megakernel.so）
+cd torch && python setup.py bdist_wheel             # wheel（_C + 随包 megakernel.so）
+
+# 2) 65 fixed-case 对比（32 卡，持 GPU 锁）
+cd ~/MXMOEMega
+DG_TEST_PACKAGE_ROOT=<解包的mxmegakernel wheel目录> \
+PYTHONPATH=<同一目录>:/home/fuyx/pylibs-20261011 \
+OUT_DIR=~/rd_x MASTER_PORT=34xxx \
+bash scripts/mx_scripts/run_mega_moe_all.sh --num-processes 32 \
+  --routing-fixed-cases all --ep-backend=auto
+```
+
+### 优化原理
+
+1. **preclear 分片**（`mx_preclear_ct2`）：32 block 各清全量 → grid-stride 恰好一次
+   （src_index_table 64MB/launch 清零量 ÷32）。清零幂等 + ct2 槽两轮后才读，
+   分片安全。
+2. **GS 广播**（`gs_mail` mailbox）：block0 做 1024 次 FG 读的倾斜判定 + LPT，
+   经 `(epoch,~epoch)` 双字握手广播；27 个 block 的重复读全消。倾斜 case 省
+   200–400µs；均衡 case 付 ~16µs（换 65-case 大幅收益，值得）。
+3. **28-SM**（`src/grid_config.h`）：`kGrid`/`kWinGrid`/`kMegaGrid()` 单一来源，
+   默认 28=设备 SM 数。实测 28-block 比 32-block 在 8/8 case 更快（−11~−75µs）。
+4. **win=64**：65 case 扫 {48,64,96}，64 在 54/65 最优（hot expert 任务数减半）；
+   代价模型 `t_task` 表（t48 32.2→20.7、t64 34.8→20.3）反转确认。
+5. **pre_ticks 诊断**：`_C.symm_rwk_ptr/rwk_ticks_off/ticks_count` 读 block0
+   时间线（kernel 零改动）。nt=1 分解：dispatch 97µs(28%) / L1 140µs(40%) /
+   L2tail 76µs(22%) / prologue+xbar+setup 仅 ~35µs / REDUCE ~0.3µs。
+
+### 已证伪 / 负收益（不再投入）
+
+| 方向 | 结果 |
+|---|---|
+| kernel 内自适应选窗（counts→select_win→win_mail） | 全 case +34~+85µs：block0 256 次 FG 读串行化全 grid，决策成本 > 收益。已回滚 |
+| 小路径阈值 R19_SMALL_MAX=32 | nt=17 数值发散（小路径有 ≤16 硬假设）。已回滚 |
+| pull 去重（同窗 4 slice 重复拉） | 假设错误：srcp/dstp 均带 u4_off 列偏移，4 slice 按列分片、无冗余 |
+| 4 倍重复清零/GS 广播阈值/自适应窗口之外 | preclear 分片与 GS 广播已落地（见上） |
+| REDUCE 融合进 mega 尾（`MXK_FUSE_REDUCE`） | 旧结论 −0.8%；新口径 REDUCE 本身仅 ~0.3µs，问题在尾部同步，融合不解决 |
+| coverage（均衡 21 点）整体优化 | 0/21；差距 = 固定 167µs + 4.28µs/token。断崖在 count>16 后 L2tail 尾部同步（+66µs）与 dispatch 随行数线性（+149µs@nt24→54），非 GEMM |
+| mybench 作为性能口径 | 间歇 NoBinaryForGpu、单点抖动 20%+；性能决策一律改用 harness + wheel（已验证 NoBinary=0） |
