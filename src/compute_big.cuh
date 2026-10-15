@@ -1731,6 +1731,10 @@ __device__ __forceinline__ void r19_pull_flags(
         : &(&S.a->unk->rd)->src_index_table[S.cycle][0][0][0];
     const bool kTick = (S.pt != nullptr) && (blockIdx.x == 0) && (task == 0) &&
                        (tid == 0);
+#if R24_DIAG_PHASE
+    const unsigned long long t_dp0 = (tid == 0) ? clock64() : 0ull;
+    unsigned long long t_dm = t_dp0;
+#endif
     // ---- 行均分 K 片 pull：半 warp 一行（8 warp × 2 行并行），staging 写 weights/meta
     // [H1] 每个 warp 的两个半 warp 各负责一行，且相邻行配对（同源 rank）
     const int half = lane >> 5;           // 半 warp 号（0/1）
@@ -1882,6 +1886,12 @@ __device__ __forceinline__ void r19_pull_flags(
         __threadfence();
 #endif
         __syncthreads();
+#if R24_DIAG_PHASE
+        if (tid == 0 && S.pt != nullptr)
+            atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 5,
+                      clock64() - t_dp0);
+        if (tid == 0) t_dm = clock64();
+#endif
         // ---- 分片就绪旗（本 slice 的 K 片已落 pool；L1 消费）----
         // [BALANCE·docs/20 §4.2b] 非 owner（kseg>0）不置旗；旗由各 slice 的 owner 置。
         if (own && tid == 0) {
@@ -1928,6 +1938,11 @@ __device__ __forceinline__ void r19_pull_flags(
         }
     }
     __syncthreads();
+#if R24_DIAG_PHASE
+    if (tid == 0 && S.pt != nullptr)
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 6,
+                  clock64() - t_dm);
+#endif
 }
 
 __device__ __forceinline__ void r19_l1_pub_wait(
@@ -1936,6 +1951,9 @@ __device__ __forceinline__ void r19_l1_pub_wait(
     const int tid = threadIdx.x;
     const bool kTick = (S.pt != nullptr) && (blockIdx.x == 0) && (task == 0) &&
                        (tid == 0);
+#if R24_DIAG_PHASE
+    const unsigned long long t_pw0 = (tid == 0) ? clock64() : 0ull;
+#endif
     // [GEN] 与 slice_flags 同代际，避免 l1_prog 跨窗口复用陈旧读
     // [MX_GROUP_SCHED] gs 下 w 实为「本 rank 窗口序号 seq」，ring 用 S.ring。
     const int ring_sz = (S.ring > 0) ? S.ring : 1;
@@ -1969,6 +1987,11 @@ __device__ __forceinline__ void r19_l1_pub_wait(
         __threadfence();
     }
     __syncthreads();
+#if R24_DIAG_PHASE
+    if (tid == 0 && S.pt != nullptr)
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 3,
+                  clock64() - t_pw0);
+#endif
     // 诊断：block0 首任务 L1 完成（已等齐本窗 slice 旗）
     if (kTick) S.pt[5] = clock64();
 }
@@ -1992,6 +2015,9 @@ __device__ __forceinline__ void r19_tail_common(
         const R19Sched& S, const CombineCtx& ctx, bool fused, int task, int e,
         int w, int count, int slice, unsigned epoch, int pool_slot) {
     (void)S; (void)task; (void)e; (void)w; (void)pool_slot; (void)epoch;
+#if R24_DIAG_PHASE
+    const unsigned long long t_t0 = (threadIdx.x == 0) ? clock64() : 0ull;
+#endif
     if (ctx.combine_on) {
         const int lane = (int)(threadIdx.x % 64);
         const int warp = (int)(threadIdx.x / 64);
@@ -2006,6 +2032,14 @@ __device__ __forceinline__ void r19_tail_common(
                               count, lane, warp, 8);
     }
     __syncthreads();
+#if R24_DIAG_PHASE
+    // [spanW] 本 rank 自己写出完成标记的最晚时刻（bank0 空闲槽 11，跨块 atomicMax）
+    if (threadIdx.x == 0 && S.pt != nullptr)
+        atomicMax(&S.pt[11], clock64());
+    if (threadIdx.x == 0 && S.pt != nullptr)
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 7,
+                  clock64() - t_t0);
+#endif
 }
 
 // ============================================================================
@@ -2042,9 +2076,15 @@ __device__ R19_BIG_ATTR void r19_big_task(
     fuse.out_base = reinterpret_cast<const uint8_t*>((&S.a->unk->rd.l2_out[0][0][0]));
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
+#if R24_DIAG_PHASE
+    const unsigned long long t_pull0 = (tid == 0) ? clock64() : 0ull;
+#endif
     r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx, kseg,
                            owner, seq);
 #if R24_DIAG_PHASE
+    if (tid == 0 && S.pt != nullptr)
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 2,
+                  clock64() - t_pull0);
     const unsigned long long t_l1s = (tid == 0) ? clock64() : 0ull;
 #endif
     // ---- L1：M 档位（kMT 个 16 行 tile 共享 B 一遍）----
@@ -2450,13 +2490,21 @@ __device__ R19_BIG_ATTR void r19_big_task(
                     kHidden, nullptr, 0);
             }
         } else if (count > 48 && count <= 64 && f2 != nullptr &&
-                   (count % (4 * kM) == 0) &&
                    ((kIntermediate / 32) % R24_L2_KS == 0)) {
-            // [OPT-64] 49..64 档 L2 同样走 r24 A-smem（MT4 无掩码）
-            r24_l2_big<4, R24_L2_KS, 3, false, 4, kR24BPF, kBsmB>(
-                a_smem, f2, S.mt_total, w2_e, 0, count, kIntermediate,
-                kHidden, kL1BlockN, lane, warp, kComputeWarps,
-                S.l2_chk, g0_l2, g_l2, out_slot, kHidden, nullptr);
+            // [OPT-64] 49..64 档 L2 同样走 r24 A-smem（MT4）：整块 64 无掩码，
+            //   49..63 掩码（对齐 L1 的 [L1TUNE-D]）。原条件 count%64==0 只放行 64，
+            //   49..63 掉进 r19_l2_big<4,PF,3> 慢回退（W64 TPR49..63 断崖，
+            //   49 比线性趋势 +~160µs，54/60 为 coverage 命中点）。
+            if (count % (4 * kM) == 0)
+                r24_l2_big<4, R24_L2_KS, 3, false, 4, kR24BPF, kBsmB>(
+                    a_smem, f2, S.mt_total, w2_e, 0, count, kIntermediate,
+                    kHidden, kL1BlockN, lane, warp, kComputeWarps,
+                    S.l2_chk, g0_l2, g_l2, out_slot, kHidden, nullptr);
+            else
+                r24_l2_big<4, R24_L2_KS, 3, true, 4, kR24BPF, kBsmB>(
+                    a_smem, f2, S.mt_total, w2_e, 0, count, kIntermediate,
+                    kHidden, kL1BlockN, lane, warp, kComputeWarps,
+                    S.l2_chk, g0_l2, g_l2, out_slot, kHidden, nullptr);
         } else if (kAsyncL2) {
             // [R34] 同 L1：全块 + 尾块（尾块掩码；融合推送对两段都生效）
             const int full = count - count % (R19_L2_MT * kM);
@@ -2558,8 +2606,17 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     (void)b_smem;
     // [L1L2-SPLIT] pull 恒调用：其内部按 kPhase 决定搬数据（L1/Both）还是
     //   只重算 wt/meta staging（L2）；L2 的 COMBINE tail 依赖此 staging。
+#if R24_DIAG_PHASE
+    const unsigned long long t_pull0 = (tid == 0) ? clock64() : 0ull;
+#endif
     r19_pull_flags<kPhase>(S, task, e, w, count, slice, epoch, pool_slot, pfx, kseg,
                            owner, seq);
+#if R24_DIAG_PHASE
+    if (tid == 0 && S.pt != nullptr)
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 2,
+                  clock64() - t_pull0);
+    const unsigned long long t_l1s = (tid == 0) ? clock64() : 0ull;
+#endif
     // ---- L1：小 count 档位（与基线实例选择一致）----
     if constexpr (kPhase != MegaPhase::L2) {
     const uint8_t* pool = S.pool_base;
@@ -2643,6 +2700,11 @@ __device__ R19_SMALL_ATTR void r19_small_task(
         }   // end L1_SPLITK else（原实例选择链）
     }   // end if (CM_L1_GATE)
     }   // end if constexpr (kPhase != MegaPhase::L2)  —— L1 段（small）
+#if R24_DIAG_PHASE
+    if (tid == 0 && S.pt != nullptr)
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8,
+                  clock64() - t_l1s);
+#endif
     if constexpr (kPhase == MegaPhase::Both) {
 #if R19_BLOCK_KSPLIT
         if (ksplit)
@@ -2655,6 +2717,9 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     if constexpr (kPhase != MegaPhase::L1) {
         if (ksplit && kseg != 0) return;
     }
+#endif
+#if R24_DIAG_PHASE
+    const unsigned long long t_l2s = (tid == 0) ? clock64() : 0ull;
 #endif
     // ---- L2：小 count（与基线实例选择一致）----
     if constexpr (kPhase != MegaPhase::L1) {
@@ -2735,6 +2800,11 @@ __device__ R19_SMALL_ATTR void r19_small_task(
     }
     }   // end if constexpr (kPhase != MegaPhase::L1)  —— L2 段（small）
     __syncthreads();
+#if R24_DIAG_PHASE
+    if (tid == 0 && S.pt != nullptr)
+        atomicAdd(S.pt + (size_t)kGrid * 8 + (size_t)blockIdx.x * 8 + 1,
+                  clock64() - t_l2s);
+#endif
     // [L1L2-SPLIT] COMBINE tail 依赖 L2 输出 → L1 阶段不执行
     if constexpr (kPhase != MegaPhase::L1)
         r19_tail_common(S, cctx, false, task, e, w, count, slice, epoch, pool_slot);

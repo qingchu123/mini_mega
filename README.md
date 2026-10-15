@@ -694,3 +694,378 @@ main                        c122068（已复位，等审查合并）
 agent/opt/env-baseline      580ff40（环境基线：_FIXED_WIN=48/GS-ON/GROUP_RANKS）
 agent/opt/preclear-gs       …→058f769 win64→本节README（7→8提交，单链干净）
 ```
+
+---
+
+> 合并注（2026-10-15）：以下为 `agent/glm52a/opt` 分支合入的 coverage 调研记录（含 L2TUNE-49 落地），与上一节互补保留。
+
+## coverage 均衡 21 点调研（2026-10-14，`agent/glm52a/opt` 分支）
+
+背景：65 fixed-case（倾斜路由）已到 64/65@1.176x，但 coverage 均衡 21 点
+（`--routing-mode coverage`，tokens=1..256，32 rank 负载严格均匀）仍是 0/21
+（0.54–0.81x）。本节记录根因定位的机制发现、实验数据与复现方法。所有实验在独立
+工作区 `mini_mega/.agents/work/glm52a/wt`（分支 `agent/glm52a/opt`）内执行。
+
+### 1) 现状复现（口径一致）
+
+`rd_cov_glm52a/summary.tsv`（本轮）与 `rd_cov_w64/summary.tsv`（历史）逐点差 ≤2%；
+mega 计时=图 50-in-1（graph_reps=50）+ bench_kineto 核时求和（核名
+`mega_reduce_kernel`+`mega_kernel`），rankavg，ms：
+
+| tokens | window(逻辑*) | baseline | mega | speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 8 | 0.3086 | 0.4153 | 0.74 |
+| 2 | 8 | 0.3224 | 0.4229 | 0.76 |
+| 4 | 8 | 0.3540 | 0.4439 | 0.80 |
+| 6 | 8 | 0.3705 | 0.4597 | 0.81 |
+| 8 | 8 | 0.3786 | 0.4809 | 0.79 |
+| 12 | 16 | 0.4260 | 0.5344 | 0.80 |
+| 18 | 24 | 0.5118 | 0.7703 | 0.66 |
+| 24 | 24 | 0.5037 | 0.8553 | 0.59 |
+| 30 | 32 | 0.5583 | 0.9168 | 0.61 |
+| 36 | 48 | 0.6275 | 0.9755 | 0.64 |
+| 42 | 48 | 0.6677 | 1.0522 | 0.64 |
+| 48 | 48 | 0.7004 | 1.1239 | 0.62 |
+| 54 | 64 | 0.7477 | 1.3630 | 0.55 |
+| 60 | 64 | 0.7902 | 1.4756 | 0.54 |
+| 66 | 80 | 0.8628 | 1.2155 | 0.71 |
+| 72 | 80 | 0.9038 | 1.2559 | 0.72 |
+| 78 | 80 | 0.9316 | 1.3348 | 0.70 |
+| 84 | 48 | 0.9773 | 1.4696 | 0.67 |
+| 90 | 48 | 1.0115 | 1.5660 | 0.65 |
+| 128 | 64 | 1.2731 | 2.2399 | 0.57 |
+| 256 | 64 | 2.5142 | 3.5902 | 0.70 |
+
+\* window 列=harness `compare-window` 打印的 `select_fp8_mega_moe_window()` 返回值，
+**不是**计时 launch 的实跑窗口（见 2）。
+
+coverage 分布（harness `compare-routing` 行）：total_pairs=tokens×256、
+load_per_rank=8×tokens（min=max，严格均衡）→ 每本地专家行数 = 每 rank tokens。
+
+### 2) 关键发现：wheel `_FIXED_WIN=64` —— 计时 launch 恒用 win_cap=64
+
+- `torch/mxmegakernel/mega/__init__.py:50`：`_FIXED_WIN = 64`；`fp8_mega_moe` /
+  `fp8_mega_moe_compute` 内 `win_cap, skip = _FIXED_WIN, 0`（:636/:687，注释残留
+  “固定 48”）；C++ 侧 `wc = (win_cap>0) ? win_cap : b->win`（`mega.hpp`
+  `make_mega_args`）→ 所有计时 launch 实跑 64。
+- harness 的 `compare-window` 行（8/16/…/64/80）只写入 `sym_buffer.expert_window`
+  （逻辑窗口：参与 launch 校验 ew∈[8, win_phys] 与 warmup），对计时 launch 无效；
+  `DG_MEGA_WIN_AUTO` 在 wheel 内无读取点（仅 harness CLI 帮助文本提及）。
+- 交叉验证：mybench `MT_FORCE_WIN=64` 与 harness coverage 逐点吻合（TPR=1:
+  415.7 vs 415.3；66: 1257.6 vs 1215.5；128: 2372 vs 2240；256: 3699 vs 3590；
+  mybench 系统偏高 1–6%），而 W48/W96 与 harness 数值明显偏离 → 证实计时恒 64。
+- 该 64 为 65 fixed-case 实测全局最优（commit 058f769），**保持默认**；下文的
+  逐点窗口仅为实验记录/待验证优化，不改默认。
+
+### 3) 实验 A：固定窗口扫描（MT_FORCE_WIN，mybench -R 32 -s 1，us_mean）
+
+| W \ TPR | 54 | 66 | 128 |
+|---:|---:|---:|---:|
+| 32 | 1390 | 1387 | 2424 |
+| 48 | **1137** | 1434 | 2269 |
+| 64 | 1446 | **1260** | 2318 |
+| 96 | 1505 | 1683 | **2229** |
+| 128 | 1505 | 1704 | 2809 |
+
+- 逐点最优≠全局：54 想 win48（−309µs vs 64）、66 想 win64（已最优）、128 想 win96
+  （−89µs）；单一全局窗口无法同时最优。
+- 非单调：win64 下 harness nt=60=1475.6µs > nt=66=1215.5µs（多 6 token 反快
+  260µs；nt=66 起每专家行数 66>64 → 每专家分 2 窗 64+2）。机制未完全归因
+  （候选：窗划分→两段流水、staging stride、`R19_BLOCK_KSPLIT_WINMAX=64` 门控组合）。
+- 窗口敏感性来源（源码）：win_cap 同时决定 ①每专家每窗行数上限
+  Σ_e ceil(count_e/win_cap) ②staging/pool/l1 行 stride ③fragment m 维
+  ceil(win_cap/16) ④K-split 门控（≤64 启用）。
+
+### 4) 实验 B：相位诊断（MYBENCH_PHASE=1，block0 pre_ticks 时间线）
+
+方法：`MT_FORCE_WIN=64 MYBENCH_PHASE=1 run.sh mybench -s 1 -tprs …`：常规计时后
+reset + 单发 eager launch 读 tick（**eager 口径**，非 graph 50-in-1，绝对值含冷启动
+成分，用于比较相位结构；graph lat 列=同 run 常规计时）。µs@≈1.497GHz：
+
+| TPR | graph lat | dispatch(r0) | L1(r0) | L2tail(r0 / max@rank) |
+|---:|---:|---:|---:|---:|
+| 1 | 416 | 28 | 171 | 92 / 291@23 |
+| 8 | 511 | 69 | 170 | 147 / 367@18 |
+| 24 | 916 | 182 | 201 | 351 / 687@29 |
+| 54 | 1415 | 341 | 232 | 561 / 1096@14 |
+| 60 | 1528 | 379 | 247 | 545 / 1147@23 |
+| 66 | 1258 | 278 | 214 | 794 / 1073@8 |
+| 128 | 2372 | 384 | 208 | 1833 / 2237@9 |
+| 256 | 3699 | 209 | 227 | 3219 / 3959@24 |
+
+相位语义（pre_ticks）：t3→t4=首任务 pull+staging+分片旗；t5→t7=L2tail 尾部同步；
+route/publish/xbar/setup 合计在热态约占 3–8%。
+
+窗口对照（同法）：W48@54 dispatch 198 / L2tail 677（max 914@22），graph lat 1095
+（vs W64@54 1415，**−320µs**）；W48@66 215 / 1007（比 W64 慢）；W96@128 431 /
+1524（max 1819），graph lat 2226（vs W64 −146µs）。→ 54 点的窗口收益主要来自首任务
+staging 缩小与最慢 rank L2tail 收缩。
+
+### 5) 结论与开放项
+
+- 已闭合：计时恒 win64 机制；窗口敏感性数据（逐点最优 ≈ 54→48、66→64、128→96）；
+  nt=60/66 非单调记录；权重路径（仅 GS 组指针变化才 D2D 拷入 rwk，无逐 launch
+  300MB 拷贝）与 pull 路径（按列分片、无冗余）复核。
+- 逐点窗口（env-gated，不动默认 64）预估可挽回：54 点 −320µs（≈0.55→0.70x）、
+  128 点 −90～150µs；仍不足以整体 >1x——21 点的结构性差距在 dispatch 随行数增长
+  与 L2tail 尾部同步（28 block 下由最慢 rank/block 决定）。
+- 未决：60→66 非单调的精确机制；kernel 内自适应选窗（已证伪，勿重试）；
+  设备码变体漂移（构建后 smoke 门禁，见上文“mybench 作为性能口径”条）。
+- 下一步候选：(a) env-gated 逐点窗口 + 21 点 harness 复测；(b) dispatch/staging
+  与 L2tail 同步的结构性优化；(c) 非单调机制定因。
+
+### 6) 复现命令
+
+```bash
+# 环境（SDK 重组后：/opt/maca 与 /opt/maca-20261011 指向
+#   ~/opt/maca-sdk-c600u-20261011；mybench 的 mpirun 需要它）
+export MACA_PATH=/opt/maca CUDA_HOME=/opt/maca/tools/cu-bridge \
+       CUCC_PATH=$CUDA_HOME CUBRIDGE_HOME=$HOME \
+       DG_JIT_NVCC_COMPILER=$HOME/cucc_maca_include.sh
+export LD_LIBRARY_PATH=$MACA_PATH/ompi/lib:$CUDA_HOME/lib:$MACA_PATH/mxgpu_llvm/lib:$MACA_PATH/lib
+export KERNEL_CFLAGS="--offload-arch=xcore1600"   # 缺省报 ErrorNoBinaryForGpu
+# 本机 32 卡（0..31）：test_env.sh 默认面向 16..23 卡，HCA/网卡需覆盖
+export MXSHMEM_HCA_LIST=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1
+export MCCL_IB_HCA=$MXSHMEM_HCA_LIST
+export MCCL_SOCKET_IFNAME=ens59f0np0 NCCL_SOCKET_IFNAME=ens59f0np0
+
+# 1) wheel（wt 内；产出 torch/dist/mxmegakernel-*.whl）
+cd /home/fuyx/mini_mega/.agents/work/glm52a/wt
+MACA_PATH=/opt/maca PYTHON=/home/fuyx/myenv/bin/python bash scripts/build.sh whl
+unzip -o torch/dist/mxmegakernel-*.whl -d /home/fuyx/wheel_glm52a_pb
+md5sum /home/fuyx/wheel_glm52a_pb/mxmegakernel/megakernel.so
+#   → L2TUNE-49 前：65bd063241300c388e2dd44f79329102
+#   → L2TUNE-49 后：e3485a545900cd9cdb09a3aa6ac06d22（check --all 762/762、
+#     smoke 11/11；设备码变体漂移时需重编到与前一个可用 md5 一致的变体，
+#     或用 run.sh check --smoke 门禁后再部署）
+
+# 2) coverage 21 点（32 卡；持共享 GPU 锁）
+#   环境（run_mega_moe_all.sh 缺省 PYTHON=py310-maca 本机不存在，必须显式给；
+#   缺 MCCL_IFNAME/HCA 会 rank0 “Bootstrap: no socket interface found”→NCCL init 失败）
+export MCCL_SOCKET_IFNAME=ens59f0np0 NCCL_SOCKET_IFNAME=ens59f0np0 \
+       MXSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=ens59f0np0 GLOO_SOCKET_IFNAME=ens59f0np0
+export PYTHON=/home/fuyx/myenv/bin/python
+cd /home/fuyx/MXMOEMega
+DG_TEST_PACKAGE_ROOT=/home/fuyx/wheel_glm52a_pb \
+PYTHONPATH=/home/fuyx/wheel_glm52a_pb:/home/fuyx/pylibs-20261011 \
+OUT_DIR=/home/fuyx/rd_cov_glm52a MASTER_PORT=34553 \
+flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+bash scripts/mx_scripts/run_mega_moe_all.sh --num-processes 32 \
+  --routing-mode coverage --ep-backend=auto
+# 输出 summary.tsv / run_metadata.txt / profile.log（全程约 2 分钟）；
+# 65 定档换 --routing-fixed-cases all（约 2.5 分钟）；历史对照 /home/fuyx/rd_cov_w64/
+
+# 3) 相位诊断（wt 内；worktree 里 run.sh 的 GPU_LOCK 会落到私有锁，
+#    需外层持共享锁 + GPU_LOCK=0）
+cd /home/fuyx/mini_mega/.agents/work/glm52a/wt
+flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+env GPU_LOCK=0 MT_FORCE_WIN=64 MYBENCH_PHASE=1 \
+bash scripts/run.sh mybench -R 32 -s 1 -tprs 1,8,24,54,60,66,128,256 -quiet
+
+# 4) 固定窗口扫描
+for W in 32 48 64 96 128; do
+  flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+  env GPU_LOCK=0 MT_FORCE_WIN=$W bash scripts/run.sh mybench -R 32 -s 1 -tprs 54,66,128 -quiet
+done
+```
+
+### 7) 本轮产物清单
+
+- wheel：`torch/dist/mxmegakernel-0.0.0+mini.mega.2026101417-*.whl`（解包到
+  `/home/fuyx/wheel_glm52a_pb`，megakernel.so md5 65bd0632…；L2TUNE-49 后重打为
+  e3485a54…，旧部署备份 `wheel_glm52a_pb_prel2fix/`）
+- coverage：`/home/fuyx/rd_cov_glm52a/{summary.tsv,run_metadata.txt,profile.log}`
+  + 完整日志 `.../glm52a/tmp/cov_pb_run.log`；历史对照 `/home/fuyx/rd_cov_w64/`
+- 相位/扫描日志：`.../glm52a/tmp/{phase_s1,phase_w64,phase_w48,phase_w96,winsweep}.log`
+- 可用构建备份：`.../glm52a/tmp/backup_good_1714/`（65bd0632 产物 + objs）
+
+### 8) [L2TUNE-49] L2 49..63 慢回退修复（coverage nt=54/60 −93/−99µs；65case 大面积提速）
+
+#### 问题：W64 下 TPR 49..63 断崖
+
+mybench（`-R 32 -s 1`，W64）悬崖探针：48→49 跳 +179µs（1122.9→1302.3），49..63
+整段偏离 48↔64 线性弦线 +74..160µs；64 回到趋势线，66（每专家两窗 64+2）反而
+更快。coverage 21 点命中 54/60（每专家行数=49..63），恰是 speedup 最差两点
+（0.55/0.54）。_FIXED_WIN=64 下凡每专家窗行数落入 49..63 的 case 全部中招
+（均衡 TPR=49..63；倾斜 case 中任一专家窗该区间）。
+
+#### 根因
+
+L2 任务分派链的 [OPT-64] 门控 `count % (4*kM) == 0`（count≤64 时仅 64 通过）
+把 49..63 排除在 r24 A-smem 路径外 → 掉进 `r19_l2_big<4, R19_L2_PF, 3>` 慢
+回退（MT4 M 空转 + 非 r24 管线）。同构问题 L1 侧已在 [L1TUNE-D] 用「掩码 MT4
+r24」修掉（见上文「C600UL 优化实录」），L2 从未镜像。
+
+#### 修复（src/compute_big.cuh，r19_big_task L2 链，14+/6-）
+
+去掉 `count%64==0` 门控，函数体内二分支：count%64==0 → 原无掩码
+`r24_l2_big<4, R24_L2_KS, 3, false, 4>`；49..63 → `kMask=true, kMTAct=4` 掩码版
+（与 L1TUNE-D 完全同构）。掩码路径安全性沿用既有语义：越界 M-tile 不搬运
+（r24_issue_a）、m_abs0+m ≥ mt_total 折叠到末 tile、尾部 out/acc_chk 由
+`row < cc` 保护、残余组数经 kBatch=1 递归。不动 L1、不动 win_cap、不加开关/
+宏（NSLICE=8 等构建同样生效）。
+
+#### 验证数据（v3 构建 e3485a54；前值=修复前同口径）
+
+A. mybench 悬崖探针（W64，`-R 32 -s 1`，us_mean）：
+
+| TPR | 48 | 49 | 50 | 52 | 54 | 56 | 60 | 62 | 64 | 66 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 修复前 | 1122.9 | 1302.3 | 1335.3 | 1374.0 | 1399.5 | 1426.6 | 1499.5 | 1497.8 | 1461.9 | 1253.5 |
+| 修复后 | 1124.0 | 1211.1 | 1233.1 | 1272.8 | 1302.8 | 1327.5 | 1399.7 | 1401.2 | 1456.0 | 1255.3 |
+| Δµs | +1 | **−91** | **−102** | **−101** | **−97** | **−99** | **−100** | **−97** | −6(噪声) | +2(不受影响) |
+
+B. harness coverage 21 点（32 卡，graph 50-in-1 rankavg，mega_rankavg ms）：
+
+| tokens | 1 | 2 | 4 | 6 | 8 | 12 | 18 | 24 | 30 | 36 | 42 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 修复前 | .4153 | .4229 | .4439 | .4597 | .4809 | .5344 | .7703 | .8553 | .9168 | .9755 | 1.0522 |
+| 修复后 | .4155 | .4217 | .4424 | .4607 | .4789 | .5341 | .7735 | .8565 | .9165 | .9761 | 1.0586 |
+
+| tokens | 48 | **54** | **60** | 66 | 72 | 78 | 84 | 90 | 128 | 256 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 修复前 | 1.1239 | **1.3630** | **1.4756** | 1.2155 | 1.2559 | 1.3348 | 1.4696 | 1.5660 | 2.2399 | 3.5902 |
+| 修复后 | 1.1226 | **1.2704** | **1.3767** | 1.2193 | 1.2469 | 1.3325 | 1.4649 | 1.5805 | 2.2432 | 3.5891 |
+| Δµs | −1 | **−93** | **−99** | +4 | −9 | −2 | −5 | +15 | +3 | −1 |
+
+54/60 speedup 0.549→0.585、0.536→0.566；其余点 ±15µs 为跑间抖动（baseline 同步
+漂移；两端点已复核为噪声口径）。数据：`rd_cov_glm52a`（前）→`rd_cov_l2fix`（后）。
+
+C. 65 定档 harness（`--routing-fixed-cases all`，rd_re_opt 前 → rd_65_l2fix 后）：
+mega 逐点 Δ 均值 **−9.75µs**、中位 −9.10（min −35.0 / max +12.5）；38/65 改善
+（<−5µs）、8/65 小回退（+5.0..+12.5：863100/850800/844400/806600/838700/
+853900/843500/889500）；speedup≥1.0：65/65 → **64/65**（853900 由 1.000 到
+0.989 边界擦线），均值 **1.1761→1.1943**。
+
+D. TK top50 mybench A/B（每二进制 3 跑交替取均值）：Δ 均值 **−14.35µs**、中位
+−12.37；38 项 <−3µs、9 中性、3 项 >+3µs（804700 +5.5σ8.4、805400 +10.8σ2.4、
+809600 +3.0；三者均不在 65 定档集内）。最大改善：804900 −47.7、807100 −37.9、
+808800 −37.4、804300 −34.6。
+
+正确性门禁：`check --all` **762/762 PASS**（100.4s）、`check --smoke` 11/11
+（6.7s）；harness 内嵌 graph-vs-eager 逐点 rel=0.000e+00。
+
+#### 残余结构差（非路径问题）
+
+修复后 TPR=49 仍高于 48↔64 弦线 ~66µs：49..64 的 L2 任务从 [OPT-33] 的 MT3
+（3×16 行 tile）跳到 MT4（ceil(count/16)=4 tile），16 行 MMA tile 量化天然产生
+一个台阶；且该档每 rank 仅 8 个单窗任务（66 点起是每专家两窗 16 任务，并行度
+翻倍）。属窗口/tile 粒度结构性差，需 M 维细分或任务并行类改动，不在本修复范围。
+
+#### 构建/设备码漂移记录（本轮实证）
+
+同源两次 cucc 编译：v1（d781ff37）`check --smoke` 挂——804900 自旋超时
+（11.2s）、L0/L1L2 FAIL；重编 v3（e3485a54）全部门禁通过。**同源不同变体，
+部署前必须过 smoke 门禁**；v1 产物留档
+`.../glm52a/tmp/megakernel_l2fix_d781ff37.so`。
+
+#### 复现命令
+
+```bash
+# 环境同 6)（MACA/KERNEL_CFLAGS + NIC env + PYTHON）；以下均在 wt 内、持共享锁
+# 悬崖探针（前=backup_pre_l2fix 的 mybench+.so；后=test/ 当前产物）
+cd /home/fuyx/mini_mega/.agents/work/glm52a/wt
+flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+env GPU_LOCK=0 MT_FORCE_WIN=64 \
+bash scripts/run.sh mybench -R 32 -s 1 -tprs 48,49,50,52,54,56,60,62,64,66 -quiet
+# TK top50 A/B（两产物目录各自含 mybench+megakernel.so）
+flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+env GPU_LOCK=0 bash scripts/run.sh mybench -R 32 -s 2 -top 50 -quiet
+# 正确性门禁
+flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+env GPU_LOCK=0 bash scripts/run.sh check --all      # 762 用例 ~100s
+# harness：覆盖 21 点 / 65 定档（见 6)）
+```
+
+#### 相关待办
+
+- NSLICE=8（g_l2=3）构建下 count 33..48 有同类 L2 空洞（`count<=48` 分支要求
+  `g_l2%6==0`，g_l2=3 走不到 [OPT-33]）；49..63 已被本修复顺带覆盖
+  （本修复分支无 g_l2 门控）。NSLICE=8 几何未在本轮实测，需单独构建验证。
+
+### 9) [261014_21_59] 排空支配模型 + 17/18 断崖量化（诊断基建 + ISA 实证；生产路径零改动）
+
+#### 结论先行
+
+1. **`__stwt` 在本平台 ≡ 普通缓存写（ISA 位级证据）**：cucc 对 `__stwt`/`__stwb`
+   生成的编码与普通写完全相同（`stg_b64 ... devc`，`bc 00 00 30…`）；仅
+   `__stcs`/`__stcg` 带 sysc 位（`bc 00 00 70…`）。即项目全部跨 rank 推送
+   （行 + 完成标记）实为**惰性缓存写**，靠驱逐/排空才到达对端——统一解释历史现象：
+   标记早写晚见（wend ≈ −23k 但 rspan 300–600k）、run 间 rspan 波动 380k→605k、
+   原子读探针不可见（atomicOr(…,0) 实验无效果，`coh_ctrl.log`）。
+   volatile 读 = `ldx … sysc devc`（一致读），**读侧无陈旧问题，延迟全部来自写侧排空**。
+2. **迭代周期受「外发洪峰排空」支配**：kspan+rspan 跨配置近乎恒定（TPR=64 各档
+   ~2.8–3.0M cycles）。三个 store 风味实验只把记账在 kspan↔rspan 间搬家：
+   | 实验 | TPR64 period | kspan | rspan | wall |
+   |---|---:|---:|---:|---:|
+   | 基线 __stwt | 2.876M | 2.180M | 605k | 1480.7µs |
+   | MARK-STCS（标记→__stcs） | 2.928M | 2.414M | 406k | 1485.7µs |
+   | MARK-ATOMIC（标记→atomicExch） | 2.924M | 2.914M(in=194k) | 127k | 1571.1µs |
+   | ROW-STCS（行推送→__stcs） | 2.75–2.80M | 2.288M | 466k | 1489.2µs |
+   → store 风味不是杠杆；有效外发带宽 D≈2–4GB/s/rank 是墙（用 `atomicExch` 把标记
+   挪进请求路径后 rspan 崩塌至 127k，但 kspan 同步 +500k，period 不变）。
+3. **64 vs 65 真实结构差 ≈ 末波洪峰**：TPR=64 末波 = el7 整窗 768KB/rank 突发收尾
+   （无后续计算遮挡）；65/66 的 el7 大窗在 wave1 完成，末尾 1–2 行 tiny 波吸收排空
+   → 快 ~180µs。属调度结构涌现差，非路径缺陷。
+4. **17/18 断崖量化（36 行 tile 量化）**：16→17 突增 +184µs，全部落在 mega loop
+   内：L2 相位 17..24 全程平坦（~16.3–17.2M ticks，不随行数下降）——17 行必须开第
+   2 个 16 行 MMA tile，tile2 近空转仍付全价（固定 ~145µs）；33/49 台阶经
+   [OPT-33]/[L1TUNE-D]/L2TUNE-49 已收敛（+9µs/+70µs）。属 16 行 tile 粒度结构性
+   差，无廉价通用修复（小档路径仅支持 ≤16 行，win_cap=64 不可动）。
+   分档台阶实测（us_mean）：16:627 · 17:809 · 24:910 · 32:987 · 33:997 · 48:1178
+   · 49:1248 · 64:1493。
+
+#### 诊断基建（`R24_DIAG_PHASE=1` 构建；生产构建零影响）
+
+- 内核侧 5 时间戳 bank（`local_flags.pre_ticks` 扩展）：bank0 原有；第三 bank
+  （+kGrid*16）逐 block 起止 + 任务循环入口/出口；第四 bank（+kGrid*24）单任务
+  span min/max/sum/n；第五 bank（+kGrid*32）REDUCE 逐块 start/end/spin/token +
+  逐切片自旋 + 逐 (k,s2) 标记到达时刻。**条件化分配**：诊断 bank 仅在
+  `#if R24_DIAG_PHASE` 下扩展数组，生产构建 `pre_ticks[kGrid*16]` 与基线布局
+  逐字节一致（`sizeof(rwk_data)=1543676672` 已核对）。
+- mybench 侧（同样 `#if R24_DIAG_PHASE`）：`MYBENCH_PHASE=1` 输出
+  `[span-graph]`（period/kspan/b0span/in/loop/post）、`[spanR-graph]`
+  （gap1/rblk0/rspan/gap2/wend）、`[spanT-*]`（单任务分布）、`[spanR2/3/4-*]`
+  （reduce 逐块/逐切片/逐 k 标记到达）；`MYBENCH_PHASE_RANK=0` 输出
+  `[phase-blk-*]`（逐 block L1/L2/pull/move/wait/pw/loop/tail/tasks）。
+- ISA 探针（`tmp/stwt_probe/probe2.cu`，19 行：plain/__stwt/__stcs/__stcg/__stwb
+  写 + volatile/__ldcv/__ldcs/__ldcg 读 + atomicExch/Max）：
+
+```bash
+# 环境同 6)；wt 内
+cd /home/fuyx/mini_mega/.agents/work/glm52a/tmp/stwt_probe
+/opt/maca/tools/cu-bridge/bin/cucc -O3 -std=c++17 -I$CUDA_HOME/include \
+  -I/opt/maca/include --offload-arch=xcore1600 -c probe2.cu -o probe2.o
+/opt/maca/mxgpu_llvm/bin/mxobjdump --print-code --print-instruction-encoding \
+  --target-kind=maca-mxc-metax-macahca--xcore1600 --demangle probe2.o
+# 判读：k_stwt 与 k_plain 编码相同（bc 00 00 30）；k_stcs/k_stcg 为 bc 00 00 70（sysc）
+```
+
+#### 复现命令
+
+```bash
+cd /home/fuyx/mini_mega/.agents/work/glm52a/wt
+# 诊断构建（5 bank + span 输出）
+export MACA_PATH=/opt/maca CUDA_HOME=/opt/maca/tools/cu-bridge   # 分条 export
+export DJ_JIT_NVCC_COMPILER=$HOME/cucc_maca_include.sh
+export LD_LIBRARY_PATH=/opt/maca/ompi/lib:/opt/maca/tools/cu-bridge/lib:/opt/maca/mxgpu_llvm/lib:/opt/maca/lib
+touch src/combine.cuh && rm -f test/megakernel.so test/mybench
+KERNEL_CFLAGS="--offload-arch=xcore1600 -DR24_DIAG_PHASE=1" bash scripts/build.sh mybench
+# 6 点快筛（对比 kspan/rspan 记账；16..24 断崖）
+flock -w 3600 /home/fuyx/mini_mega/.agents/work/lock/lock_gpu \
+env GPU_LOCK=0 MT_FORCE_WIN=64 MYBENCH_PHASE=1 MYBENCH_PHASE_RANK=0 \
+bash scripts/run.sh mybench -R 32 -s 1 -tprs 64,65,65,64,63,66 -quiet
+# 生产构建（无 -D）：布局/行为回归基线
+KERNEL_CFLAGS="--offload-arch=xcore1600" bash scripts/build.sh mybench
+```
+
+#### 门禁与产物
+
+- 生产重建 `f6beeb10`：21 点 coverage（`cov21_gate.log`）全部落 ±10µs 噪声带
+  （TPR256 +21µs=0.6%）；`check --all` **762/762**（112.5s，`check_all_gate.log`）。
+  与上一部署产物 e3485a54 的差异 = cucc 变体漂移（同源异码，见 8)），行为经双门禁
+  等价。mybench `b95a7289`（打印门控，`MYBENCH_PHASE=1` 下生产构建零 span 垃圾输出）。
+- 实验日志：`tmp/{spanw,stcs,matom,rowstcs,cliff,tier}_ctrl.log`、`cov21_gate.log`。
+- 未采用/回退：`[EXP-COH]`（reduce 自旋内原子读探针，无效果，已回退）；
+  `combine_push_pair`/`combine_mark_rows` 均已回 `__stwt` 基线语义。
+

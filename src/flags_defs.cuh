@@ -91,7 +91,22 @@ struct alignas(256) local_flags {
     alignas(256) int dbg[8];                 // 诊断码（超时归因）
     alignas(256) uint32_t ck_dbg[kEPR * 16]; // checksum 超时行诊断（可选）
     // 前序/计算链相位时间戳：task_trace 打开时每 block 16 槽，普通 8；统一按 16 分配
+    // [R24_DIAG_PHASE] 第三 bank（偏移 kGrid*16，每 block 8 槽）：+0 block 起始 clock64、
+    //   +1 block 结束、+2 任务循环入口、+3 任务循环出口（绝对值，仅诊断构建写入）。
+    //   全局 bank 空闲槽：+8 block0 本轮起始、+9 block0 上轮起始（时钟探针：相邻
+    //   节点起始周期 / 节点墙钟 = 在载时钟）、+10 block0 本轮结束。
+    // [R24_DIAG_PHASE] 第四 bank（偏移 kGrid*24，每 block 8 槽）：单任务 span 分布
+    //   +0 min（首任务直写，其余 atomicMin）、+1 max（atomicMax）、+2 sum（atomicAdd）、
+    //   +3 任务数（atomicAdd）。仅诊断构建写入/读取。
+    // [R24_DIAG_PHASE] 第五 bank（偏移 kGrid*32）：REDUCE 逐块探针（按 blockIdx，
+    //   最多 256 块 ×8 槽）+ 逐切片全局自旋（16 槽）+ 逐 (k,s2) 标记到达时刻（32 槽）。
+    //   仅诊断构建写入/读取。诊断 bank 仅诊断构建分配（生产构建与基线布局逐字节
+    //   一致，避免无谓的重验成本）。
+#if R24_DIAG_PHASE
+    alignas(256) unsigned long long pre_ticks[kGrid * 32 + 256 * 8 + 64];
+#else
     alignas(256) unsigned long long pre_ticks[kGrid * 16];
+#endif
     alignas(256) float l1_chk[kGrid];        // L1 数值校验累加
     alignas(256) float l2_chk[kGrid];        // L2 数值校验累加
     // [BALANCE·docs/20] L1 split-K：每 (slot, N片 s) 的 K 段完成计数（atomicAdd 判最后一段）

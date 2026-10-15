@@ -497,6 +497,27 @@ __device__ __forceinline__ void reduce_tile_body(
     // 与本轮 mega 的 bar / combine_sums 片一致。用 device 计数派生，graph 安全。
     const int cyc = (int)((lf->current_time[0][1] - 1) % M_CYCLE);
     int* dbg = lf->dbg;
+#if R24_DIAG_PHASE
+    // [spanR] reduce 内核墙钟分解（第三 bank block0 区 +4..+6）：
+    //   +4 = block0 入口时刻；+5 = block0 出口；+6 = 全 block 出口的原子最大。
+    // graph 多 replay 下最后一个 replay 的值胜出（与第三 bank 其余槽一致）。
+    unsigned long long* rb = lf->pre_ticks + (size_t)kGrid * 16;
+    if (blockIdx.x == 0 && threadIdx.x == 0) rb[4] = clock64();
+    // [spanR2] 第五 bank：逐 reduce 块 start/end/spin/token（按 blockIdx，
+    //   最多 256 块）= lf->pre_ticks + kGrid*32 + blockIdx*8：
+    //   +0 start、+1 end（每 launch 覆写）、+2 自旋轮累计、+3 等待线程数、
+    //   +4 token、+5 最大单线程自旋及其 (k,s2) 槽位（低 8 位）、
+    //   +6 长等待线程数（spin>4096）、+7 备用；+2048 起 16 槽 = 逐切片全局
+    //   自旋和/等待数（+s2 自旋、+4+s2 计数）。
+    if (blockIdx.x < 256) {
+        unsigned long long* q5 =
+            lf->pre_ticks + (size_t)kGrid * 32 + (size_t)blockIdx.x * 8;
+        if (threadIdx.x == 0) {
+            q5[0] = clock64();
+            q5[4] = (unsigned long long)(blockIdx.x >> 1);   // token
+        }
+    }
+#endif
     // [集71] REDUCE 启动次数（block0 tid0）+ 参与 block 数（tid0）
     if (threadIdx.x == 0) {
         if (blockIdx.x == 0) MX_CTR_ADD(ctr, kCtrReduceLaunch, 1);
@@ -545,6 +566,31 @@ __device__ __forceinline__ void reduce_tile_body(
                 // [集71] REDUCE 自旋轮数 / 超时次数
                 MX_CTR_ADD(ctr, kCtrReduceSpin, spin);
                 if (spin > max_spins) MX_CTR_ADD(ctr, kCtrReduceTimeout, 1);
+#if R24_DIAG_PHASE
+                // [spanR2] 逐块/逐切片自旋归集（含 k/s2 槽位用于找迟滞标记）
+                if (blockIdx.x < 256) {
+                    unsigned long long* q5 = lf->pre_ticks + (size_t)kGrid * 32 +
+                                             (size_t)blockIdx.x * 8;
+                    atomicAdd(&q5[2], (unsigned long long)spin);
+                    atomicAdd(&q5[3], 1ull);
+                    if (spin > 4096) atomicAdd(&q5[6], 1ull);
+                    atomicMax(&q5[5], ((unsigned long long)spin << 8)
+                                      | (unsigned)(k * kNSlice + s2));
+                }
+                {
+                    unsigned long long* g5 =
+                        lf->pre_ticks + (size_t)kGrid * 32 + 256 * 8;
+                    atomicAdd(&g5[s2], (unsigned long long)spin);
+                    atomicAdd(&g5[4 + s2], 1ull);
+                }
+                {
+                    // [spanR4] 逐 (k,s2) 标记到达时刻（跨发射 atomicMax，
+                    //   最后一发射内最晚到达者胜出；host 侧减 reduce 起点）
+                    unsigned long long* g6 =
+                        lf->pre_ticks + (size_t)kGrid * 32 + 256 * 8 + 16;
+                    atomicMax(&g6[k * kNSlice + s2], clock64());
+                }
+#endif
                 __threadfence();
             }
         }
@@ -581,6 +627,17 @@ __device__ __forceinline__ void reduce_tile_body(
         }
         __syncthreads();
     }
+#if R24_DIAG_PHASE
+    {
+        const unsigned long long te = clock64();
+        if (threadIdx.x == 0) {
+            if (blockIdx.x == 0) rb[5] = te;
+            atomicMax(&rb[6], te);
+            if (blockIdx.x < 256)
+                lf->pre_ticks[(size_t)kGrid * 32 + (size_t)blockIdx.x * 8 + 1] = te;
+        }
+    }
+#endif
 }
 
 // 独立 mega_reduce_kernel 的入口 wrapper：blockIdx → (token, half) 映射逐字保持
