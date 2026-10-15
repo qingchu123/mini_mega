@@ -83,8 +83,15 @@ int64_t open_ipc_handle(const std::vector<uint8_t>& handle) {
   std::memset(&ipc_handle, 0, sizeof(ipc_handle));
   std::memcpy(&ipc_handle, handle.data(), sizeof(mcIpcMemHandle_t));
   void* remote = nullptr;
-  const mcError_t e = mcIpcOpenMemHandle(&remote, ipc_handle,
-                                         mcIpcMemLazyEnablePeerAccess);
+  // [IPC-FLAG] mcIpcMemLazyEnablePeerAccess 在不同 MCR 版本取值不同
+  //   （20261011=0x1，3.8.2=0）：先用编译期常量，invalid 时回退 0。
+  //   否则跨版本 wheel 在打不开 peer 句柄（serving 容器实测）。
+  mcError_t e = mcIpcOpenMemHandle(&remote, ipc_handle,
+                                   mcIpcMemLazyEnablePeerAccess);
+  if ((e != mcSuccess || remote == nullptr) && mcIpcMemLazyEnablePeerAccess != 0) {
+    remote = nullptr;
+    e = mcIpcOpenMemHandle(&remote, ipc_handle, 0);
+  }
   if (e != mcSuccess || remote == nullptr) {
     fail("mcIpcOpenMemHandle 失败: " + std::string(mcGetErrorString(e)));
   }
