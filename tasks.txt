@@ -225,7 +225,7 @@ bash scripts/mx_scripts/run_mega_moe_all.sh --skip-baseline --routing-mode cover
 每个rank 复制存储组内4个rank的权重。
 具体任务时进行拆分，
 
-固定win=48  NS=4
+固定win=48  NS=4  g=rank%8
 1.把组内的专家接受tokens数量按win进行向上对齐A_T。
 2.本地专家计算出（ntask = A_T/win, ncost = align_up(A_T,16) / 16）
 3.选择最小负载rank （优先把8个窗按负载3填满，如果不够就填负载2的），当前rank 的负载+=最大窗负载 -> 选择下一个负载最小的rank  
@@ -233,5 +233,13 @@ bash scripts/mx_scripts/run_mega_moe_all.sh --skip-baseline --routing-mode cover
 拿s2来评估一下这样做的均衡性。
 
 
-如一个本地专家token=
+现在按照：
+固定win=48  NS=4  g=rank%8
+1.把组内的专家接受tokens数量按win进行向上对齐A_T。
+2.本地专家计算出（ntask = A_T/win, ncost = align_up(tokens,16) / 16）
+3.选择最小负载rank （优先把8个窗按负载3填满，如果不够就填负载2的），当前rank 的负载+=最大窗负载 -> 选择下一个负载最小的rank  
 
+出一个任务拆分方案，和任务分配的kernel出来（尽可能高效），然后按照这个策略进行后续计算。
+
+
+增加一个打印kernel， 每rank==0 && ct%1000==0时 打印当前轮数，token_num  等值。 便于后续定位哪些轮出问题了。

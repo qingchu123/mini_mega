@@ -8,7 +8,7 @@ bash /sw_home/m01182/test/c600ul/megamoe/decode_fake_test_megamoe_0927.sh
 #2终端 待服务起来
 bash bench_serving.sh decode 10.0.82.71 8400 
 #默认跑两轮bs 128 16k1k，第一轮作为warmup，到第二轮稳定再抓profiler
-#3终端 抓profiler
+#3终端 抓profiler 可以在第一轮进度条跑到75%左右可以开始抓profiler
 bash profiler.sh 10.0.82.71 8400
 
 profiler路径设置 当前为默认值
@@ -30,3 +30,8 @@ bash /sw_home/m01182/test/c600ul/megamoe/decode_fake_test_megamoe_acc_0927.sh
 bash client.sh 10.0.82.71 8400
 或 #2终端 数据集测试
 bash run_gsm8k.sh 10.0.82.71 8400
+
+
+每次跑完模型的日志或者性能数据放入以下文件中：
+tmp/llm/{日期：10-13}/{小时分：20-32}/{包名}/log
+tmp/llm/{日期：10-13}/{小时分：20-32}/{包名}/profiler

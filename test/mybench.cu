@@ -267,6 +267,41 @@ int main(int argc, char** argv) {
             std::printf("[anchor] TPR=%d t_meas_end=%.3f us=%.2f\n", tokens, te, us);
             std::fflush(stdout);
         }
+        // [SPLIT] MYBENCH_SPLIT=1：再测一条"仅 compute"的图，split = total - compute。
+        if (std::getenv("MYBENCH_SPLIT") != nullptr) {
+            mt::reset_dev(geo, d, routes, tokens);
+            MPI_Barrier(MPI_COMM_WORLD);
+            mcGraph_t g2 = nullptr;
+            mcGraphExec_t ex2 = nullptr;
+            MYCHK(mcStreamBeginCapture(d.st, mcStreamCaptureModeThreadLocal));
+            for (int k = 0; k < o.nodes; ++k) fp8mega::launch_compute(a, d.st);
+            MYCHK(mcStreamEndCapture(d.st, &g2));
+            MYCHK(mcGraphInstantiate(&ex2, g2, nullptr, nullptr, 0));
+            mcGraphDestroy(g2);
+            for (int k = 0; k < 2; ++k) MYCHK(mcGraphLaunch(ex2, d.st));
+            MYCHK(mcStreamSynchronize(d.st));
+            MPI_Barrier(MPI_COMM_WORLD);
+            mcEvent_t f0 = nullptr, f1 = nullptr;
+            MYCHK(mcEventCreate(&f0));
+            MYCHK(mcEventCreate(&f1));
+            MYCHK(mcEventRecord(f0, d.st));
+            for (int k = 0; k < o.replays; ++k) MYCHK(mcGraphLaunch(ex2, d.st));
+            MYCHK(mcEventRecord(f1, d.st));
+            MYCHK(mcStreamSynchronize(d.st));
+            float ms2 = 0.f;
+            MYCHK(mcEventElapsedTime(&ms2, f0, f1));
+            const double comp = (double)ms2 * 1000.0 / (double)(o.nodes * o.replays);
+            mcEventDestroy(f0);
+            mcEventDestroy(f1);
+            mcGraphExecDestroy(ex2);
+            double mx2[2] = {comp, us};
+            double mn2[2] = {comp, us};
+            MPI_Reduce(mx2, nullptr, 0, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(mn2, nullptr, 0, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+            if (rank == 0)
+                std::printf("[split] case=%s total=%.1f us  compute=%.1f us  reduce=%.1f us\n",
+                            c.label.c_str(), us, comp, us - comp);
+        }
 
         // [诊断] MYBENCH_PHASE=1：计时后做一次 reset + 单次 eager launch，读取 kernel 内置相位 tick。
         // 注意：route..reduce 与 chain 只来自 block0 的时间线（kernel 结束要等所有 block），
