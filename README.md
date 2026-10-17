@@ -29,6 +29,122 @@ mini_mega/
 └── README.md
 ```
 
+## 测试环境
+
+> 本节记录 `perf.md` / README 中性能数据的采集环境；换机复现时请逐项核对。
+> 最近核对：2026-10-17。
+
+### 1. 内核基准（`mybench` / `check`，宿主机直跑）
+
+| 项 | 配置 |
+|---|---|
+| 采集机 | `10.0.82.202`（README 中"本机 202"），单机 32 卡 |
+| GPU | 32 × MetaX C600-U（MXC600-U），**28 SM/卡** |
+| 驱动 | `3.101.0-20261011-153`（MX-SMI 3.101.0，BIOS 1.2.7.0） |
+| MACA SDK | `20261011`（`/opt/maca` → `~/opt/maca-sdk-c600u-20261011`；`mxcc`/`cucc` 1.0.0） |
+| OS / kernel | Ubuntu 22.04.5 LTS / `5.15.0-119-generic` |
+| Python / PyTorch | conda `py310-maca`（`/home/fuyx/miniconda3/envs/py310-maca`），PyTorch 2.10（MetaX 构建） |
+| EP 后端 | `deep_ep` / `mxmesh` `1.0.0+metax20260909.303torch2.10`（默认 wheel 目录 `/home/fuyx/maca-pkg/wheels/20260909-303/wheel`；`--ep-backend=auto` 走 mxmesh） |
+| IB / 网络 | `mlx5_10..13`（`tests/mx_test/test_env.sh` 默认 `MXSHMEM_HCA_LIST` / `MCCL_IB_HCA`），`MCCL_SOCKET_IFNAME=enP1s136np0` |
+| 构建开关 | `KERNEL_CFLAGS=--offload-arch=xcore1600`；默认 `MX_GROUP_SCHED=1`（自动 `MX_GROUP_WEIGHTS=1`，**GS 默认开**；`-DMX_GROUP_SCHED=0` 关回基线） |
+| 运行口径 | `-R 32`（每进程一张卡）、`fp8xfp8`、E=256 / topk=8 / H=6144 / I=2048、50-in-1 CUDA Graph；MXMOEMega 对比口径 MTP 384（mega）/ 256（baseline） |
+
+### 2. 容器 / 服务侧（sglang 模型测试）
+
+| 项 | 配置 |
+|---|---|
+| 镜像 | `harbor.sh.mxcr.io/ai-release/maca/sglang:0.5.14-maca.ai3.8.2.109-c600u-torch2.10-py310-ubuntu22.04-amd64` |
+| 采集机 | 同系列 C600UL 单机 32 卡（`10.0.104.82`） |
+| 容器内 MACA | 3.8.2.19（驱动 `3.101.0-20261011-153`） |
+| 模型 | GLM-5.2-FP8（E=256 / topk=8 / H=6144 / I=2048，78 层 MoE） |
+| 服务口径 | `--mem-fraction-static=0.85`、MTP on、CUDA graph on；profile 流程为 PD-decode + fake-prefill |
+| GS | 容器脚本显式 `MXK_GS_GROUP_GATHER=0`（组权重聚合关闭 → **GS 运行期不生效**；内核仍按默认 `MX_GROUP_SCHED=1` 编译） |
+
+**sglang 测试注意事项（[261017] 实测沉淀）：**
+
+1. **CUDA graph 必须开**：`--disable-cuda-graph` 是 kernel trap 排查用的调试开关，不是性能口径。禁图会让每步几千个 kernel 单独发射，MACA 栈上 TPOT 被放大 ~8–9×（实测 deepep 715→77ms、mega 656→80ms）。vendor 性能脚本默认注释该开关；若历史脚本里它是激活状态，先复位再测。
+2. **开图 + MTP 时 `--mem-fraction-static ≤ 0.85`**：0.89 下 deepep 会因 DeepEP buffer + 图私有内存在图捕获阶段 OOM（`Capture cuda graph failed: 512MiB... 0 bytes free`），大 prefill 的 deep_gemm masked GEMM 也可能 OOM（768MiB）。0.85 下两边 KV 池约 119k，本负载（16K × 99% 共享前缀、并发 120）刚好够用。
+3. **GS 在容器里是"编译开、运行关"**：容器脚本显式 `MXK_GS_GROUP_GATHER=0` → 不做组权重 all-gather → `group_weights_ready=0` → 内核 `gs_on = 倾斜门控 && ready` 恒为假，走 base 路径。要在容器验证 GS，需 `MXK_GS_GROUP_GATHER=1` 并预留组权重显存（4× 权重副本），且只在倾斜路由下才有效。
+4. **MTP 口径要固定**：MTP on/off 不影响精度，但 TPOT = 每步耗时 ÷ accept_len；跨后端比较必须同 MTP 配置，或改比"每步耗时/吞吐"。内核对照建议 MTP off，服务口径再单独开 MTP。
+5. **profiler 必须卡在稳态**：`POST /start_profile` → 5s → `POST /stop_profile`；要在**第 2 轮**（第 1 轮 warmup）且**确认最近有 decode 批次**后再触发——5s 窗口可能落在 round2 起始的准入空窗（实测遇到：整分钟 0 条 decode 日志，trace 里既无 step span 也无模型 kernel）。trace 落在 `SGLANG_TORCH_PROFILER_DIR`，每 rank 一份 `.trace.json.gz` + `.csv`。
+6. **确认是否真的走了图**：看 decode 日志里的 `cuda graph: True`；trace 里应有 `full_cuda_graph_backend.replay`（每步约 3 次：draft / target-verify / draft-extend）。
+7. **PD-decode + fake-prefill 口径**：`--disaggregation-mode=decode --disaggregation-transfer-backend=fake` + 客户端 `--pd-separated --fake-prefill` 是**纯 decode** 测试，TTFT 无意义（只是准入），只看 TPOT/ITL/吞吐；16K 输入是 99% 共享前缀，不代表真实 16K 独有上下文。
+8. **NUM_MAX 与 chunk 的关系**：`SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` 必须 ≥ chunked-prefill/dp（chunk 8192、dp32 → 256）；该值越大对称缓冲越大，2048 建不出来（`mcMalloc` OOM），decode 实际只需 ~16–20。
+9. **megamoe 在容器里需要 [FOLD]/[RAW-X] shim 才能出正确结果**：容器自带 sglang 不做 checkpoint block-scale 折叠，JIT pre_dispatch 会做 UE8M0 归一化；未修时输出乱码（logprob −12~−16）。用本仓库 kernel 接 sglang 前先确认 shim 版本与 fold 开关（E/F=8）。
+10. **容器可能被外部停止**：长跑前后检查 `docker ps`；被停后 `docker start` 再重启服务（本环境实测约每小时可能被停一次）。
+
+**sglang 测试文件与流程（宿主机 `~/`，容器内同路径挂载）：**
+
+| 类别 | 文件 |
+|---|---|
+| 服务启动（本机适配） | `serve_megamoe_local.sh`（A/B 基线）、`serve_megamoe_graph_on.sh`（开图）、`serve_megamoe_graphon_mtp.sh`（开图+MTP）、`serve_megamoe_acc_local.sh`（acc 口径）、`serve_megamoe_pddecode_261017.sh`（PD-decode + profiler 流程）；deepep 侧 `serve_deepep_local.sh`、`serve_deepep_local_c8192.sh`、`serve_deepep_graph_on.sh`、`serve_deepep_graphon_mtp.sh`、`serve_deepep_pddecode_261017.sh` |
+| 官方（vendor）脚本 | `decode_fake_test_megamoe_0927.sh`（mega 性能/PD-decode）、`decode_fake_test_megamoe_acc_0927.sh`（mega 精度）、`decode_fake_test_unified_acc.sh`（deepep 精度）、`bench_serving.sh` + `client_loop_test_decode.sh`（PD-decode 两轮客户端）、`profiler.sh`（5s 抓拍）、`run_gsm8k.sh`、`client.sh`（位于 `~/sw_home/m01182/test/c600ul/megamoe/`） |
+| 性能客户端（本机） | `bench_mega_256x512.sh` / `bench_deepep_256x512.sh`（端到端 256 prompts / 512 out / conc128 / gsp 1013+10）、`bench_lowconc.sh`（conc16） |
+| 精度 | `run_gsm8k.sh`（200 题 / 5-shot / completion / temp 0）、`client.sh`（单语料连贯性检查） |
+| 修复/兼容 | `mxmegashim.py`（site-packages；[FOLD]+[RAW-X]；旧版备份 `mxmegashim.py.bak_261016_orig`） |
+| 报告/证据 | `logs/serving_ab_summary_261016.md`、`logs/perf_acc_summary_final_261017.md`；profiler 目录 `logs/profiler/{megamoe_pddecode2,deepep_pddecode}`；服务/客户端日志 `logs/*.log` |
+
+**标准流程：**
+
+1. 启动服务：`NODE_IP=<ip> MEGA_MOE_MEM_FRACTION=0.85 bash serve_xxx.sh fp8xfp8`（容器内）；等 `/health` 200（boot 含权重加载/图捕获，约 5–8 分钟）。
+2. 探针：`POST /generate` 短文，确认输出连贯、MTP accept_rate 正常。
+3. 性能（端到端 A/B）：`bash bench_mega_256x512.sh` / `bash bench_deepep_256x512.sh`；记录 Output tok/s、Mean TPOT、TTFT P50/P90、并发；两轮取稳态（第 1 轮冷缓存）。
+4. 性能（低并发）：`bash bench_lowconc.sh`（conc16，验证 20–30ms 口径）。
+5. 官方 PD-decode + profiler：`bash bench_serving.sh decode <ip> 8400`（两轮 512→1024 prompts、bs128、16K/1K、fake-prefill）；第 2 轮确认最近 10s 有 decode 日志后，`POST /start_profile` → sleep 5 → `POST /stop_profile`；trace 落 `SGLANG_TORCH_PROFILER_DIR`（每 rank 一份 trace + csv）。
+6. 精度：`bash run_gsm8k.sh <ip> 8400`（200 题；1 题 = 0.5%，0.955–0.970 视为噪声带）；单语料 `bash client.sh <ip> 8400`。
+7. 结果归档：客户端日志 + 服务日志（含 `cuda graph: True/False`、accept len/rate）+ trace，写入 `logs/serving_ab_summary_261016.md` 与 `logs/perf_acc_summary_final_261017.md`。
+
+**闸门（每轮必查）：**
+
+- 两侧启动脚本 diff 只允许后端本质差异（`moe-a2a-backend` / `deepep-mode` / `DEEPEP_NUM_MAX` / mega 开关）＋ profiler 输出目录；
+- 服务日志 `cuda graph: True`（或 trace 内 `full_cuda_graph_backend.replay`）确认走图；
+- `grep -iE "out of memory|exception|crashed|assert"` 与 `find ~/mxlog -name 'trapInfo*'` 确认零 OOM / 零 trap；
+- 记录 warmup/稳态轮次、KV 池、accept_len、并发，避免跨口径比较。
+
+### 3. 测试文件与流程
+
+**主要测试文件**
+
+| 文件/目录 | 用途 |
+|---|---|
+| `test/mybench.cu` | MPI 性能基准：`-s 1` 均衡 TPR；`-s 2` TK 实录（`-top N` / `-cases ...`） |
+| `test/check.cu` | MPI 正确性测试：`--smoke`（10 例，<10s）/ `--all`（762 例，约 4 分钟） |
+| `test/mega_common.cuh` | mybench/check 共用的设备资源、布局、路由构造 |
+| `test/70.r32_tpr_perf/` | 均衡 TPR 基准（`run.sh`、`results.md`、`r1/r2.log`） |
+| `test/71.r32_tk_imbalance/` | 真实 TK_INFO 倾斜基准（`run.sh`、`results.md`、`run.log`） |
+| `test/77.correctness/测试流程.md` | 正确性判据与流程（L0/L1/L2/REDUCE/graph 50-in-1） |
+| `test/73/74/75/76/78/79/80/82/91/92/93/94.*` | 专项 / 微基准（各含 `run.sh` + `results.md`） |
+| `scripts/build.sh` / `scripts/run.sh` | 构建 / 统一启动（mpirun、每进程一卡、GPU 锁） |
+| `docs/02_测试流程与性能标准.md` | 性能口径与正确性协议的权威说明 |
+| `perf.md` | 性能记录（每行标注提交时间/号） |
+
+**标准流程**
+
+1. 构建：`scripts/build.sh all`（或 `so` / `mybench` / `check`）；增量构建，产物在 `test/`。
+2. 冒烟正确性：`scripts/run.sh check --smoke`（10 用例，实测 7.5s，目标 <10s）。
+3. 全量正确性：`scripts/run.sh check --all`（762 用例，约 4 分钟；已知 36 例 TK 用例 L1 FAIL——同一 launch 单跑 PASS，疑似跨用例 pool/权重槽残留）。
+4. 均衡性能：`scripts/run.sh mybench -R 32 -s 1 -tprs 1,2,...,256`（实测 7.2s）。
+5. 实录倾斜性能：`scripts/run.sh mybench -R 32 -s 2 -top 50`（13.1s）或 `-cases 804900,807500`。
+6. 65-case 对比（MXMOEMega 口径）：`run_mega_moe_all.sh --num-processes 32 --routing-fixed-cases all --ep-backend=auto`；`OUT_DIR` 产出 `profile.log` / `run_metadata.txt` / `summary.tsv`（+ `stages.tsv`）；`speedup = baseline / mega`。
+7. 结果归档：`perf.md` 追加一行（标注提交时间/号），结论同步 README / `test/*/results.md`。
+
+**口径与判据要点**
+
+- 正式性能口径：单张 CUDA Graph 内 N 个同构节点、host 1 次提交/replay、独立 event 对、预热 2 次、5 次 replay 取 **min-of-5**、`per-kernel = replay/nodes`；`rank_barrier` 在 event 窗口外。不要用 host wall 或单次 event。
+- 跨会话数值不直接对比；A/B 优化必须同会话。
+- 分相计时（`phase_ticks`/`clock64`，按 2000MHz 折算）只作诊断，正式性能只认 graph 链。
+- 正确性判据：L0 全 rank 全字段相等；L1 rel 7e-2 / abs 2e-3；L2 rel 1e-2 / abs 1e-3；REDUCE rel 1e-5 / abs 1e-6；graph 50-in-1 vs eager rel ≤1e-3。
+- 路由三形态：balanced / hot / mixed-invalid；改可见性/校验协议必须过 `--stress`，checksum on 对照须 0 失败（历史 checksum off 出现 290/300、273/300 失败）。
+- 已知坑：`bench.cu` 曾构造重复专家 topk（非法）；`win < max_tokens` 在 max_tokens=512 时丢 topk 贡献（已统一 `win = max_tokens`）。
+
+### 4. 换机注意事项
+
+- **IB 设备名/网卡名随机器不同**（例如 `10.0.104.82` 为 `mlx5_0..6`），需覆盖 `MXSHMEM_HCA_LIST` / `MCCL_IB_HCA` / `MCCL_SOCKET_IFNAME`；
+- **Python 路径**默认 `/home/fuyx/miniconda3/envs/py310-maca/bin/python`，不存在时用 `PYTHON=` 指定；
+- **SDK 版本**：`/opt/maca` 必须指向与驱动匹配的 SDK，避免 `libmcpti.so` 混版；当前宿主机已更新到 `20261016`（`mx-smi` 报 MACA `3.0.2098.20261016`），复现历史数据时注意与采集时的 `20261011` 对齐；
+- **SM 数**：非 C600-U 的卡用 `MXK_KERNEL_GRID=<SM数>` 覆盖；
+- **GS 口径**：本仓库默认构建 GS 开（仅倾斜路由、门控通过时生效）；若要与"base 路径"对照，用 `KERNEL_CFLAGS="-DMX_GROUP_SCHED=0"` 重编，并在结果里注明。
+
 ## 关键编译期参数（`src/common.cuh`）
 
 | 参数 | 值 | 说明 |
